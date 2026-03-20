@@ -1,0 +1,45 @@
+{
+  "task_id": "W01",
+  "title": "Platform Architecture and Authentication Foundation",
+  "status": "completed",
+  "priority": "critical",
+  "objective": "Establish the baseline platform architecture, service boundaries, API contracts, and secure authentication for a multi-user options platform.",
+  "prd_mapping": [
+    "Section 1: Product Vision",
+    "Section 7: Microservices Architecture",
+    "Section 8: Data Flow Architecture"
+  ],
+  "scope": [
+    "Define monolith-to-microservices migration plan with clear service contracts.",
+    "Implement authentication and role model (admin, trader).",
+    "Set API gateway rules for internal and external traffic.",
+    "Define message-bus event schemas for analytics, recommendation, and execution flows."
+  ],
+  "deliverables": [
+    "Architecture decision record (ADR) for service decomposition.",
+    "Auth service design and token policy (JWT/session, expiry, rotation).",
+    "API contract document (OpenAPI + event schema).",
+    "Initial service template with health, logging, tracing hooks."
+  ],
+  "dependencies": [],
+  "blocked_by": [],
+  "owner_role": "Backend Architect",
+  "estimate": {
+    "tshirt_size": "L",
+    "ideal_days": 6
+  },
+  "success_metrics": [
+    "All downstream services consume standardized identity claims.",
+    "No unauthenticated access to admin-only operations.",
+    "Service interfaces agreed before implementation of W02-W08."
+  ],
+  "risks": [
+    "Over-designing services too early.",
+    "Unclear role permissions for strategy marketplace actions."
+  ],
+  "open_questions": [
+    "Should API gateway be implemented now or deferred until full microservice split?",
+    "Do users require broker-level RBAC or only platform-level RBAC?",
+    "Should refresh tokens be persistent (DB) or stateless?"
+  ]
+}

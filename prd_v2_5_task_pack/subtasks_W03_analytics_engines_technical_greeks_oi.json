@@ -1,0 +1,57 @@
+{
+  "task_id": "W03",
+  "subtasks": [
+    {
+      "subtask_id": "W03-S01",
+      "title": "Implement indicator calculation pipeline",
+      "status": "completed",
+      "details": "Compute VWAP, EMA(9/21), RSI and additional derived features from streaming candles.",
+      "acceptance_criteria": [
+        "Indicators available for all subscribed strikes each minute.",
+        "Unit tests for edge cases (low volume, startup period)."
+      ],
+      "questions": [
+        "Should EMA periods be globally fixed or per strategy?"
+      ]
+    },
+    {
+      "subtask_id": "W03-S02",
+      "title": "Implement Greeks engine",
+      "status": "completed",
+      "details": "Compute delta/gamma/theta/vega using configurable model assumptions and fallback behavior for missing inputs.",
+      "acceptance_criteria": [
+        "Greeks table populated for CE/PE strikes.",
+        "Model assumptions versioned in metadata."
+      ],
+      "questions": [
+        "Do we support model switching (Black-Scholes vs approximation)?"
+      ]
+    },
+    {
+      "subtask_id": "W03-S03",
+      "title": "Implement OI and volume change processor",
+      "status": "completed",
+      "details": "Calculate OI change, volume spike, and momentum windows for ranking engine.",
+      "acceptance_criteria": [
+        "Windowed deltas available in under 1 second after cycle close.",
+        "Anomaly detection flags outliers and bad ticks."
+      ],
+      "questions": [
+        "Window lengths for OI/volume spike detection?"
+      ]
+    },
+    {
+      "subtask_id": "W03-S04",
+      "title": "Persist analytics outputs",
+      "status": "completed",
+      "details": "Store final metrics in PostgreSQL tables with proper indexing for recommendation queries.",
+      "acceptance_criteria": [
+        "Historical queries under target SLA.",
+        "No duplicate rows per strike/time bucket."
+      ],
+      "questions": [
+        "Retention policy for high-frequency analytics tables?"
+      ]
+    }
+  ]
+}

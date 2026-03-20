@@ -1,0 +1,43 @@
+{
+  "pack_name": "options_trading_platform_complete_PRD_v2_5_task_pack",
+  "source_prd": "options_trading_platform_complete_PRD_v2_5.pdf",
+  "created_on": "2026-03-12",
+  "default_status": "pending",
+  "status_values": ["pending", "in_progress", "blocked", "completed", "cancelled"],
+  "execution_order": [
+    "W01",
+    "W02",
+    "W03",
+    "W04",
+    "W05",
+    "W06",
+    "W07",
+    "W08",
+    "W09"
+  ],
+  "files": [
+    "task_W01_platform_architecture_and_auth.json",
+    "subtasks_W01_platform_architecture_and_auth.json",
+    "task_W02_market_data_ingestion_and_candles.json",
+    "subtasks_W02_market_data_ingestion_and_candles.json",
+    "task_W03_analytics_engines_technical_greeks_oi.json",
+    "subtasks_W03_analytics_engines_technical_greeks_oi.json",
+    "task_W04_strike_ranking_top5_liquidity_detector.json",
+    "subtasks_W04_strike_ranking_top5_liquidity_detector.json",
+    "task_W05_strategy_engine_and_recommendation.json",
+    "subtasks_W05_strategy_engine_and_recommendation.json",
+    "task_W06_execution_risk_portfolio_management.json",
+    "subtasks_W06_execution_risk_portfolio_management.json",
+    "task_W07_realtime_websocket_dashboard_and_alerts.json",
+    "subtasks_W07_realtime_websocket_dashboard_and_alerts.json",
+    "task_W08_strategy_marketplace_and_user_controls.json",
+    "subtasks_W08_strategy_marketplace_and_user_controls.json",
+    "task_W09_data_model_deployment_observability_and_release.json",
+    "subtasks_W09_data_model_deployment_observability_and_release.json"
+  ],
+  "notes": [
+    "Each workstream has one task JSON and one subtasks JSON file.",
+    "Subtasks include implementation details, dependencies, acceptance criteria, and open questions.",
+    "Use task status + subtask status to track completion in a PM workflow."
+  ]
+}

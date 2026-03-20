@@ -1,0 +1,44 @@
+{
+  "task_id": "W06",
+  "title": "Trade Execution, Risk Management, and Portfolio Management",
+  "status": "completed",
+  "priority": "critical",
+  "objective": "Execute paper/live trades from recommendations, apply real-time risk controls, and maintain portfolio state with lifecycle monitoring.",
+  "prd_mapping": [
+    "Section 4: Strategy Execution",
+    "Section 7: Trade Execution Engine, Risk Management Service, Portfolio Management Service",
+    "Section 11: Trade execution latency target"
+  ],
+  "scope": [
+    "Execution flow for paper and live modes.",
+    "Pre-trade and post-trade risk checks.",
+    "Active trade monitor and exit policy enforcement.",
+    "Portfolio and PnL state management."
+  ],
+  "deliverables": [
+    "Execution service with broker integration adapter.",
+    "Risk policies: max loss, max exposure, strategy-level caps.",
+    "Trade lifecycle state machine with audit trail.",
+    "Portfolio summary APIs and user position views."
+  ],
+  "dependencies": ["W05"],
+  "blocked_by": ["Broker API production credentials"],
+  "owner_role": "Execution Engineer",
+  "estimate": {
+    "tshirt_size": "XL",
+    "ideal_days": 10
+  },
+  "success_metrics": [
+    "Trade execution path under 300 ms internal latency target.",
+    "Risk rejections logged with deterministic reason codes.",
+    "Portfolio state matches broker confirmations."
+  ],
+  "risks": [
+    "Order rejection mismatch between simulation and live broker.",
+    "Partial-fill handling complexity."
+  ],
+  "open_questions": [
+    "How should partial fills affect target/SL sizing?",
+    "Should strategy auto-retry on transient broker failures?"
+  ]
+}

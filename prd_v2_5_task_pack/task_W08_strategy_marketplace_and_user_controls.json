@@ -1,0 +1,42 @@
+{
+  "task_id": "W08",
+  "title": "Strategy Marketplace and User Controls",
+  "status": "completed",
+  "priority": "high",
+  "objective": "Build strategy marketplace capabilities where users can discover, enable, configure, and run strategies in paper or live mode safely.",
+  "prd_mapping": [
+    "Section 2: Strategy Marketplace",
+    "Section 4: User enables strategy and execution flow"
+  ],
+  "scope": [
+    "Marketplace catalog with strategy metadata and performance snapshots.",
+    "User subscription and per-strategy configuration.",
+    "Enable/disable workflow with guardrails and confirmations.",
+    "Paper/live toggle controls and compliance checks."
+  ],
+  "deliverables": [
+    "Marketplace APIs and frontend pages.",
+    "Strategy enrollment state model and audit logs.",
+    "User control panel for mode, limits, and pause/resume."
+  ],
+  "dependencies": ["W05", "W06"],
+  "blocked_by": ["Final strategy templates and legal disclaimers"],
+  "owner_role": "Product + Full-stack",
+  "estimate": {
+    "tshirt_size": "L",
+    "ideal_days": 6
+  },
+  "success_metrics": [
+    "User can activate strategy in paper mode in under 1 minute.",
+    "Live mode requires explicit prechecks and confirmations.",
+    "Marketplace views show latest strategy stats."
+  ],
+  "risks": [
+    "Users enabling overly risky configs without safeguards.",
+    "Inconsistent strategy metadata across versions."
+  ],
+  "open_questions": [
+    "Who can publish strategies: admin only or approved users?",
+    "Do users need strategy version pinning?"
+  ]
+}

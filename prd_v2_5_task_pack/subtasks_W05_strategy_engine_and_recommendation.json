@@ -1,0 +1,57 @@
+{
+  "task_id": "W05",
+  "subtasks": [
+    {
+      "subtask_id": "W05-S01",
+      "title": "Define strategy schema and policy engine",
+      "status": "completed",
+      "details": "Design strategy config model including universe, allowed sides, score thresholds, time filters, and risk limits.",
+      "acceptance_criteria": [
+        "Schema supports paper/live independently.",
+        "Policy engine validates strategy configuration."
+      ],
+      "questions": [
+        "Will custom user-defined formulas be supported in v1?"
+      ]
+    },
+    {
+      "subtask_id": "W05-S02",
+      "title": "Generate recommendation payload",
+      "status": "completed",
+      "details": "Create recommendation payload with symbol, side, entry, target, stop loss, confidence, reason codes, and timestamp.",
+      "acceptance_criteria": [
+        "Payload contains complete execution-ready details.",
+        "Reason codes map to scoring factors."
+      ],
+      "questions": [
+        "Should target/SL be absolute values or percent defaults by strategy?"
+      ]
+    },
+    {
+      "subtask_id": "W05-S03",
+      "title": "Persist recommendation lifecycle",
+      "status": "completed",
+      "details": "Store recommendation records with lifecycle state transitions and user-level tracking.",
+      "acceptance_criteria": [
+        "s004_trade_recommendations has full audit history.",
+        "State transitions validated by business rules."
+      ],
+      "questions": [
+        "Need manual override status for admin edits?"
+      ]
+    },
+    {
+      "subtask_id": "W05-S04",
+      "title": "Expose recommendation APIs",
+      "status": "completed",
+      "details": "Provide endpoints for latest recommendations, history, and recommendation details by strategy/user.",
+      "acceptance_criteria": [
+        "API filters by user, strategy, and segment.",
+        "Pagination and sorting implemented."
+      ],
+      "questions": [
+        "Default API history window (7d/30d/90d)?"
+      ]
+    }
+  ]
+}

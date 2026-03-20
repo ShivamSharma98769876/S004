@@ -1,0 +1,4 @@
+backend/app/api/routes_analytics.py
+backend/app/services/option_chain_zerodha.py
+backend/app/services/option_greeks.py
+frontend/src/app/analytics/page.tsx

@@ -1,0 +1,57 @@
+{
+  "task_id": "W01",
+  "subtasks": [
+    {
+      "subtask_id": "W01-S01",
+      "title": "Define role and permission matrix",
+      "status": "completed",
+      "details": "Create explicit permission table for admin and trader roles covering data ingestion, strategy publish, recommendation override, and execution controls.",
+      "acceptance_criteria": [
+        "Permission matrix reviewed and signed off.",
+        "Every API endpoint mapped to at least one permission."
+      ],
+      "questions": [
+        "Can traders pause admin-provided strategies for their account only?"
+      ]
+    },
+    {
+      "subtask_id": "W01-S02",
+      "title": "Design auth token lifecycle",
+      "status": "completed",
+      "details": "Define access token TTL, refresh token rotation, logout invalidation, and multi-device policy.",
+      "acceptance_criteria": [
+        "Token lifecycle documented with sequence diagrams.",
+        "Security review checklist completed."
+      ],
+      "questions": [
+        "Required session duration for active trading hours?"
+      ]
+    },
+    {
+      "subtask_id": "W01-S03",
+      "title": "Create API and event naming conventions",
+      "status": "completed",
+      "details": "Standardize URI naming, event topic naming, payload versioning strategy, and idempotency keys.",
+      "acceptance_criteria": [
+        "Conventions published in engineering docs.",
+        "Sample contracts validated with two services."
+      ],
+      "questions": [
+        "Should versioning be URI-based (/v1) or header-based?"
+      ]
+    },
+    {
+      "subtask_id": "W01-S04",
+      "title": "Define cross-service observability contract",
+      "status": "completed",
+      "details": "Standardize correlation IDs, trace context propagation, log fields, and error envelope format.",
+      "acceptance_criteria": [
+        "Trace IDs visible across request chain.",
+        "Common error model used in all services."
+      ],
+      "questions": [
+        "Do we enforce structured JSON logs from day one?"
+      ]
+    }
+  ]
+}

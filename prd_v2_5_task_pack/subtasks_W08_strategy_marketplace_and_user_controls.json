@@ -1,0 +1,57 @@
+{
+  "task_id": "W08",
+  "subtasks": [
+    {
+      "subtask_id": "W08-S01",
+      "title": "Build strategy catalog model",
+      "status": "completed",
+      "details": "Define catalog entities for strategy name, version, risk profile, supported segments, and historical performance snapshot.",
+      "acceptance_criteria": [
+        "Catalog API returns searchable strategy list.",
+        "Each strategy has immutable version identity."
+      ],
+      "questions": [
+        "Need approval workflow before strategy becomes visible?"
+      ]
+    },
+    {
+      "subtask_id": "W08-S02",
+      "title": "Implement subscription workflow",
+      "status": "completed",
+      "details": "Allow users to subscribe/unsubscribe and configure strategy-specific parameters with validation.",
+      "acceptance_criteria": [
+        "Subscription state persists and is auditable.",
+        "Invalid configuration is rejected with useful message."
+      ],
+      "questions": [
+        "Can one user subscribe multiple variants of same strategy?"
+      ]
+    },
+    {
+      "subtask_id": "W08-S03",
+      "title": "Implement paper-live mode guardrails",
+      "status": "completed",
+      "details": "Require explicit confirmation and broker readiness checks before enabling live mode.",
+      "acceptance_criteria": [
+        "Live mode blocked if broker credentials or risk limits are missing.",
+        "Mode change events logged."
+      ],
+      "questions": [
+        "Do we require cooling period between mode switches?"
+      ]
+    },
+    {
+      "subtask_id": "W08-S04",
+      "title": "Create marketplace frontend UX",
+      "status": "completed",
+      "details": "Build strategy browsing, details page, subscription actions, and current-user strategy control panel.",
+      "acceptance_criteria": [
+        "Marketplace page loads strategy metadata and status.",
+        "Users can pause/resume strategies without page refresh."
+      ],
+      "questions": [
+        "Need ranking by returns, drawdown, or popularity?"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,43 @@
+{
+  "task_id": "W05",
+  "title": "Strategy Engine and Trade Recommendation Engine",
+  "status": "completed",
+  "priority": "critical",
+  "objective": "Turn ranked strikes into strategy-aware recommendations with entry, target, stop loss, and confidence metadata.",
+  "prd_mapping": [
+    "Section 2: Strategy Engine, Trade Recommendation Engine",
+    "Section 4: Strategy Execution"
+  ],
+  "scope": [
+    "Strategy rule evaluation using ranked strikes.",
+    "Recommendation generation per user strategy subscription.",
+    "Recommendation persistence and lifecycle transitions.",
+    "Explainability payload for why a strike was recommended."
+  ],
+  "deliverables": [
+    "Strategy execution policy model (entry windows, risk profile, segment scope).",
+    "Recommendation engine with status flow (GENERATED, ACCEPTED, EXPIRED).",
+    "Persistence in s004_trade_recommendations.",
+    "API endpoints for latest and historical recommendations."
+  ],
+  "dependencies": ["W04"],
+  "blocked_by": ["Strategy template definitions"],
+  "owner_role": "Backend + Quant",
+  "estimate": {
+    "tshirt_size": "L",
+    "ideal_days": 6
+  },
+  "success_metrics": [
+    "Recommendation generated within 1 second of ranking output.",
+    "Recommendation has valid entry/target/sl and strategy reference.",
+    "No duplicate recommendation per strategy per cycle."
+  ],
+  "risks": [
+    "Over-frequent recommendations causing churn.",
+    "Conflicts between multiple enabled strategies."
+  ],
+  "open_questions": [
+    "Can multiple strategies recommend the same strike for same user?",
+    "Expiration duration for generated recommendations?"
+  ]
+}

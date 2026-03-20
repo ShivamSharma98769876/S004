@@ -1,0 +1,30 @@
+groups:
+  - name: s004-alerts
+    rules:
+      - alert: BackendHighErrorRate
+        expr: rate(http_requests_total{status=~"5.."}[5m]) > 0.05
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "High backend 5xx error rate"
+          description: "Backend 5xx rate exceeded threshold for 2 minutes."
+
+      - alert: WebsocketLatencyHigh
+        expr: histogram_quantile(0.95, rate(ws_publish_latency_ms_bucket[5m])) > 200
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "WebSocket p95 latency above target"
+          description: "WebSocket p95 latency is above 200ms target."
+
+      - alert: MarketFeedDisconnected
+        expr: market_feed_connected == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Market feed disconnected"
+          description: "No active market feed connection detected."
+

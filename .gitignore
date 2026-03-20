@@ -1,0 +1,101 @@
+# =============================================================================
+# S004-DynamicOptionBuy — what should NOT be pushed to Git
+# =============================================================================
+# Secrets, local tooling, build outputs, and generated files belong here so
+# the repo stays small, safe, and reproducible. Use .env.example (committed)
+# to document required variables without real passwords.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Secrets & local environment (NEVER commit real credentials)
+# -----------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+*credentials*.json
+
+# -----------------------------------------------------------------------------
+# Python / FastAPI (backend)
+# -----------------------------------------------------------------------------
+backend/.venv/
+backend/venv/
+backend/.env
+**/__pycache__/
+**/*.py[cod]
+**/*$py.class
+**/*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+pip-wheel-metadata/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.cover
+.hypothesis/
+.tox/
+
+# -----------------------------------------------------------------------------
+# Node.js / Next.js (frontend)
+# -----------------------------------------------------------------------------
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/build/
+frontend/.turbo/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# -----------------------------------------------------------------------------
+# Local database backups & dumps (may contain live/trading data)
+# Do NOT use '*.sql' here — backend/db/*.sql migrations must stay tracked.
+# -----------------------------------------------------------------------------
+backend/db/backups/
+
+# -----------------------------------------------------------------------------
+# IDE & editor (personal/workspace state)
+# -----------------------------------------------------------------------------
+.idea/
+*.sublime-project
+*.sublime-workspace
+*.code-workspace
+
+# Optional: uncomment if you do not want team VS Code settings in Git
+# .vscode/
+
+# -----------------------------------------------------------------------------
+# OS-generated files
+# -----------------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# -----------------------------------------------------------------------------
+# Logs & temporary files
+# -----------------------------------------------------------------------------
+logs/
+*.log
+tmp/
+temp/
+*.tmp
+*.temp
+
+# -----------------------------------------------------------------------------
+# Azure / deployment local artifacts (if you add them later)
+# -----------------------------------------------------------------------------
+*.publishsettings
+.azure/
+
+# -----------------------------------------------------------------------------
+# Misc
+# -----------------------------------------------------------------------------
+.cache/

@@ -1,0 +1,45 @@
+{
+  "task_id": "W09",
+  "title": "Data Model, Deployment, Observability, and Release Readiness",
+  "status": "completed",
+  "priority": "critical",
+  "objective": "Finalize database schema, deployment infrastructure, observability stack, and release process to meet PRD production targets.",
+  "prd_mapping": [
+    "Section 9: Databases",
+    "Section 11: Performance Targets",
+    "Section 12: Deployment Architecture"
+  ],
+  "scope": [
+    "Implement and validate required s004 tables for analytics and trading.",
+    "Containerized deployment with Docker/Kubernetes and Redis/Postgres.",
+    "Prometheus/Grafana metrics and alerting.",
+    "Performance and reliability test plan with go-live checklist."
+  ],
+  "deliverables": [
+    "Migration scripts for all required PRD tables.",
+    "Docker compose for local staging and K8s manifests/helm baseline.",
+    "Metrics dashboards and alert rules.",
+    "Release runbook and rollback plan."
+  ],
+  "dependencies": ["W01", "W02", "W03", "W04", "W05", "W06", "W07", "W08"],
+  "blocked_by": [],
+  "owner_role": "DevOps + Backend",
+  "estimate": {
+    "tshirt_size": "XL",
+    "ideal_days": 10
+  },
+  "success_metrics": [
+    "Option data latency under 2 seconds end-to-end.",
+    "Signal generation under 1 second after cycle trigger.",
+    "Websocket update under 200 ms median.",
+    "Production deployment reproducible from code."
+  ],
+  "risks": [
+    "Resource limits under market open spikes.",
+    "Insufficient observability for intermittent broker issues."
+  ],
+  "open_questions": [
+    "Single-cluster deployment first or separate data/compute clusters?",
+    "Target RPO/RTO requirements for disaster recovery?"
+  ]
+}

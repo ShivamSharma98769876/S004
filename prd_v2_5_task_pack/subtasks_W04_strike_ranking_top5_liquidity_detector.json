@@ -1,0 +1,57 @@
+{
+  "task_id": "W04",
+  "subtasks": [
+    {
+      "subtask_id": "W04-S01",
+      "title": "Implement confidence score formula",
+      "status": "completed",
+      "details": "Combine technical, volume, OI, Greeks, and liquidity components into final score with configurable weights.",
+      "acceptance_criteria": [
+        "Score includes all five factors.",
+        "Weights configurable without code deploy."
+      ],
+      "questions": [
+        "Default starting weights for each component?"
+      ]
+    },
+    {
+      "subtask_id": "W04-S02",
+      "title": "Create top-5 CE/PE finder",
+      "status": "completed",
+      "details": "Rank all valid strikes and output top 5 calls and puts with tie-break by volume, OI change, ATM proximity.",
+      "acceptance_criteria": [
+        "Top-5 lists generated each minute.",
+        "Tie-break logic deterministic and tested."
+      ],
+      "questions": [
+        "ATM proximity threshold for eligibility?"
+      ]
+    },
+    {
+      "subtask_id": "W04-S03",
+      "title": "Build liquidity trap classifier",
+      "status": "completed",
+      "details": "Detect bull/bear traps using OI clusters, sweep patterns, gamma concentration, and sudden reversals.",
+      "acceptance_criteria": [
+        "Alert payload includes trap_type, trigger_factors, confidence.",
+        "Liquidity zones persisted to s004_liquidity_zones."
+      ],
+      "questions": [
+        "Minimum evidence count before emitting trap alert?"
+      ]
+    },
+    {
+      "subtask_id": "W04-S04",
+      "title": "Persist ranking outputs",
+      "status": "completed",
+      "details": "Store scores and ranking snapshots in s004_strike_scores with cycle timestamp and model version.",
+      "acceptance_criteria": [
+        "Historical rank replay possible for audits.",
+        "Indexes support low-latency latest-cycle query."
+      ],
+      "questions": [
+        "Required retention period for ranking snapshots?"
+      ]
+    }
+  ]
+}

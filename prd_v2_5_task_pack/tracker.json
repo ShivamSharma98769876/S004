@@ -1,0 +1,334 @@
+{
+  "tracker_name": "PRD v2.5 Execution Tracker",
+  "source_pack": "prd_v2_5_task_pack",
+  "last_updated_utc": "2026-03-12T14:58:27.777272+00:00",
+  "status_values": [
+    "blocked",
+    "cancelled",
+    "completed",
+    "in_progress",
+    "pending"
+  ],
+  "summary": {
+    "tasks_total": 9,
+    "tasks_completed": 9,
+    "tasks_completion_pct": 100.0,
+    "subtasks_total": 37,
+    "subtasks_completed": 37,
+    "subtasks_completion_pct": 100.0,
+    "overall_units_total": 46,
+    "overall_units_completed": 46,
+    "overall_completion_pct": 100.0
+  },
+  "status_distribution": {
+    "tasks": {
+      "blocked": 0,
+      "cancelled": 0,
+      "completed": 9,
+      "in_progress": 0,
+      "pending": 0
+    },
+    "subtasks": {
+      "blocked": 0,
+      "cancelled": 0,
+      "completed": 37,
+      "in_progress": 0,
+      "pending": 0
+    }
+  },
+  "tasks": [
+    {
+      "task_id": "W01",
+      "title": "Platform Architecture and Authentication Foundation",
+      "status": "completed",
+      "task_file": "task_W01_platform_architecture_and_auth.json",
+      "subtask_file": "subtasks_W01_platform_architecture_and_auth.json",
+      "subtasks_total": 4,
+      "subtasks_completed": 4,
+      "subtasks_completion_pct": 100.0,
+      "subtasks": [
+        {
+          "subtask_id": "W01-S01",
+          "title": "Define role and permission matrix",
+          "status": "completed"
+        },
+        {
+          "subtask_id": "W01-S02",
+          "title": "Design auth token lifecycle",
+          "status": "completed"
+        },
+        {
+          "subtask_id": "W01-S03",
+          "title": "Create API and event naming conventions",
+          "status": "completed"
+        },
+        {
+          "subtask_id": "W01-S04",
+          "title": "Define cross-service observability contract",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "task_id": "W02",
+      "title": "Market Data Ingestion and Candle Builder",
+      "status": "completed",
+      "task_file": "task_W02_market_data_ingestion_and_candles.json",
+      "subtask_file": "subtasks_W02_market_data_ingestion_and_candles.json",
+      "subtasks_total": 4,
+      "subtasks_completed": 4,
+      "subtasks_completion_pct": 100.0,
+      "subtasks": [
+        {
+          "subtask_id": "W02-S01",
+          "title": "Implement websocket connector with recovery",
+          "status": "completed"
+        },
+        {
+          "subtask_id": "W02-S02",
+          "title": "Build instrument and expiry resolver",
+          "status": "completed"
+        },
+        {
+          "subtask_id": "W02-S03",
+          "title": "Create candle builder service",
+          "status": "completed"
+        },
+        {
+          "subtask_id": "W02-S04",
+          "title": "Persist and cache market snapshots",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "task_id": "W03",
+      "title": "Analytics Engines: Technical Indicators, Greeks, and OI",
+      "status": "completed",
+      "task_file": "task_W03_analytics_engines_technical_greeks_oi.json",
+      "subtask_file": "subtasks_W03_analytics_engines_technical_greeks_oi.json",
+      "subtasks_total": 4,
+      "subtasks_completed": 4,
+      "subtasks_completion_pct": 100.0,
+      "subtasks": [
+        {
+          "subtask_id": "W03-S01",
+          "title": "Implement indicator calculation pipeline",
+          "status": "completed"
+        },
+        {
+          "subtask_id": "W03-S02",
+          "title": "Implement Greeks engine",
+          "status": "completed"
+        },
+        {
+          "subtask_id": "W03-S03",
+          "title": "Implement OI and volume change processor",
+          "status": "completed"
+        },
+        {
+          "subtask_id": "W03-S04",
+          "title": "Persist analytics outputs",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "task_id": "W04",
+      "title": "Strike Ranking, Top-5 Finder, and Liquidity Trap Detector",
+      "status": "completed",
+      "task_file": "task_W04_strike_ranking_top5_liquidity_detector.json",
+      "subtask_file": "subtasks_W04_strike_ranking_top5_liquidity_detector.json",
+      "subtasks_total": 4,
+      "subtasks_completed": 4,
+      "subtasks_completion_pct": 100.0,
+      "subtasks": [
+        {
+          "subtask_id": "W04-S01",
+          "title": "Implement confidence score formula",
+          "status": "completed"
+        },
+        {
+          "subtask_id": "W04-S02",
+          "title": "Create top-5 CE/PE finder",
+          "status": "completed"
+        },
+        {
+          "subtask_id": "W04-S03",
+          "title": "Build liquidity trap classifier",
+          "status": "completed"
+        },
+        {
+          "subtask_id": "W04-S04",
+          "title": "Persist ranking outputs",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "task_id": "W05",
+      "title": "Strategy Engine and Trade Recommendation Engine",
+      "status": "completed",
+      "task_file": "task_W05_strategy_engine_and_recommendation.json",
+      "subtask_file": "subtasks_W05_strategy_engine_and_recommendation.json",
+      "subtasks_total": 4,
+      "subtasks_completed": 4,
+      "subtasks_completion_pct": 100.0,
+      "subtasks": [
+        {
+          "subtask_id": "W05-S01",
+          "title": "Define strategy schema and policy engine",
+          "status": "completed"
+        },
+        {
+          "subtask_id": "W05-S02",
+          "title": "Generate recommendation payload",
+          "status": "completed"
+        },
+        {
+          "subtask_id": "W05-S03",
+          "title": "Persist recommendation lifecycle",
+          "status": "completed"
+        },
+        {
+          "subtask_id": "W05-S04",
+          "title": "Expose recommendation APIs",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "task_id": "W06",
+      "title": "Trade Execution, Risk Management, and Portfolio Management",
+      "status": "completed",
+      "task_file": "task_W06_execution_risk_portfolio_management.json",
+      "subtask_file": "subtasks_W06_execution_risk_portfolio_management.json",
+      "subtasks_total": 4,
+      "subtasks_completed": 4,
+      "subtasks_completion_pct": 100.0,
+      "subtasks": [
+        {
+          "subtask_id": "W06-S01",
+          "title": "Implement execution adapter for paper/live",
+          "status": "completed"
+        },
+        {
+          "subtask_id": "W06-S02",
+          "title": "Implement risk gates",
+          "status": "completed"
+        },
+        {
+          "subtask_id": "W06-S03",
+          "title": "Implement trade state machine",
+          "status": "completed"
+        },
+        {
+          "subtask_id": "W06-S04",
+          "title": "Portfolio snapshot and reconciliation",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "task_id": "W07",
+      "title": "Realtime WebSocket Dashboard and Notification Alerts",
+      "status": "completed",
+      "task_file": "task_W07_realtime_websocket_dashboard_and_alerts.json",
+      "subtask_file": "subtasks_W07_realtime_websocket_dashboard_and_alerts.json",
+      "subtasks_total": 4,
+      "subtasks_completed": 4,
+      "subtasks_completion_pct": 100.0,
+      "subtasks": [
+        {
+          "subtask_id": "W07-S01",
+          "title": "Implement websocket channel contracts",
+          "status": "completed"
+        },
+        {
+          "subtask_id": "W07-S02",
+          "title": "Secure websocket authentication and authorization",
+          "status": "completed"
+        },
+        {
+          "subtask_id": "W07-S03",
+          "title": "Implement frontend stream manager",
+          "status": "completed"
+        },
+        {
+          "subtask_id": "W07-S04",
+          "title": "Alerting and escalation integration",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "task_id": "W08",
+      "title": "Strategy Marketplace and User Controls",
+      "status": "completed",
+      "task_file": "task_W08_strategy_marketplace_and_user_controls.json",
+      "subtask_file": "subtasks_W08_strategy_marketplace_and_user_controls.json",
+      "subtasks_total": 4,
+      "subtasks_completed": 4,
+      "subtasks_completion_pct": 100.0,
+      "subtasks": [
+        {
+          "subtask_id": "W08-S01",
+          "title": "Build strategy catalog model",
+          "status": "completed"
+        },
+        {
+          "subtask_id": "W08-S02",
+          "title": "Implement subscription workflow",
+          "status": "completed"
+        },
+        {
+          "subtask_id": "W08-S03",
+          "title": "Implement paper-live mode guardrails",
+          "status": "completed"
+        },
+        {
+          "subtask_id": "W08-S04",
+          "title": "Create marketplace frontend UX",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "task_id": "W09",
+      "title": "Data Model, Deployment, Observability, and Release Readiness",
+      "status": "completed",
+      "task_file": "task_W09_data_model_deployment_observability_and_release.json",
+      "subtask_file": "subtasks_W09_data_model_deployment_observability_and_release.json",
+      "subtasks_total": 5,
+      "subtasks_completed": 5,
+      "subtasks_completion_pct": 100.0,
+      "subtasks": [
+        {
+          "subtask_id": "W09-S01",
+          "title": "Implement final schema and migrations",
+          "status": "completed"
+        },
+        {
+          "subtask_id": "W09-S02",
+          "title": "Containerize platform and local stack",
+          "status": "completed"
+        },
+        {
+          "subtask_id": "W09-S03",
+          "title": "Prepare Kubernetes deployment baseline",
+          "status": "completed"
+        },
+        {
+          "subtask_id": "W09-S04",
+          "title": "Add monitoring and alerting",
+          "status": "completed"
+        },
+        {
+          "subtask_id": "W09-S05",
+          "title": "Run performance and release readiness tests",
+          "status": "completed"
+        }
+      ]
+    }
+  ]
+}

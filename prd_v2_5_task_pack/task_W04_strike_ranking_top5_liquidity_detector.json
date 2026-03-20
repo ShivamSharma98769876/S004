@@ -1,0 +1,43 @@
+{
+  "task_id": "W04",
+  "title": "Strike Ranking, Top-5 Finder, and Liquidity Trap Detector",
+  "status": "completed",
+  "priority": "critical",
+  "objective": "Rank option strikes every 60 seconds using confidence scoring, produce top CE/PE candidates, and detect liquidity traps.",
+  "prd_mapping": [
+    "Section 3: Strike Recommendation Logic",
+    "Section 5: Liquidity Trap Detector",
+    "Section 6: Top-5 Strike Finder"
+  ],
+  "scope": [
+    "Confidence score calculation from analytics factors.",
+    "Top 5 CE and top 5 PE ranking output.",
+    "Liquidity trap detection (OI clusters, volume spikes, sweeps, gamma exposure).",
+    "Persist scores and liquidity zones."
+  ],
+  "deliverables": [
+    "Scoring engine with explainability payload (factor contribution).",
+    "Top-5 ranking endpoint and stream publisher.",
+    "Liquidity detector with bull/bear trap alerts and heatmap data."
+  ],
+  "dependencies": ["W03"],
+  "blocked_by": [],
+  "owner_role": "Quant + Backend",
+  "estimate": {
+    "tshirt_size": "XL",
+    "ideal_days": 9
+  },
+  "success_metrics": [
+    "Ranking cycle completes in under 1 second after analytics inputs are ready.",
+    "Top 5 lists available each 60-second cycle.",
+    "Trap alerts include reason codes and confidence."
+  ],
+  "risks": [
+    "Score instability under noisy market intervals.",
+    "False positives in trap detector."
+  ],
+  "open_questions": [
+    "Should confidence score weights be static or strategy-specific?",
+    "How to calibrate trap detector thresholds per index?"
+  ]
+}

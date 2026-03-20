@@ -1,0 +1,46 @@
+{
+  "base_path": "/api/recommendations",
+  "version": "v1",
+  "endpoints": [
+    {
+      "method": "GET",
+      "path": "/api/recommendations/latest",
+      "query_params": ["user_id", "strategy_id", "segment", "limit"],
+      "description": "Fetch latest recommendations for user/strategy with optional segment filter."
+    },
+    {
+      "method": "GET",
+      "path": "/api/recommendations/history",
+      "query_params": ["user_id", "strategy_id", "from", "to", "page", "page_size"],
+      "description": "Fetch historical recommendations with pagination."
+    },
+    {
+      "method": "GET",
+      "path": "/api/recommendations/{recommendation_id}",
+      "query_params": [],
+      "description": "Fetch detailed recommendation object by id."
+    },
+    {
+      "method": "PATCH",
+      "path": "/api/recommendations/{recommendation_id}/status",
+      "query_params": [],
+      "description": "Update recommendation lifecycle status (ACCEPTED/EXPIRED/SKIPPED)."
+    }
+  ],
+  "response_fields": [
+    "recommendation_id",
+    "strategy_id",
+    "user_id",
+    "instrument",
+    "expiry",
+    "symbol",
+    "side",
+    "entry_price",
+    "target_price",
+    "stop_loss_price",
+    "confidence_score",
+    "reason_code",
+    "status",
+    "created_at"
+  ]
+}

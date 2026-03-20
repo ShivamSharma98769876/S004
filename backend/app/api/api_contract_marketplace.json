@@ -1,0 +1,43 @@
+{
+  "version": "v1",
+  "base_path": "/api/marketplace",
+  "endpoints": [
+    {
+      "method": "GET",
+      "path": "/api/marketplace/strategies",
+      "query": ["search", "risk_profile", "segment", "status", "page", "page_size"],
+      "description": "Search strategy catalog with filters and pagination."
+    },
+    {
+      "method": "GET",
+      "path": "/api/marketplace/strategies/{strategy_id}",
+      "query": ["version"],
+      "description": "Get strategy details and performance snapshot."
+    },
+    {
+      "method": "POST",
+      "path": "/api/marketplace/subscriptions",
+      "query": [],
+      "description": "Subscribe user to strategy version with mode and config."
+    },
+    {
+      "method": "PATCH",
+      "path": "/api/marketplace/subscriptions/{id}",
+      "query": [],
+      "description": "Pause/resume/stop subscription and update mode or config."
+    },
+    {
+      "method": "GET",
+      "path": "/api/marketplace/subscriptions/me",
+      "query": ["status", "mode"],
+      "description": "List current user subscriptions and control states."
+    }
+  ],
+  "events": [
+    "strategy.subscription.created",
+    "strategy.subscription.updated",
+    "strategy.subscription.mode_changed",
+    "strategy.subscription.paused",
+    "strategy.subscription.resumed"
+  ]
+}

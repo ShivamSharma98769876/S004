@@ -1,0 +1,102 @@
+{
+  "version": "1.0.0",
+  "base_ws_path": "/ws",
+  "channels": [
+    {
+      "channel": "/ws/market",
+      "access": "authenticated",
+      "event_schema": {
+        "event_id": "uuid",
+        "event_name": "market.tick",
+        "event_version": "1.0",
+        "timestamp_utc": "ISO8601",
+        "correlation_id": "string",
+        "data": {
+          "instrument": "string",
+          "symbol": "string",
+          "ltp": "number",
+          "volume": "number",
+          "oi": "number"
+        }
+      }
+    },
+    {
+      "channel": "/ws/strategy-signals",
+      "access": "authenticated",
+      "event_schema": {
+        "event_id": "uuid",
+        "event_name": "strategy.signal",
+        "event_version": "1.0",
+        "timestamp_utc": "ISO8601",
+        "correlation_id": "string",
+        "data": {
+          "strategy_id": "string",
+          "signal_id": "string",
+          "instrument": "string",
+          "symbol": "string",
+          "side": "BUY|SELL",
+          "confidence_score": "number"
+        }
+      }
+    },
+    {
+      "channel": "/ws/trade-updates",
+      "access": "authenticated",
+      "event_schema": {
+        "event_id": "uuid",
+        "event_name": "trade.update",
+        "event_version": "1.0",
+        "timestamp_utc": "ISO8601",
+        "correlation_id": "string",
+        "data": {
+          "trade_ref": "string",
+          "recommendation_id": "string",
+          "state": "ENTRY|ACTIVE|TRAIL|EXIT|REJECTED",
+          "pnl": "number",
+          "reason_code": "string"
+        }
+      }
+    },
+    {
+      "channel": "/ws/liquidity-alerts",
+      "access": "authenticated",
+      "event_schema": {
+        "event_id": "uuid",
+        "event_name": "liquidity.alert",
+        "event_version": "1.0",
+        "timestamp_utc": "ISO8601",
+        "correlation_id": "string",
+        "data": {
+          "instrument": "string",
+          "expiry": "string",
+          "strike": "number",
+          "trap_type": "BULL_TRAP|BEAR_TRAP",
+          "confidence": "number",
+          "reason": "string"
+        }
+      }
+    },
+    {
+      "channel": "/ws/strike-rankings",
+      "access": "authenticated",
+      "event_schema": {
+        "event_id": "uuid",
+        "event_name": "strike.ranking",
+        "event_version": "1.0",
+        "timestamp_utc": "ISO8601",
+        "correlation_id": "string",
+        "data": {
+          "instrument": "string",
+          "expiry": "string",
+          "top5_ce": "array",
+          "top5_pe": "array",
+          "cycle_ts": "ISO8601"
+        }
+      }
+    }
+  ],
+  "compatibility_rules": [
+    "Only additive changes allowed in minor versions.",
+    "Breaking field changes require major version bump and dual-publish window."
+  ]
+}

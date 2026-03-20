@@ -1,0 +1,57 @@
+{
+  "task_id": "W02",
+  "subtasks": [
+    {
+      "subtask_id": "W02-S01",
+      "title": "Implement websocket connector with recovery",
+      "status": "completed",
+      "details": "Build broker connector with ping/heartbeat, retry policy, jitter backoff, and stale-feed detection.",
+      "acceptance_criteria": [
+        "Automatic reconnect within defined SLA after disconnect.",
+        "Heartbeat alarms generated on stale stream."
+      ],
+      "questions": [
+        "Should reconnect fallback to reduced symbol set under repeated failures?"
+      ]
+    },
+    {
+      "subtask_id": "W02-S02",
+      "title": "Build instrument and expiry resolver",
+      "status": "completed",
+      "details": "Maintain mapping between symbols, strikes, expiries, and broker instrument tokens with daily refresh jobs.",
+      "acceptance_criteria": [
+        "Resolver returns valid token for active expiry.",
+        "Rollover logic tested across weekly/monthly expiry."
+      ],
+      "questions": [
+        "Do we prioritize weekly expiries by default for recommendations?"
+      ]
+    },
+    {
+      "subtask_id": "W02-S03",
+      "title": "Create candle builder service",
+      "status": "completed",
+      "details": "Aggregate ticks into OHLCV candles and publish final candle events on close.",
+      "acceptance_criteria": [
+        "1m candle open/high/low/close/volume validated against reference.",
+        "Late ticks handled without corrupting closed candles."
+      ],
+      "questions": [
+        "Should we allow candle correction window after close?"
+      ]
+    },
+    {
+      "subtask_id": "W02-S04",
+      "title": "Persist and cache market snapshots",
+      "status": "completed",
+      "details": "Write latest market snapshots to Redis and append raw stream pointers for replay/debug.",
+      "acceptance_criteria": [
+        "Snapshot keys available for subscribed strikes.",
+        "Replay job can reconstruct candles for selected intervals."
+      ],
+      "questions": [
+        "How long should raw tick retention be kept?"
+      ]
+    }
+  ]
+}

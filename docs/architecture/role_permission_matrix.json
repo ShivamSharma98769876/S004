@@ -1,0 +1,94 @@
+{
+  "version": "1.0.0",
+  "workstream": "W01",
+  "title": "Role and Permission Matrix",
+  "roles": [
+    {
+      "role": "admin",
+      "description": "Controls ingestion, strategy lifecycle, recommendation overrides, and system operations.",
+      "permissions": [
+        "auth:user.read",
+        "auth:user.update_role",
+        "market_data:ingestion.start",
+        "market_data:ingestion.stop",
+        "market_data:feed.read",
+        "strategy:create",
+        "strategy:update",
+        "strategy:publish",
+        "strategy:archive",
+        "strategy:force_disable",
+        "recommendation:read_all",
+        "recommendation:override",
+        "trade:read_all",
+        "trade:force_exit",
+        "risk:policy.update",
+        "marketplace:publish",
+        "marketplace:unpublish",
+        "analytics:read_all",
+        "alerts:manage",
+        "ops:config.read",
+        "ops:config.write",
+        "ops:service.health.read"
+      ]
+    },
+    {
+      "role": "trader",
+      "description": "Consumes recommendations, configures own strategy subscriptions, and executes in paper/live modes.",
+      "permissions": [
+        "auth:self.read",
+        "auth:self.update_profile",
+        "strategy:read_published",
+        "strategy:subscribe",
+        "strategy:unsubscribe",
+        "strategy:self_config.update",
+        "recommendation:read_self",
+        "trade:open_self",
+        "trade:close_self",
+        "trade:read_self",
+        "risk:self_limits.read",
+        "risk:self_limits.update",
+        "marketplace:read",
+        "analytics:read_self",
+        "alerts:self.read",
+        "alerts:self.update"
+      ]
+    }
+  ],
+  "endpoint_authorization": [
+    {
+      "endpoint_pattern": "/api/auth/*",
+      "allowed_roles": ["admin", "trader"],
+      "notes": "Role changes are admin-only."
+    },
+    {
+      "endpoint_pattern": "/api/admin/*",
+      "allowed_roles": ["admin"],
+      "notes": "All admin control APIs are strictly restricted."
+    },
+    {
+      "endpoint_pattern": "/api/analytics/*",
+      "allowed_roles": ["admin", "trader"],
+      "notes": "Trader scope limited to own data where applicable."
+    },
+    {
+      "endpoint_pattern": "/api/trades/*",
+      "allowed_roles": ["admin", "trader"],
+      "notes": "Trader operations are user-scoped; admin can supervise."
+    },
+    {
+      "endpoint_pattern": "/api/settings/*",
+      "allowed_roles": ["admin", "trader"],
+      "notes": "Trader can edit own settings, admin can edit defaults."
+    },
+    {
+      "endpoint_pattern": "/api/ws/*",
+      "allowed_roles": ["admin", "trader"],
+      "notes": "Channel-level ACL enforced on websocket subscriptions."
+    }
+  ],
+  "implementation_notes": [
+    "JWT claim must include: sub, role, permissions_version, org_id(optional), iat, exp.",
+    "Permission checks must be centralized as dependency/middleware.",
+    "All deny decisions should log reason_code and correlation_id."
+  ]
+}

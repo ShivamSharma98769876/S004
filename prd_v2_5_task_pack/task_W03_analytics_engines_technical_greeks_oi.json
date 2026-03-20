@@ -1,0 +1,44 @@
+{
+  "task_id": "W03",
+  "title": "Analytics Engines: Technical Indicators, Greeks, and OI",
+  "status": "completed",
+  "priority": "critical",
+  "objective": "Compute real-time analytical factors (VWAP, EMA, RSI, Greeks, OI deltas) used by strike scoring and strategy decisions.",
+  "prd_mapping": [
+    "Section 2: Greeks Calculation Engine, Technical Indicator Engine",
+    "Section 3: Strike Recommendation Inputs",
+    "Section 7: Technical Indicator, Greeks, OI Analytics engines"
+  ],
+  "scope": [
+    "Indicator computation from candles and LTP.",
+    "Greeks engine per strike (delta/gamma/theta/vega).",
+    "OI and volume change analytics.",
+    "Store outputs in normalized analytics tables."
+  ],
+  "deliverables": [
+    "Indicator service API and event publisher.",
+    "Greeks service with configurable assumptions.",
+    "OI analytics processor with rolling windows.",
+    "Persisted metrics in s004_option_chain and s004_option_greeks."
+  ],
+  "dependencies": ["W02"],
+  "blocked_by": [],
+  "owner_role": "Quant Engineer",
+  "estimate": {
+    "tshirt_size": "L",
+    "ideal_days": 8
+  },
+  "success_metrics": [
+    "Indicator update frequency matches 1-minute scoring cycle.",
+    "Greeks values verified against benchmark calculator within tolerance.",
+    "OI/volume spikes detected within one cycle."
+  ],
+  "risks": [
+    "Greeks sensitivity to IV assumptions.",
+    "Computational load at high strike counts."
+  ],
+  "open_questions": [
+    "Preferred IV source: broker feed, derived IV, or hybrid?",
+    "Do we compute Greeks for all strikes or filtered liquidity universe?"
+  ]
+}

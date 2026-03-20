@@ -1,0 +1,42 @@
+{
+  "task_id": "W07",
+  "title": "Realtime WebSocket Dashboard and Notification Alerts",
+  "status": "completed",
+  "priority": "high",
+  "objective": "Deliver real-time client streaming for market, strategy signals, trades, liquidity alerts, and strike rankings with reliable UI updates.",
+  "prd_mapping": [
+    "Section 2: Real-time WebSocket Streaming Dashboard",
+    "Section 10: WebSocket Streams",
+    "Section 11: WebSocket update latency target"
+  ],
+  "scope": [
+    "Implement websocket channels /ws/market, /ws/strategy-signals, /ws/trade-updates, /ws/liquidity-alerts, /ws/strike-rankings.",
+    "Frontend subscription manager with reconnect and backpressure handling.",
+    "Notification hooks (in-app + Telegram) for critical events."
+  ],
+  "deliverables": [
+    "Websocket server with auth and channel ACL.",
+    "Dashboard widgets updated from streaming events.",
+    "Alert delivery pipeline with retry and status tracking."
+  ],
+  "dependencies": ["W04", "W05", "W06"],
+  "blocked_by": [],
+  "owner_role": "Full-stack Engineer",
+  "estimate": {
+    "tshirt_size": "L",
+    "ideal_days": 7
+  },
+  "success_metrics": [
+    "Websocket updates under 200 ms median publish-to-client.",
+    "Client reconnect restores channel subscriptions automatically.",
+    "Critical alerts delivered with retry status."
+  ],
+  "risks": [
+    "High-frequency stream overload on UI thread.",
+    "Unbounded websocket payload growth."
+  ],
+  "open_questions": [
+    "Should all channels be user-specific or include global public channels?",
+    "Do we require message signing for websocket payload integrity?"
+  ]
+}

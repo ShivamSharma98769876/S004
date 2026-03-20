@@ -1,0 +1,41 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: s004-frontend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: s004-frontend
+  template:
+    metadata:
+      labels:
+        app: s004-frontend
+    spec:
+      containers:
+        - name: frontend
+          image: s004-frontend:latest
+          ports:
+            - containerPort: 3000
+          env:
+            - name: NEXT_PUBLIC_API_URL
+              value: http://s004-backend:8000
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 3000
+            initialDelaySeconds: 15
+            periodSeconds: 10
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: s004-frontend
+spec:
+  selector:
+    app: s004-frontend
+  ports:
+    - port: 3000
+      targetPort: 3000
+

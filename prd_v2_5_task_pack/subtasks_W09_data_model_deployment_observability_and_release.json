@@ -1,0 +1,70 @@
+{
+  "task_id": "W09",
+  "subtasks": [
+    {
+      "subtask_id": "W09-S01",
+      "title": "Implement final schema and migrations",
+      "status": "completed",
+      "details": "Create migration set for s004_option_chain, s004_option_greeks, s004_strike_scores, s004_liquidity_zones, s004_trade_recommendations, and s004_live_trades.",
+      "acceptance_criteria": [
+        "Migrations run clean in fresh and incremental environments.",
+        "Rollback scripts validated."
+      ],
+      "questions": [
+        "Alembic migrations or SQL-first migration runner?"
+      ]
+    },
+    {
+      "subtask_id": "W09-S02",
+      "title": "Containerize platform and local stack",
+      "status": "completed",
+      "details": "Create Dockerfiles and docker-compose setup for api, worker, websocket, redis, postgres, and frontend.",
+      "acceptance_criteria": [
+        "Single command boots local stack.",
+        "Environment configuration documented."
+      ],
+      "questions": [
+        "Need separate compose profiles for paper-only vs live modes?"
+      ]
+    },
+    {
+      "subtask_id": "W09-S03",
+      "title": "Prepare Kubernetes deployment baseline",
+      "status": "completed",
+      "details": "Add manifests or helm charts with autoscaling, probes, secrets, and config maps.",
+      "acceptance_criteria": [
+        "Staging deployment successful in cluster.",
+        "Health probes and rolling updates verified."
+      ],
+      "questions": [
+        "Preferred packaging: Helm or Kustomize?"
+      ]
+    },
+    {
+      "subtask_id": "W09-S04",
+      "title": "Add monitoring and alerting",
+      "status": "completed",
+      "details": "Instrument services with Prometheus metrics; build Grafana dashboards and alert rules for latency, errors, disconnect rates, and queue lag.",
+      "acceptance_criteria": [
+        "Dashboards cover all critical services.",
+        "Alert routing tested in staging."
+      ],
+      "questions": [
+        "Who receives production incident alerts and escalation policy?"
+      ]
+    },
+    {
+      "subtask_id": "W09-S05",
+      "title": "Run performance and release readiness tests",
+      "status": "completed",
+      "details": "Execute load and soak tests against PRD SLAs and prepare go-live checklist with rollback plan.",
+      "acceptance_criteria": [
+        "SLA report generated for all PRD targets.",
+        "Go-live checklist signed by engineering and product."
+      ],
+      "questions": [
+        "Minimum duration for soak testing before production launch?"
+      ]
+    }
+  ]
+}

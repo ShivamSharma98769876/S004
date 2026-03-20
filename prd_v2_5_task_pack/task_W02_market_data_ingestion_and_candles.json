@@ -1,0 +1,44 @@
+{
+  "task_id": "W02",
+  "title": "Market Data Ingestion and Candle Builder",
+  "status": "completed",
+  "priority": "critical",
+  "objective": "Implement reliable broker market data ingestion, normalize ticks, and build OHLC candles for downstream analytics engines.",
+  "prd_mapping": [
+    "Section 2: Real-time Option Chain Analytics",
+    "Section 7: Market Data Ingestion Service, Candle Builder Service",
+    "Section 8: Data Flow Architecture"
+  ],
+  "scope": [
+    "Broker websocket connector with reconnect and backoff.",
+    "Tick normalization and symbol mapping.",
+    "Candle aggregation for 1m and configurable frames.",
+    "Publish market streams to queue and cache."
+  ],
+  "deliverables": [
+    "Ingestion service with heartbeat and reconnect logic.",
+    "Candle builder module with deterministic outputs.",
+    "Backfill and gap-detection handling for short disconnects.",
+    "Operational dashboards for ingestion health."
+  ],
+  "dependencies": ["W01"],
+  "blocked_by": ["Auth decision for admin-only ingestion controls"],
+  "owner_role": "Market Data Engineer",
+  "estimate": {
+    "tshirt_size": "L",
+    "ideal_days": 7
+  },
+  "success_metrics": [
+    "Tick-to-queue latency under 500 ms median.",
+    "No candle gaps in normal market session.",
+    "Automatic recovery from websocket disconnect."
+  ],
+  "risks": [
+    "Broker throttling and intermittent feed drops.",
+    "Instrument token map drift on expiry rollovers."
+  ],
+  "open_questions": [
+    "Single broker source or broker abstraction from first release?",
+    "How many symbols/strikes should be subscribed per index initially?"
+  ]
+}

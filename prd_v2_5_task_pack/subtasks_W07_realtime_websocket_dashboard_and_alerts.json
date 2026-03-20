@@ -1,0 +1,57 @@
+{
+  "task_id": "W07",
+  "subtasks": [
+    {
+      "subtask_id": "W07-S01",
+      "title": "Implement websocket channel contracts",
+      "status": "completed",
+      "details": "Define payload schema for each channel with event version, timestamp, correlation id, and data object.",
+      "acceptance_criteria": [
+        "Schemas published and validated.",
+        "Backward-compatible event versioning in place."
+      ],
+      "questions": [
+        "Do we need binary payloads for performance or JSON is acceptable?"
+      ]
+    },
+    {
+      "subtask_id": "W07-S02",
+      "title": "Secure websocket authentication and authorization",
+      "status": "completed",
+      "details": "Authenticate socket sessions and enforce role-based access for admin-only streams.",
+      "acceptance_criteria": [
+        "Unauthorized sockets denied.",
+        "Role restrictions tested across channels."
+      ],
+      "questions": [
+        "Token in query param or subprotocol header?"
+      ]
+    },
+    {
+      "subtask_id": "W07-S03",
+      "title": "Implement frontend stream manager",
+      "status": "completed",
+      "details": "Create reusable client manager for subscribe/unsubscribe, reconnect, and state update dispatch.",
+      "acceptance_criteria": [
+        "UI resumes updates after temporary disconnect.",
+        "No memory leaks after route changes."
+      ],
+      "questions": [
+        "Should state be managed with Redux/Zustand or React context?"
+      ]
+    },
+    {
+      "subtask_id": "W07-S04",
+      "title": "Alerting and escalation integration",
+      "status": "completed",
+      "details": "Send critical events (trap alerts, execution failures, risk breach) to notification channels with retry and status tracking.",
+      "acceptance_criteria": [
+        "Critical alert emitted to configured channels.",
+        "Alert status visible in audit logs."
+      ],
+      "questions": [
+        "Need SMS/email fallback besides Telegram?"
+      ]
+    }
+  ]
+}

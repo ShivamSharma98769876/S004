@@ -1,0 +1,57 @@
+{
+  "task_id": "W06",
+  "subtasks": [
+    {
+      "subtask_id": "W06-S01",
+      "title": "Implement execution adapter for paper/live",
+      "status": "completed",
+      "details": "Route orders to simulation engine or live broker based on user mode with shared interface and common response schema.",
+      "acceptance_criteria": [
+        "Same request payload works for paper and live.",
+        "Execution response includes broker order id when live."
+      ],
+      "questions": [
+        "Can users switch mode mid-session for active strategy?"
+      ]
+    },
+    {
+      "subtask_id": "W06-S02",
+      "title": "Implement risk gates",
+      "status": "completed",
+      "details": "Add pre-trade checks (daily loss, max open trades, exposure limits) and post-trade checks (slippage alerts, margin utilization).",
+      "acceptance_criteria": [
+        "Blocked trades emit explicit reason code.",
+        "Risk events persisted for audit."
+      ],
+      "questions": [
+        "Need separate limits per index segment (NIFTY/BANKNIFTY/SENSEX)?"
+      ]
+    },
+    {
+      "subtask_id": "W06-S03",
+      "title": "Implement trade state machine",
+      "status": "completed",
+      "details": "Manage ENTRY, ACTIVE, TRAIL, EXIT states with consistent transition guards and persistence.",
+      "acceptance_criteria": [
+        "Invalid transitions rejected.",
+        "Every state change recorded in event log."
+      ],
+      "questions": [
+        "Should trailing rules vary by strategy or remain global?"
+      ]
+    },
+    {
+      "subtask_id": "W06-S04",
+      "title": "Portfolio snapshot and reconciliation",
+      "status": "completed",
+      "details": "Provide per-user positions, realized/unrealized PnL, and broker reconciliation tasks for divergence detection.",
+      "acceptance_criteria": [
+        "Portfolio API updates near real time.",
+        "Reconciliation job flags mismatches automatically."
+      ],
+      "questions": [
+        "How often should live reconciliation run (30s, 60s, 5m)?"
+      ]
+    }
+  ]
+}
