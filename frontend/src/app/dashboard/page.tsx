@@ -187,6 +187,8 @@ type DashboardSummary = {
   unrealized_pnl: number;
   charges_today?: number;
   win_rate_pct: number;
+  /** Consecutive ISO weeks (Mon-based) with at least one closed trade, ending at last active week */
+  trading_week_streak?: number;
 };
 
 type DashboardFunds = {
@@ -381,6 +383,9 @@ export default function DashboardPage() {
   const targetProgress = Math.min(100, Math.round((netPnl / Math.max(setup.capitalRisk.maxProfitDay, 1)) * 100));
   const winRate = summary ? summary.win_rate_pct : closedTrades ? 100 : 0;
   const avgPerTrade = closedTrades ? netPnl / closedTrades : 0;
+  const tradingWeekStreak = Math.max(0, Math.floor(summary?.trading_week_streak ?? 0));
+  const tradingWeekStreakLabel =
+    tradingWeekStreak === 0 ? "+0W" : `+${tradingWeekStreak}W`;
   const estimatedMarginUsed =
     funds?.used_margin ??
     (setup.master.engineRunning
@@ -683,7 +688,12 @@ export default function DashboardPage() {
         </div>
         <div className="dash-kpi-card panel-accent-risk">
           <div className="summary-label">CURRENT STREAK</div>
-          <div className="summary-value metric-positive">+3W</div>
+          <div
+            className="summary-value metric-positive"
+            title="Consecutive weeks (IST, Mon start) with at least one closed trade; closed_at treated as UTC in the database"
+          >
+            {tradingWeekStreakLabel}
+          </div>
         </div>
       </section>
 

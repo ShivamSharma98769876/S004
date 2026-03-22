@@ -4,9 +4,9 @@ Configure under `strategy_details_json.heuristicEnhancements` for `strategyType:
 
 ## Enable / disable
 
-- Omit the key → legacy behavior (all liquid strikes ranked, no post-processing).
-- `"heuristicEnhancements": {}` → treated as disabled (`enabled: false`).
-- Set `"enabled": true` with parameters below.
+- Omit the key or `{}` → runtime uses **`DEFAULT_HEURISTIC_ENHANCEMENTS`** in `heuristic_enhancements.py` (same values as below, **`enabled: true`**).
+- To turn post-filters off: set **`"enabled": false`** inside a non-empty object (e.g. `{ "enabled": false }`).
+- Otherwise set **`"enabled": true`** and override any parameters below.
 
 ## Keys (JSON)
 

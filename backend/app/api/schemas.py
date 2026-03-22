@@ -98,7 +98,13 @@ def _format_exit_reason(reason_code: str | None) -> str:
         return "Target Hit"
     if reason_code == "SL_HIT":
         return "SL Triggered"
-    return "Manual"
+    if reason_code in ("ADMIN_CLOSE", "ADMIN", "FORCED_EXIT"):
+        return "Admin Close"
+    if reason_code in ("MANUAL", "MANUAL_EXECUTE", "USER_EXIT"):
+        return "Manual"
+    if not reason_code:
+        return "Unknown"
+    return str(reason_code).replace("_", " ").title()
 
 
 class TradeOut(BaseModel):

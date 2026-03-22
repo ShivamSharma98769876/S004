@@ -22,16 +22,20 @@ async def apply_schema() -> None:
 
     migrations_dir = Path(__file__).resolve().parent.parent / "db" / "migrations"
     schema_file = migrations_dir / "functional_core_schema.sql"
+    auth_file = migrations_dir / "user_auth_approval_schema.sql"
     seed_file = migrations_dir / "functional_seed.sql"
     sql = _read_sql(schema_file)
+    auth_sql = _read_sql(auth_file)
     seed_sql = _read_sql(seed_file)
 
     conn = await asyncpg.connect(dsn=db_url)
     try:
         # asyncpg can execute a multi-statement script for DDL.
         await conn.execute(sql)
+        await conn.execute(auth_sql)
         await conn.execute(seed_sql)
         print(f"Applied schema successfully: {schema_file.name}")
+        print(f"Applied auth columns: {auth_file.name}")
         print(f"Applied seed successfully: {seed_file.name}")
     finally:
         await conn.close()

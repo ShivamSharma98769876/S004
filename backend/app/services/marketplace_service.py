@@ -15,6 +15,12 @@ def _strategy_explainer(strategy_id: str, display_name: str, description: str) -
             "with price-action continuation and risk checks; exits are managed using SL, target, "
             "and breakeven rules from your settings."
         )
+    if "ivr-trend-short" in sid or "ivr trend short" in name:
+        return (
+            "Nifty IVR Trend Short sells naked NIFTY puts in spot uptrends and naked calls in spot "
+            "downtrends when chain IV rank is elevated; strikes target |delta| 0.29-0.35. "
+            "Margin required; lot size, target, and stop loss come from your settings."
+        )
     if "vwap" in sid or "vwap" in name:
         return (
             "VWAP Pullback waits for price to retrace near VWAP and rejoin trend direction. "

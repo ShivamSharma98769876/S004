@@ -220,6 +220,140 @@ def _bars_since_bullish_cross(ltps: list[float], fast_period: int = 9, slow_peri
     return None
 
 
+def _bars_since_bearish_cross(ltps: list[float], fast_period: int = 9, slow_period: int = 21) -> int | None:
+    """Bars since fast EMA crossed below slow (bearish cross), or None if none in history."""
+    min_len = max(fast_period, slow_period) + 2
+    if len(ltps) < min_len:
+        return None
+    for i in range(len(ltps) - 1, 0, -1):
+        window_curr = ltps[: i + 1]
+        window_prev = ltps[:i]
+        if len(window_prev) < min_len - 1:
+            continue
+        ema_fast_prev = _ema(window_prev, fast_period)
+        ema_slow_prev = _ema(window_prev, slow_period)
+        ema_fast_curr = _ema(window_curr, fast_period)
+        ema_slow_curr = _ema(window_curr, slow_period)
+        if ema_fast_prev >= ema_slow_prev and ema_fast_curr < ema_slow_curr:
+            return (len(ltps) - 1) - i
+    return None
+
+
+def _indicator_pack_from_series_bearish(
+    ltps: list[float],
+    vols: list[float],
+    score_threshold: int = 3,
+    max_candles_since_cross: int | None = None,
+    rsi_min: float = 50,
+    rsi_max: float = 75,
+    volume_min_ratio: float = 1.5,
+) -> dict[str, Any]:
+    """Bearish mirror of _indicator_pack_from_series: price below VWAP, EMA9 < EMA21, RSI in lower band."""
+    if not ltps:
+        return {
+            "ema9": 0.0,
+            "ema21": 0.0,
+            "rsi": 50.0,
+            "vwap": 0.0,
+            "avgVolume": 0.0,
+            "volumeSpikeRatio": 0.0,
+            "score": 0,
+            "primaryOk": False,
+            "emaOk": False,
+            "emaCrossoverOk": False,
+            "rsiOk": False,
+            "volumeOk": False,
+            "signalEligible": False,
+        }
+    rsi_bear_lo = max(0.0, 100.0 - float(rsi_max))
+    rsi_bear_hi = min(100.0, 100.0 - float(rsi_min))
+    if rsi_bear_lo > rsi_bear_hi:
+        rsi_bear_lo, rsi_bear_hi = rsi_bear_hi, rsi_bear_lo
+    close_now = ltps[-1]
+    vol_now = vols[-1] if vols else 0.0
+    ema9 = _ema(ltps[-30:], 9)
+    ema21 = _ema(ltps[-30:], 21)
+    ema_crossover = False
+    if len(ltps) >= 22:
+        if max_candles_since_cross is not None:
+            bars_since = _bars_since_bearish_cross(ltps, 9, 21)
+            ema_crossover = bars_since is not None and bars_since <= max_candles_since_cross
+        else:
+            ema9_prev = _ema(ltps[-31:-1], 9)
+            ema21_prev = _ema(ltps[-31:-1], 21)
+            ema_crossover = (ema9_prev >= ema21_prev) and (ema9 < ema21)
+    if len(ltps) >= 3:
+        rsi = _rsi(ltps[-30:], min(14, len(ltps) - 1))
+    else:
+        rsi = 50.0
+    v_sum = sum(max(0.0, v) for v in vols)
+    if v_sum > 0:
+        vwap = sum(p * max(0.0, v) for p, v in zip(ltps, vols)) / v_sum
+    else:
+        vwap = statistics.mean(ltps)
+    avg_vol = statistics.mean(vols[:-1]) if len(vols) > 1 else max(1.0, vol_now)
+    vol_ratio = (vol_now / avg_vol) if avg_vol > 0 else 0.0
+    primary_ok = close_now < vwap
+    ema_ok = ema9 < ema21
+    rsi_ok = rsi_bear_lo <= rsi <= rsi_bear_hi
+    volume_ok = vol_ratio > volume_min_ratio
+    score = (1 if primary_ok else 0) + (1 if ema_ok else 0) + (1 if ema_crossover else 0) + (1 if rsi_ok else 0) + (1 if volume_ok else 0)
+    return {
+        "ema9": round(ema9, 2),
+        "ema21": round(ema21, 2),
+        "rsi": round(rsi, 2),
+        "vwap": round(vwap, 2),
+        "avgVolume": float(round(avg_vol, 2)),
+        "volumeSpikeRatio": round(vol_ratio, 2),
+        "score": score,
+        "primaryOk": primary_ok,
+        "emaOk": ema_ok,
+        "emaCrossoverOk": ema_crossover,
+        "rsiOk": rsi_ok,
+        "volumeOk": volume_ok,
+        "signalEligible": primary_ok and score >= score_threshold,
+    }
+
+
+def _spot_trend_payload_from_candles(
+    candles: list[dict[str, Any]],
+    indicator_params: dict[str, Any],
+    score_threshold: int,
+) -> dict[str, Any]:
+    """NIFTY spot trend scores for short-premium: bullish vs bearish regime (mutually exclusive when possible)."""
+    closes: list[float] = []
+    vols: list[float] = []
+    for c in candles:
+        cl = float(c.get("close", 0) or 0)
+        if cl <= 0:
+            continue
+        closes.append(cl)
+        vols.append(float(c.get("volume") or 0))
+    if len(closes) < 5:
+        return {"spotBullishScore": 0, "spotBearishScore": 0, "spotRegime": None}
+    ip = indicator_params or {}
+    max_cross = ip.get("max_candles_since_cross")
+    rsi_min = float(ip.get("rsi_min", 50))
+    rsi_max = float(ip.get("rsi_max", 75))
+    vol_min = float(ip.get("volume_min_ratio", 1.5))
+    bull = _indicator_pack_from_series(
+        closes, vols, score_threshold, max_cross, rsi_min, rsi_max, vol_min
+    )
+    bear = _indicator_pack_from_series_bearish(
+        closes, vols, score_threshold, max_cross, rsi_min, rsi_max, vol_min
+    )
+    bs = int(bull["score"])
+    be = int(bear["score"])
+    st = int(score_threshold)
+    if bs >= st and be < st:
+        regime: str | None = "bullish"
+    elif be >= st and bs < st:
+        regime = "bearish"
+    else:
+        regime = None
+    return {"spotBullishScore": bs, "spotBearishScore": be, "spotRegime": regime}
+
+
 def _indicator_pack_from_series(
     ltps: list[float],
     vols: list[float],
@@ -856,7 +990,17 @@ def fetch_option_chain_sync(
     if kite is None and require_live:
         raise RuntimeError("Live Zerodha connection is required for option chain data.")
 
-    ip = indicator_params or {}
+    ip = dict(indicator_params or {})
+    ip.setdefault("spotScoreThreshold", score_threshold)
+    short_pm = str(ip.get("positionIntent", "")).lower() == "short_premium"
+
+    spot_candles: list[dict[str, Any]] = []
+    if kite and (
+        short_pm
+        or (ip.get("adx_min_threshold") is not None and float(ip.get("adx_min_threshold") or 0) > 0)
+    ):
+        spot_candles = _fetch_spot_candles(kite, instrument)
+
     if kite is None:
         chain = _build_synthetic_chain(instrument, expiry_date, spot, strikes_up, strikes_down)
     else:
@@ -868,16 +1012,20 @@ def fetch_option_chain_sync(
 
     adx_val: float | None = None
     adx_min = ip.get("adx_min_threshold")
-    if kite and adx_min is not None and adx_min > 0:
-        candles = _fetch_spot_candles(kite, instrument)
+    if spot_candles and adx_min is not None and float(adx_min) > 0:
         adx_period = int(ip.get("adx_period", 14))
-        adx_val = _adx_from_candles(candles, adx_period)
-        if adx_val < adx_min:
+        adx_val = _adx_from_candles(spot_candles, adx_period)
+        if adx_val < float(adx_min):
             for row in chain:
                 for leg_key in ("call", "put"):
                     leg = row.get(leg_key)
                     if leg:
                         leg["signalEligible"] = False
+
+    spot_trend: dict[str, Any] = {"spotBullishScore": 0, "spotBearishScore": 0, "spotRegime": None}
+    if short_pm and spot_candles:
+        spot_trend = _spot_trend_payload_from_candles(spot_candles, ip, int(score_threshold))
+
     total_call_oi = sum(float(x["call"]["oi"]) for x in chain)
     total_put_oi = sum(float(x["put"]["oi"]) for x in chain)
     total_call_vol = sum(float(x["call"]["volume"]) for x in chain)
@@ -896,8 +1044,9 @@ def fetch_option_chain_sync(
         "from_cache": False,
         "using_live_broker": bool(kite),
         "window_size": _window_size(),
+        **spot_trend,
     }
     if adx_val is not None:
         out["adx"] = adx_val
-        out["adxOk"] = adx_val >= (adx_min or 0)
+        out["adxOk"] = adx_val >= float(adx_min or 0)
     return out

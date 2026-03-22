@@ -13,6 +13,7 @@ from kiteconnect import KiteConnect
 from app.db_client import execute, fetch, fetchrow
 from app.services.heuristic_scorer import score_leg as heuristic_score_leg
 from app.services.heuristic_enhancements import (
+    DEFAULT_HEURISTIC_ENHANCEMENTS,
     HeuristicEnhancementConfig,
     apply_moneyness_dte_rules,
     joint_score_multiplier,
@@ -143,17 +144,24 @@ async def _get_live_candidates(
     rsi_min: float = 50,
     rsi_max: float = 75,
     volume_min_ratio: float = 1.5,
+    position_intent: str = "long_premium",
+    ivr_min_threshold: float = 0.0,
+    strike_delta_min_abs: float = 0.29,
+    strike_delta_max_abs: float = 0.35,
 ) -> list[dict]:
     instrument = "NIFTY"
     expiries = get_expiries_for_instrument(instrument)
     if not expiries:
         return []
     expiry_str = expiries[0]
+    use_short = str(position_intent).strip().lower() == "short_premium"
     indicator_params: dict[str, Any] = {
         "rsi_min": float(rsi_min),
         "rsi_max": float(rsi_max),
         "volume_min_ratio": float(volume_min_ratio),
     }
+    if use_short:
+        indicator_params["positionIntent"] = "short_premium"
     if ema_crossover_max_candles is not None:
         indicator_params["max_candles_since_cross"] = ema_crossover_max_candles
     if adx_min_threshold is not None:
@@ -173,9 +181,13 @@ async def _get_live_candidates(
     spot = float(chain_payload.get("spot") or 0.0)
     if not chain or spot <= 0:
         return []
+    spot_regime = chain_payload.get("spotRegime")
+    spot_bull = int(chain_payload.get("spotBullishScore") or 0)
+    spot_bear = int(chain_payload.get("spotBearishScore") or 0)
     step = 50
     atm = round(spot / step) * step
     recs: list[dict] = []
+    conf_denom = max(1, int(score_max))
     for row in chain:
         strike = int(float(row.get("strike", 0)))
         distance_to_atm = int((strike - atm) / step)
@@ -187,27 +199,72 @@ async def _get_live_candidates(
             volume = int(float(leg.get("volume") or 0))
             if oi < strike_min_oi or volume < strike_min_volume:
                 continue
-            score = int(leg.get("score") or 0)
+            if use_short:
+                if spot_regime == "bullish" and opt_type != "PE":
+                    continue
+                if spot_regime == "bearish" and opt_type != "CE":
+                    continue
+                if spot_regime not in ("bullish", "bearish"):
+                    continue
+            ltp = float(leg.get("ltp") or 0.0)
+            delta = float(leg.get("delta") or 0.0)
+            delta_abs = abs(delta)
             ivr = leg.get("ivr")
-            if ivr_bonus > 0 and ivr is not None:
-                try:
-                    ivr_val = float(ivr)
-                    if ivr_val < ivr_max_threshold:
-                        score = min(score_max, score + ivr_bonus)
-                except (TypeError, ValueError):
-                    pass
-            signal_eligible = bool(leg.get("signalEligible"))
+            if use_short:
+                if ivr_min_threshold > 0:
+                    if ivr is None:
+                        continue
+                    try:
+                        if float(ivr) < float(ivr_min_threshold):
+                            continue
+                    except (TypeError, ValueError):
+                        continue
+                if delta_abs < strike_delta_min_abs - 1e-9 or delta_abs > strike_delta_max_abs + 1e-9:
+                    continue
+                spot_score = spot_bull if opt_type == "PE" else spot_bear
+                score = int(spot_score)
+                signal_eligible = score >= int(score_threshold)
+                ivr_note = float(ivr) if ivr is not None else None
+                failed_msg = (
+                    "PASS"
+                    if signal_eligible
+                    else (
+                        f"NIFTY spot trend score {score} < {int(score_threshold)} "
+                        f"(regime={spot_regime}, IVR={ivr_note})"
+                    )
+                )
+                side = "SELL"
+                target_price = round(max(0.05, ltp * 0.75), 2)
+                stop_loss_price = round(ltp * 1.35, 2)
+            else:
+                score = int(leg.get("score") or 0)
+                if ivr_bonus > 0 and ivr is not None:
+                    try:
+                        ivr_val = float(ivr)
+                        if ivr_val < ivr_max_threshold:
+                            score = min(score_max, score + ivr_bonus)
+                    except (TypeError, ValueError):
+                        pass
+                signal_eligible = bool(leg.get("signalEligible"))
+                side = "BUY"
+                target_price = round(ltp * 1.08, 2)
+                stop_loss_price = round(ltp * 0.94, 2)
+                failed_msg = _failed_conditions(
+                    bool(leg.get("primaryOk")),
+                    bool(leg.get("emaOk")),
+                    bool(leg.get("rsiOk")),
+                    rsi_min=rsi_min,
+                    rsi_max=rsi_max,
+                )
             vol_ratio = float(leg.get("volumeSpikeRatio") or 0.0)
-            base_conf = (score / max(1, score_max)) * 100
+            base_conf = (score / conf_denom) * 100
             vol_bonus = max(0.0, min(19.0, (vol_ratio - 1.0) * 10))
             confidence = min(99.0, round(base_conf + vol_bonus, 2))
-            ltp = float(leg.get("ltp") or 0.0)
             primary_ok = bool(leg.get("primaryOk"))
             ema_ok = bool(leg.get("emaOk"))
             ema_crossover_ok = bool(leg.get("emaCrossoverOk"))
             rsi_ok = bool(leg.get("rsiOk"))
             volume_ok = bool(leg.get("volumeOk"))
-            delta = float(leg.get("delta") or 0.0)
             oi_chg_pct = float(leg.get("oiChgPct") or 0.0)
             target_delta = strike_delta_ce if opt_type == "CE" else strike_delta_pe
             delta_distance = abs(delta - target_delta)
@@ -217,10 +274,10 @@ async def _get_live_candidates(
                     "instrument": instrument,
                     "expiry": expiry_str,
                     "symbol": symbol,
-                    "side": "BUY",
+                    "side": side,
                     "entry_price": round(ltp, 2),
-                    "target_price": round(ltp * 1.08, 2),
-                    "stop_loss_price": round(ltp * 0.94, 2),
+                    "target_price": target_price,
+                    "stop_loss_price": stop_loss_price,
                     "confidence_score": confidence,
                     "vwap": float(leg.get("vwap") or 0.0),
                     "ema9": float(leg.get("ema9") or 0.0),
@@ -236,10 +293,7 @@ async def _get_live_candidates(
                     "rsi_ok": rsi_ok,
                     "volume_ok": volume_ok,
                     "signal_eligible": signal_eligible,
-                    "failed_conditions": _failed_conditions(
-                        primary_ok, ema_ok, rsi_ok,
-                        rsi_min=rsi_min, rsi_max=rsi_max,
-                    ),
+                    "failed_conditions": failed_msg,
                     "spot_price": round(spot, 2),
                     "timeframe": "3m",
                     "refresh_interval_sec": 30,
@@ -248,6 +302,7 @@ async def _get_live_candidates(
                     "oi_chg_pct": oi_chg_pct,
                     "delta": delta,
                     "delta_distance": delta_distance,
+                    "option_type": opt_type,
                 }
             )
     recs.sort(
@@ -545,8 +600,29 @@ async def get_strategy_score_params(
     _stp = details.get("scoreThresholdPE")
     score_threshold_pe = float(_stp) if isinstance(_stp, (int, float)) else None
 
+    position_intent = str(details.get("positionIntent", "long_premium")).strip().lower()
+    if position_intent not in ("long_premium", "short_premium"):
+        position_intent = "long_premium"
+    ivr_min_threshold = float(ivr_cfg["minThreshold"]) if isinstance(ivr_cfg.get("minThreshold"), (int, float)) else 0.0
+    _dmin = strike_cfg.get("deltaMinAbs")
+    _dmax = strike_cfg.get("deltaMaxAbs")
+    strike_delta_min_abs = (
+        float(_dmin)
+        if isinstance(_dmin, (int, float))
+        else (0.29 if position_intent == "short_premium" else 0.0)
+    )
+    strike_delta_max_abs = (
+        float(_dmax)
+        if isinstance(_dmax, (int, float))
+        else (0.35 if position_intent == "short_premium" else 1.0)
+    )
+
     return {
         "strategy_type": strategy_type,
+        "position_intent": position_intent,
+        "ivr_min_threshold": ivr_min_threshold,
+        "strike_delta_min_abs": strike_delta_min_abs,
+        "strike_delta_max_abs": strike_delta_max_abs,
         "heuristics": heuristics_cfg,
         "heuristics_ce": heuristics_ce,
         "heuristics_pe": heuristics_pe,
@@ -703,6 +779,12 @@ async def ensure_recommendations(user_id: int, kite: KiteConnect | None = None) 
         score_max = score_params["score_max"]
         ivr_max_threshold = score_params.get("ivr_max_threshold", 20.0)
         ivr_bonus = score_params.get("ivr_bonus", 0)
+        position_intent = str(score_params.get("position_intent", "long_premium"))
+        ivr_min_threshold = float(score_params.get("ivr_min_threshold", 0.0))
+        strike_delta_min_abs = float(score_params.get("strike_delta_min_abs", 0.29))
+        strike_delta_max_abs = float(score_params.get("strike_delta_max_abs", 0.35))
+        if position_intent == "short_premium":
+            ivr_bonus = 0
         ema_crossover_max_candles = score_params.get("ema_crossover_max_candles")
         adx_period = score_params.get("adx_period", 14)
         adx_min_threshold = score_params.get("adx_min_threshold")
@@ -720,11 +802,11 @@ async def ensure_recommendations(user_id: int, kite: KiteConnect | None = None) 
             if strategy_type == "heuristic-voting":
                 heuristics_cfg = score_params.get("heuristics") or {}
                 raw_enh = score_params.get("heuristic_enhancements")
-                enhancement_cfg = (
-                    HeuristicEnhancementConfig.from_dict(raw_enh)
-                    if isinstance(raw_enh, dict)
-                    else None
-                )
+                # Missing/empty → DEFAULT_HEURISTIC_ENHANCEMENTS (enabled, loss-reduction filters on).
+                if not isinstance(raw_enh, dict) or len(raw_enh) == 0:
+                    enhancement_cfg = HeuristicEnhancementConfig.from_dict(DEFAULT_HEURISTIC_ENHANCEMENTS)
+                else:
+                    enhancement_cfg = HeuristicEnhancementConfig.from_dict(raw_enh)
                 generated_rows = await _get_live_candidates_heuristic(
                     kite,
                     max_strike_distance,
@@ -763,6 +845,10 @@ async def ensure_recommendations(user_id: int, kite: KiteConnect | None = None) 
                     rsi_min=rsi_min,
                     rsi_max=rsi_max,
                     volume_min_ratio=volume_min_ratio,
+                    position_intent=position_intent,
+                    ivr_min_threshold=ivr_min_threshold,
+                    strike_delta_min_abs=strike_delta_min_abs,
+                    strike_delta_max_abs=strike_delta_max_abs,
                 )
         except Exception:
             generated_rows = []

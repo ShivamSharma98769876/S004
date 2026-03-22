@@ -13,6 +13,8 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from app.services.heuristic_enhancements import DEFAULT_HEURISTIC_ENHANCEMENTS
+
 HEURISTIC_STRATEGY_DETAILS = {
     "strategyType": "heuristic-voting",
     "displayName": "Multi-Heuristic Strike Selector",
@@ -37,31 +39,20 @@ HEURISTIC_STRATEGY_DETAILS = {
         "description": "Liquidity: min OI 10k, min volume 500.",
     },
     "heuristicEnhancements": {
-        "enabled": True,
-        "maxMoneynessPct": 1.2,
-        "moneynessOverrideMinScore": 4.5,
-        "flatSpotBandPct": 0.08,
-        "flatOiPct": 0.5,
-        "volumeHighRatio": 1.5,
-        "oiChurnAbsPct": 0.35,
-        "churnScoreMultiplier": 0.94,
-        "ltpStrongPct": 2.0,
-        "oiWeightWhenLtpStrong": 0.45,
-        "maxLtpOiCombinedWeightShare": 0.88,
-        "jointMinMult": 0.72,
-        "jointMaxMult": 1.08,
-        "bestPerSideMinGap": 0.35,
-        "singleDirectionOnly": False,
-        "singleDirectionMinSpread": 0.4,
-        "ceRequiresSpotNotDown": False,
-        "peRequiresSpotNotUp": False,
-        "directionalGateFlatBandPct": 0.05,
-        "description": "Moneyness hard cap, DTE×moneyness matrix, spot×OI joint multipliers, volume/OI churn dampening, LTP/OI decorrelation, one best CE and one best PE.",
+        **DEFAULT_HEURISTIC_ENHANCEMENTS,
+        "description": (
+            "Moneyness hard cap, DTE×moneyness matrix, spot×OI joint multipliers, volume/OI churn dampening, "
+            "LTP/OI decorrelation, one best CE and one best PE."
+        ),
     },
     "scoreThreshold": 3.0,
     "scoreMax": 5.0,
     "autoTradeScoreThreshold": 3.5,
-    "scoreDescription": "Weighted average of 9 heuristics. Signal when score >= 3.0.",
+    "scoreDescription": (
+        "Weighted average of 9 heuristics (OI buildup, IVR, volume, RSI, EMA, VWAP, delta fit, OI change, LTP change). "
+        "Post-filters: moneyness cap, DTE matrix, joint spot x OI, churn dampening, best CE and best PE. "
+        "Signal when enhanced score >= 3.0."
+    ),
 }
 
 

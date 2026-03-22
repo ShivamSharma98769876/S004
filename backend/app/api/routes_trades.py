@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+from typing import Any
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -417,17 +419,170 @@ async def get_trade_history(
     return out
 
 
-@router.get("/reports")
-async def get_trade_reports(user_id: int = Depends(get_user_id)) -> list[dict]:
-    """Return all closed trades for Reports. Admin sees all users' trades with username; users see only their own."""
-    from app.api.schemas import _format_exit_reason
+def _build_reports_filter_sql(
+    *,
+    is_admin: bool,
+    user_id: int,
+    from_d: date | None,
+    to_d: date | None,
+    mode_upper: str,
+    strategy_id: str | None,
+    strategy_version: str | None,
+    filter_user_id: int | None,
+    taken_upper: str,
+) -> tuple[str, list]:
+    """Returns WHERE fragment (without WHERE keyword) and args list for parameterized query."""
+    parts = ["t.current_state = 'EXIT'", "t.closed_at IS NOT NULL"]
+    args: list = []
+    idx = 1
 
+    if from_d is not None:
+        parts.append(f"t.closed_at::date >= ${idx}")
+        args.append(from_d)
+        idx += 1
+    if to_d is not None:
+        parts.append(f"t.closed_at::date <= ${idx}")
+        args.append(to_d)
+        idx += 1
+
+    if mode_upper == "PAPER":
+        parts.append("t.mode = 'PAPER'")
+    elif mode_upper == "LIVE":
+        parts.append("t.mode = 'LIVE'")
+
+    if strategy_id and strategy_id.strip():
+        parts.append(f"t.strategy_id = ${idx}")
+        args.append(strategy_id.strip())
+        idx += 1
+    if strategy_version and strategy_version.strip():
+        parts.append(f"t.strategy_version = ${idx}")
+        args.append(strategy_version.strip())
+        idx += 1
+
+    if not is_admin:
+        parts.append(f"t.user_id = ${idx}")
+        args.append(user_id)
+        idx += 1
+    elif filter_user_id is not None and filter_user_id > 0:
+        parts.append(f"t.user_id = ${idx}")
+        args.append(filter_user_id)
+        idx += 1
+
+    if taken_upper == "AUTO":
+        parts.append("o.manual_execute = false")
+    elif taken_upper == "MANUAL":
+        parts.append("o.manual_execute = true")
+
+    return " AND ".join(parts), args
+
+
+@router.get("/reports/strategies")
+async def get_report_strategy_options(user_id: int = Depends(get_user_id)) -> dict:
+    """Distinct strategies from closed trades (scoped: admin = all, user = own). For Reports filter dropdown."""
     role_row = await fetchrow("SELECT role FROM s004_users WHERE id = $1", user_id)
     is_admin = role_row and str(role_row.get("role", "")).upper() == "ADMIN"
 
     if is_admin:
         rows = await fetch(
             """
+            SELECT DISTINCT t.strategy_id, t.strategy_version,
+                   COALESCE(c.display_name, t.strategy_id || ' ' || t.strategy_version) AS display_name
+            FROM s004_live_trades t
+            LEFT JOIN s004_strategy_catalog c ON c.strategy_id = t.strategy_id AND c.version = t.strategy_version
+            WHERE t.current_state = 'EXIT' AND t.closed_at IS NOT NULL
+            ORDER BY display_name, t.strategy_id, t.strategy_version
+            """
+        )
+    else:
+        rows = await fetch(
+            """
+            SELECT DISTINCT t.strategy_id, t.strategy_version,
+                   COALESCE(c.display_name, t.strategy_id || ' ' || t.strategy_version) AS display_name
+            FROM s004_live_trades t
+            LEFT JOIN s004_strategy_catalog c ON c.strategy_id = t.strategy_id AND c.version = t.strategy_version
+            WHERE t.user_id = $1 AND t.current_state = 'EXIT' AND t.closed_at IS NOT NULL
+            ORDER BY display_name, t.strategy_id, t.strategy_version
+            """,
+            user_id,
+        )
+    return {
+        "strategies": [
+            {
+                "strategy_id": str(r["strategy_id"]),
+                "strategy_version": str(r["strategy_version"]),
+                "display_name": str(r["display_name"] or r["strategy_id"]),
+            }
+            for r in (rows or [])
+        ]
+    }
+
+
+@router.get("/reports")
+async def get_trade_reports(
+    user_id: int = Depends(get_user_id),
+    from_date: str | None = Query(None, description="Closed on/after this date (YYYY-MM-DD)"),
+    to_date: str | None = Query(None, description="Closed on/before this date (YYYY-MM-DD)"),
+    mode: str = Query("BOTH", description="PAPER, LIVE, or BOTH"),
+    strategy_id: str | None = Query(None, description="Filter by strategy_id"),
+    strategy_version: str | None = Query(None, description="Filter by strategy_version (optional)"),
+    filter_user_id: int | None = Query(None, alias="userId", description="Admin only: filter by user"),
+    taken_by: str = Query("ALL", description="ALL, AUTO, or MANUAL"),
+) -> list[dict]:
+    """Return closed trades for Reports. Admin sees all users' trades unless userId set. Filterable by date, mode, strategy, taken-by."""
+    from app.api.schemas import _format_exit_reason
+
+    role_row = await fetchrow("SELECT role FROM s004_users WHERE id = $1", user_id)
+    is_admin = role_row and str(role_row.get("role", "")).upper() == "ADMIN"
+
+    if not is_admin and filter_user_id is not None and filter_user_id != user_id:
+        filter_user_id = None
+
+    from_d: date | None = None
+    to_d: date | None = None
+    if from_date:
+        try:
+            from_d = date.fromisoformat(from_date.strip())
+        except ValueError:
+            pass
+    if to_date:
+        try:
+            to_d = date.fromisoformat(to_date.strip())
+        except ValueError:
+            pass
+    if from_d and to_d and from_d > to_d:
+        from_d, to_d = to_d, from_d
+
+    mode_upper = (mode or "BOTH").upper()
+    if mode_upper not in ("PAPER", "LIVE", "BOTH"):
+        mode_upper = "BOTH"
+    taken_upper = (taken_by or "ALL").upper()
+    if taken_upper not in ("ALL", "AUTO", "MANUAL"):
+        taken_upper = "ALL"
+
+    has_filters = bool(
+        from_d
+        or to_d
+        or mode_upper != "BOTH"
+        or (strategy_id and strategy_id.strip())
+        or (strategy_version and strategy_version.strip())
+        or (is_admin and filter_user_id is not None and filter_user_id > 0)
+        or taken_upper != "ALL"
+    )
+    limit_n = 2000 if has_filters else 500
+
+    where_sql, filter_args = _build_reports_filter_sql(
+        is_admin=is_admin,
+        user_id=user_id,
+        from_d=from_d,
+        to_d=to_d,
+        mode_upper=mode_upper,
+        strategy_id=strategy_id,
+        strategy_version=strategy_version,
+        filter_user_id=filter_user_id,
+        taken_upper=taken_upper,
+    )
+
+    base_select_admin = """
             SELECT t.trade_ref, t.symbol, t.mode, t.side, t.quantity, t.entry_price, t.current_price,
                    t.target_price, t.stop_loss_price, t.current_state, t.realized_pnl, t.unrealized_pnl,
                    t.opened_at, t.closed_at, t.updated_at, t.user_id, o.manual_execute,
@@ -440,30 +595,35 @@ async def get_trade_reports(user_id: int = Depends(get_user_id)) -> list[dict]:
             LEFT JOIN s004_users u ON u.id = t.user_id
             LEFT JOIN s004_execution_orders o ON o.order_ref = t.order_ref
             LEFT JOIN s004_strategy_catalog c ON c.strategy_id = t.strategy_id AND c.version = t.strategy_version
-            WHERE t.current_state = 'EXIT' AND t.closed_at IS NOT NULL
+            WHERE """ + where_sql + """
             ORDER BY t.closed_at DESC
-            LIMIT 500
-            """,
-        )
-    else:
-        rows = await fetch(
-            """
+            LIMIT """ + str(
+        limit_n
+    )
+
+    base_select_user = """
             SELECT t.trade_ref, t.symbol, t.mode, t.side, t.quantity, t.entry_price, t.current_price,
                    t.target_price, t.stop_loss_price, t.current_state, t.realized_pnl, t.unrealized_pnl,
-                   t.opened_at, t.closed_at, t.updated_at, o.manual_execute,
+                   t.opened_at, t.closed_at, t.updated_at, t.user_id, o.manual_execute,
+                   COALESCE(u.username, 'user#' || t.user_id) AS username,
                    COALESCE(c.display_name, t.strategy_id || ' ' || t.strategy_version) AS strategy_name,
                    (SELECT e.reason_code FROM s004_trade_events e
                     WHERE e.trade_ref = t.trade_ref AND e.next_state = 'EXIT'
                     ORDER BY e.occurred_at DESC LIMIT 1) AS exit_reason_code
             FROM s004_live_trades t
+            LEFT JOIN s004_users u ON u.id = t.user_id
             LEFT JOIN s004_execution_orders o ON o.order_ref = t.order_ref
             LEFT JOIN s004_strategy_catalog c ON c.strategy_id = t.strategy_id AND c.version = t.strategy_version
-            WHERE t.user_id = $1 AND t.current_state = 'EXIT' AND t.closed_at IS NOT NULL
+            WHERE """ + where_sql + """
             ORDER BY t.closed_at DESC
-            LIMIT 500
-            """,
-            user_id,
-        )
+            LIMIT """ + str(
+        limit_n
+    )
+
+    if is_admin:
+        rows = await fetch(base_select_admin, *filter_args)
+    else:
+        rows = await fetch(base_select_user, *filter_args)
 
     user_ids = list(dict.fromkeys(int(r["user_id"]) for r in rows)) if is_admin else [user_id]
     lot_sizes = await _get_lot_size_by_user_ids(user_ids) if user_ids else {}
@@ -622,6 +782,566 @@ async def get_performance_analytics(
     ]
 
     return {"dailyPnl": daily_list, "userPnl": user_list, "tradeRows": trade_rows}
+
+
+def _sp_index_from_symbol(sym: str) -> str:
+    u = sym.upper()
+    if "BANKNIFTY" in u:
+        return "BANKNIFTY"
+    if "FINNIFTY" in u:
+        return "FINNIFTY"
+    if "MIDCPNIFTY" in u:
+        return "MIDCPNIFTY"
+    if "NIFTY" in u:
+        return "NIFTY"
+    return "OTHER"
+
+
+def _sp_opt_type_from_symbol(sym: str) -> str | None:
+    u = sym.upper().strip()
+    if u.endswith("CE"):
+        return "CE"
+    if u.endswith("PE"):
+        return "PE"
+    return None
+
+
+def _sp_to_ist(dt: datetime | None) -> datetime | None:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(ZoneInfo("Asia/Kolkata"))
+
+
+@router.get("/strategy-performance")
+async def get_strategy_performance(
+    user_id: int = Depends(get_user_id),
+    from_date: str | None = Query(None, description="Start date YYYY-MM-DD (closed_at)"),
+    to_date: str | None = Query(None, description="End date YYYY-MM-DD"),
+    filter_user_id: int | None = Query(None, alias="userId", description="Admin only: filter by user"),
+    mode: str = Query("BOTH", description="PAPER, LIVE, or BOTH"),
+    index: str = Query("ALL", description="ALL, NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY, OTHER — filter by underlying in symbol"),
+) -> dict:
+    """Per-strategy stats plus overview widgets. Win/loss counts, win rates, streak, and profit factor use net P&L (after estimated charges)."""
+    from app.api.schemas import _format_exit_reason
+
+    role_row = await fetchrow("SELECT role FROM s004_users WHERE id = $1", user_id)
+    is_admin = role_row and str(role_row.get("role", "")).upper() == "ADMIN"
+    if not is_admin and filter_user_id is not None and filter_user_id != user_id:
+        filter_user_id = None
+
+    to_d = date.today()
+    from_d = to_d - timedelta(days=89)
+    if from_date:
+        try:
+            from_d = date.fromisoformat(from_date.strip())
+        except ValueError:
+            pass
+    if to_date:
+        try:
+            to_d = date.fromisoformat(to_date.strip())
+        except ValueError:
+            pass
+    if from_d > to_d:
+        from_d, to_d = to_d, from_d
+
+    mode_upper = (mode or "BOTH").upper()
+    mode_filter = ""
+    if mode_upper == "PAPER":
+        mode_filter = " AND t.mode = 'PAPER'"
+    elif mode_upper == "LIVE":
+        mode_filter = " AND t.mode = 'LIVE'"
+
+    user_filter = ""
+    user_args: list = []
+    if not is_admin:
+        user_filter = " AND t.user_id = $3"
+        user_args = [user_id]
+    elif is_admin and filter_user_id is not None and filter_user_id > 0:
+        user_filter = " AND t.user_id = $3"
+        user_args = [filter_user_id]
+
+    idx_upper = (index or "ALL").strip().upper()
+    if idx_upper not in ("ALL", "NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "OTHER"):
+        idx_upper = "ALL"
+
+    q = f"""
+        SELECT t.user_id, t.strategy_id, t.strategy_version,
+               t.closed_at, t.opened_at, t.symbol,
+               t.realized_pnl, t.entry_price, t.current_price, t.quantity,
+               COALESCE(c.display_name, t.strategy_id || ' ' || t.strategy_version) AS display_name,
+               (SELECT e.reason_code FROM s004_trade_events e
+                WHERE e.trade_ref = t.trade_ref AND e.next_state = 'EXIT'
+                ORDER BY e.occurred_at DESC LIMIT 1) AS exit_reason_code
+        FROM s004_live_trades t
+        LEFT JOIN s004_strategy_catalog c ON c.strategy_id = t.strategy_id AND c.version = t.strategy_version
+        WHERE t.current_state = 'EXIT' AND t.closed_at IS NOT NULL
+          AND t.closed_at::date >= $1 AND t.closed_at::date <= $2
+          {user_filter}
+          {mode_filter}
+        ORDER BY t.closed_at
+    """
+    rows = await fetch(q, from_d, to_d, *user_args)
+
+    user_ids_all = list(set(int(r["user_id"]) for r in rows)) if rows else []
+    user_lot_charges: dict[int, tuple[int, float]] = {}
+    for uid in user_ids_all:
+        lot_row = await fetchrow(
+            "SELECT COALESCE(lot_size, 65) AS lot_size FROM s004_user_strategy_settings WHERE user_id = $1 ORDER BY updated_at DESC LIMIT 1",
+            uid,
+        )
+        chg_row = await fetchrow(
+            "SELECT COALESCE(charges_per_trade, 20) AS charges_per_trade FROM s004_user_master_settings WHERE user_id = $1",
+            uid,
+        )
+        lot = int(lot_row["lot_size"] or 65) if lot_row else 65
+        chg = float(chg_row["charges_per_trade"] or 20) if chg_row else 20.0
+        user_lot_charges[uid] = (lot, chg)
+
+    trades: list[dict[str, Any]] = []
+    for r in rows:
+        uid = int(r["user_id"])
+        gross = float(r["realized_pnl"] or 0)
+        entry = float(r["entry_price"] or 0)
+        exit_p = float(r["current_price"] or r["entry_price"] or 0)
+        qty = int(r["quantity"] or 1)
+        lot, chg = user_lot_charges.get(uid, (65, 20.0))
+        contracts = qty * lot
+        est_ch = _est_charges_per_trade(gross, entry, exit_p, contracts, chg)
+        net = gross - est_ch
+        sym = str(r.get("symbol") or "")
+        ix = _sp_index_from_symbol(sym)
+        if idx_upper != "ALL" and ix != idx_upper:
+            continue
+        closed_raw = r.get("closed_at")
+        opened_raw = r.get("opened_at")
+        closed_dt = closed_raw if isinstance(closed_raw, datetime) else None
+        opened_dt = opened_raw if isinstance(opened_raw, datetime) else None
+        trades.append(
+            {
+                "user_id": uid,
+                "strategy_id": str(r.get("strategy_id") or "unknown"),
+                "strategy_version": str(r.get("strategy_version") or ""),
+                "display_name": str(r.get("display_name") or ""),
+                "symbol": sym,
+                "index": ix,
+                "opt_type": _sp_opt_type_from_symbol(sym),
+                "gross": gross,
+                "net": round(net, 2),
+                "charges": round(est_ch, 2),
+                "closed_at": closed_dt,
+                "opened_at": opened_dt,
+                "exit_reason_code": r.get("exit_reason_code"),
+            }
+        )
+
+    # Per-strategy aggregation + per-trade nets for best/worst/avg
+    agg: dict[tuple[str, str], dict[str, Any]] = {}
+    for t in trades:
+        sid, sver = t["strategy_id"], t["strategy_version"]
+        key = (sid, sver)
+        if key not in agg:
+            agg[key] = {
+                "display_name": t["display_name"] or f"{sid} {sver}".strip(),
+                "trade_count": 0,
+                "wins": 0,
+                "losses": 0,
+                "breakeven": 0,
+                "gross_pnl": 0.0,
+                "charges": 0.0,
+                "net_pnl": 0.0,
+                "nets": [],
+            }
+        a = agg[key]
+        n = t["net"]
+        a["trade_count"] += 1
+        if n > 0:
+            a["wins"] += 1
+        elif n < 0:
+            a["losses"] += 1
+        else:
+            a["breakeven"] += 1
+        a["gross_pnl"] += t["gross"]
+        a["charges"] += t["charges"]
+        a["net_pnl"] += t["net"]
+        a["nets"].append(t["net"])
+
+    strategies_out: list[dict] = []
+    weekly_by_strategy: dict[str, list[dict[str, Any]]] = {}
+    for (sid, sver), a in agg.items():
+        wr = round(float(a["wins"]) / float(a["trade_count"]) * 100.0, 1) if a["trade_count"] else 0.0
+        nets: list[float] = a["nets"]
+        strategies_out.append(
+            {
+                "strategy_id": sid,
+                "strategy_version": sver,
+                "display_name": a["display_name"],
+                "trade_count": int(a["trade_count"]),
+                "wins": int(a["wins"]),
+                "losses": int(a["losses"]),
+                "breakeven": int(a["breakeven"]),
+                "win_rate_pct": wr,
+                "gross_pnl": round(float(a["gross_pnl"]), 2),
+                "charges": round(float(a["charges"]), 2),
+                "net_pnl": round(float(a["net_pnl"]), 2),
+                "avg_net_pnl": round(float(a["net_pnl"]) / float(a["trade_count"]), 2) if a["trade_count"] else 0.0,
+                "best_trade_net": round(max(nets), 2) if nets else 0.0,
+                "worst_trade_net": round(min(nets), 2) if nets else 0.0,
+            }
+        )
+        sk = f"{sid}|{sver}"
+        weekly_by_strategy[sk] = []
+
+    strategies_out.sort(key=lambda x: x["net_pnl"], reverse=True)
+
+    # Weekly splits per strategy (ISO week Monday, IST)
+    wk_agg: dict[tuple[str, str, date], dict[str, Any]] = {}
+    for t in trades:
+        sk = f"{t['strategy_id']}|{t['strategy_version']}"
+        cdt = _sp_to_ist(t["closed_at"])
+        if cdt is None:
+            continue
+        d = cdt.date()
+        monday = d - timedelta(days=d.weekday())
+        wkey = (t["strategy_id"], t["strategy_version"], monday)
+        if wkey not in wk_agg:
+            wk_agg[wkey] = {"nets": [], "wins": 0, "losses": 0, "breakeven": 0}
+        w = wk_agg[wkey]
+        w["nets"].append(t["net"])
+        n = t["net"]
+        if n > 0:
+            w["wins"] += 1
+        elif n < 0:
+            w["losses"] += 1
+        else:
+            w["breakeven"] += 1
+
+    for (sid, sver, monday), w in sorted(wk_agg.items(), key=lambda x: (x[0][0], x[0][1], x[0][2])):
+        sk = f"{sid}|{sver}"
+        nets = w["nets"]
+        n = len(nets)
+        tw = int(w["wins"])
+        tl = int(w["losses"])
+        weekly_by_strategy.setdefault(sk, []).append(
+            {
+                "week_start": monday.isoformat(),
+                "trade_count": n,
+                "wins": tw,
+                "losses": tl,
+                "win_rate_pct": round(100.0 * tw / n, 1) if n else 0.0,
+                "net_pnl": round(sum(nets), 2),
+            }
+        )
+
+    n_all = len(trades)
+    wins_all = sum(1 for t in trades if t["net"] > 0)
+    losses_all = sum(1 for t in trades if t["net"] < 0)
+    be_all = sum(1 for t in trades if t["net"] == 0)
+    total_net = round(sum(t["net"] for t in trades), 2)
+    total_charges = round(sum(t["charges"] for t in trades), 2)
+    total_gross = round(sum(t["gross"] for t in trades), 2)
+    win_rate = round(100.0 * wins_all / n_all, 1) if n_all else 0.0
+    avg_net = round(total_net / n_all, 2) if n_all else 0.0
+    nets_list = [t["net"] for t in trades]
+    best_trade = round(max(nets_list), 2) if nets_list else 0.0
+    worst_trade = round(min(nets_list), 2) if nets_list else 0.0
+
+    sum_win_net = sum(t["net"] for t in trades if t["net"] > 0)
+    sum_loss_net = sum(t["net"] for t in trades if t["net"] < 0)
+    profit_factor = None
+    if sum_loss_net < 0:
+        profit_factor = round(sum_win_net / abs(sum_loss_net), 2)
+
+    durations_min: list[float] = []
+    for t in trades:
+        o = _sp_to_ist(t["opened_at"])
+        c = _sp_to_ist(t["closed_at"])
+        if o and c:
+            durations_min.append((c - o).total_seconds() / 60.0)
+    avg_duration_min = round(sum(durations_min) / len(durations_min), 1) if durations_min else None
+
+    sorted_by_close = sorted(
+        [t for t in trades if t["closed_at"]],
+        key=lambda x: x["closed_at"] or datetime.min.replace(tzinfo=timezone.utc),
+    )
+    max_dd = 0.0
+    peak = 0.0
+    cum = 0.0
+    for t in sorted_by_close:
+        cum += t["net"]
+        peak = max(peak, cum)
+        max_dd = max(max_dd, peak - cum)
+    max_drawdown = round(max_dd, 2)
+
+    streak_type: str | None = None
+    streak_n = 0
+    desc = sorted(
+        [t for t in trades if t["closed_at"]],
+        key=lambda x: x["closed_at"] or datetime.min.replace(tzinfo=timezone.utc),
+        reverse=True,
+    )
+    if desc:
+        fn = desc[0]["net"]
+        if fn > 0:
+            streak_type = "W"
+        elif fn < 0:
+            streak_type = "L"
+        if streak_type:
+            for t in desc:
+                n = t["net"]
+                if n == 0:
+                    break
+                if streak_type == "W" and n > 0:
+                    streak_n += 1
+                elif streak_type == "L" and n < 0:
+                    streak_n += 1
+                else:
+                    break
+
+    # Monthly net (IST month)
+    monthly: dict[str, float] = {}
+    for t in trades:
+        c = _sp_to_ist(t["closed_at"])
+        if not c:
+            continue
+        mk = f"{c.year}-{c.month:02d}"
+        monthly[mk] = monthly.get(mk, 0.0) + t["net"]
+    monthly_list = [{"month": k, "net_pnl": round(v, 2)} for k, v in sorted(monthly.items())]
+
+    # Hourly 9–15 IST
+    hourly: dict[int, dict[str, Any]] = {h: {"nets": [], "wins": 0, "losses": 0} for h in range(9, 16)}
+    for t in trades:
+        c = _sp_to_ist(t["closed_at"])
+        if not c:
+            continue
+        h = c.hour
+        if h not in hourly:
+            continue
+        hourly[h]["nets"].append(t["net"])
+        n = t["net"]
+        if n > 0:
+            hourly[h]["wins"] += 1
+        elif n < 0:
+            hourly[h]["losses"] += 1
+    hourly_list = []
+    for h in range(9, 16):
+        block = hourly[h]
+        nets = block["nets"]
+        n = len(nets)
+        tw, tl = int(block["wins"]), int(block["losses"])
+        hourly_list.append(
+            {
+                "hour_start": h,
+                "label": f"{h:02d}:00–{h + 1:02d}:00",
+                "trade_count": n,
+                "wins": tw,
+                "losses": tl,
+                "win_rate_pct": round(100.0 * tw / n, 1) if n else None,
+                "net_pnl": round(sum(nets), 2),
+            }
+        )
+
+    # Weekday Mon–Fri (IST)
+    wd_agg: dict[int, dict[str, Any]] = {
+        i: {"nets": [], "wins": 0, "losses": 0} for i in range(5)
+    }
+    wd_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+    for t in trades:
+        c = _sp_to_ist(t["closed_at"])
+        if not c:
+            continue
+        wd = c.weekday()
+        if wd > 4:
+            continue
+        wd_agg[wd]["nets"].append(t["net"])
+        n = t["net"]
+        if n > 0:
+            wd_agg[wd]["wins"] += 1
+        elif n < 0:
+            wd_agg[wd]["losses"] += 1
+    weekday_list = []
+    for i in range(5):
+        nets = wd_agg[i]["nets"]
+        n = len(nets)
+        tw, tl = int(wd_agg[i]["wins"]), int(wd_agg[i]["losses"])
+        weekday_list.append(
+            {
+                "day_index": i,
+                "day": wd_names[i],
+                "trade_count": n,
+                "wins": tw,
+                "losses": tl,
+                "win_rate_pct": round(100.0 * tw / n, 1) if n else None,
+                "net_pnl": round(sum(nets), 2),
+            }
+        )
+
+    # By index
+    ix_agg: dict[str, dict[str, Any]] = {}
+    for t in trades:
+        ix = t["index"]
+        if ix not in ix_agg:
+            ix_agg[ix] = {"nets": [], "wins": 0, "losses": 0}
+        ix_agg[ix]["nets"].append(t["net"])
+        n = t["net"]
+        if n > 0:
+            ix_agg[ix]["wins"] += 1
+        elif n < 0:
+            ix_agg[ix]["losses"] += 1
+    by_index = []
+    for ix, b in sorted(ix_agg.items()):
+        nets = b["nets"]
+        n = len(nets)
+        tw, tl = int(b["wins"]), int(b["losses"])
+        by_index.append(
+            {
+                "index": ix,
+                "trade_count": n,
+                "wins": tw,
+                "losses": tl,
+                "win_rate_pct": round(100.0 * tw / n, 1) if n else 0.0,
+                "net_pnl": round(sum(nets), 2),
+            }
+        )
+
+    # CE / PE
+    ce = {"nets": [], "wins": 0, "losses": 0}
+    pe = {"nets": [], "wins": 0, "losses": 0}
+    for t in trades:
+        ot = t["opt_type"]
+        bucket = ce if ot == "CE" else pe if ot == "PE" else None
+        if bucket is None:
+            continue
+        bucket["nets"].append(t["net"])
+        n = t["net"]
+        if n > 0:
+            bucket["wins"] += 1
+        elif n < 0:
+            bucket["losses"] += 1
+
+    def _side_block(bucket: dict[str, Any]) -> dict[str, Any]:
+        nets = bucket["nets"]
+        n = len(nets)
+        tw, tl = int(bucket["wins"]), int(bucket["losses"])
+        return {
+            "trade_count": n,
+            "wins": tw,
+            "losses": tl,
+            "win_rate_pct": round(100.0 * tw / n, 1) if n else 0.0,
+            "net_pnl": round(sum(nets), 2),
+        }
+
+    ce_pe = {"CE": _side_block(ce), "PE": _side_block(pe)}
+
+    # Exit reasons
+    reason_counts: dict[str, int] = {}
+    for t in trades:
+        code = str(t["exit_reason_code"] or "UNKNOWN").upper()
+        reason_counts[code] = reason_counts.get(code, 0) + 1
+    exit_reasons = [
+        {"code": k, "label": _format_exit_reason(k if k != "UNKNOWN" else None), "count": v}
+        for k, v in sorted(reason_counts.items(), key=lambda x: -x[1])
+    ]
+
+    # ACTIVE marketplace subscriptions (not tied to date range)
+    active_sub_scope: str
+    active_strategies_out: list[dict[str, Any]]
+    _sub_sql_base = """
+        SELECT s.strategy_id, s.strategy_version,
+               COALESCE(c.display_name, s.strategy_id || ' ' || s.strategy_version) AS display_name
+        FROM s004_strategy_subscriptions s
+        LEFT JOIN s004_strategy_catalog c ON c.strategy_id = s.strategy_id AND c.version = s.strategy_version
+    """
+    if not is_admin:
+        active_sub_scope = "user"
+        _sr = await fetch(
+            _sub_sql_base + " WHERE s.user_id = $1 AND s.status = 'ACTIVE' ORDER BY display_name",
+            user_id,
+        )
+        active_strategies_out = [
+            {
+                "strategy_id": str(r["strategy_id"]),
+                "strategy_version": str(r["strategy_version"]),
+                "display_name": str(r["display_name"] or ""),
+                "subscriber_count": 1,
+            }
+            for r in (_sr or [])
+        ]
+    elif filter_user_id is not None and filter_user_id > 0:
+        active_sub_scope = "user"
+        _sr = await fetch(
+            _sub_sql_base + " WHERE s.user_id = $1 AND s.status = 'ACTIVE' ORDER BY display_name",
+            filter_user_id,
+        )
+        active_strategies_out = [
+            {
+                "strategy_id": str(r["strategy_id"]),
+                "strategy_version": str(r["strategy_version"]),
+                "display_name": str(r["display_name"] or ""),
+                "subscriber_count": 1,
+            }
+            for r in (_sr or [])
+        ]
+    else:
+        active_sub_scope = "platform"
+        _sr = await fetch(
+            """
+            SELECT s.strategy_id, s.strategy_version,
+                   COALESCE(MAX(c.display_name), s.strategy_id || ' ' || s.strategy_version) AS display_name,
+                   COUNT(DISTINCT s.user_id)::int AS subscriber_count
+            FROM s004_strategy_subscriptions s
+            LEFT JOIN s004_strategy_catalog c ON c.strategy_id = s.strategy_id AND c.version = s.strategy_version
+            WHERE s.status = 'ACTIVE'
+            GROUP BY s.strategy_id, s.strategy_version
+            ORDER BY display_name
+            """,
+        )
+        active_strategies_out = [
+            {
+                "strategy_id": str(r["strategy_id"]),
+                "strategy_version": str(r["strategy_version"]),
+                "display_name": str(r["display_name"] or ""),
+                "subscriber_count": int(r["subscriber_count"] or 0),
+            }
+            for r in (_sr or [])
+        ]
+
+    return {
+        "strategies": strategies_out,
+        "summary": {
+            "strategy_count": len(strategies_out),
+            "total_trades": n_all,
+            "total_net_pnl": total_net,
+        },
+        "overview": {
+            "total_trades": n_all,
+            "wins": wins_all,
+            "losses": losses_all,
+            "breakeven": be_all,
+            "win_rate_pct": win_rate,
+            "total_net_pnl": total_net,
+            "total_gross_pnl": total_gross,
+            "total_charges": total_charges,
+            "avg_net_pnl_per_trade": avg_net,
+            "best_trade_net": best_trade,
+            "worst_trade_net": worst_trade,
+            "profit_factor": profit_factor,
+            "avg_duration_min": avg_duration_min,
+            "max_drawdown": max_drawdown,
+            "current_streak": {"type": streak_type, "count": streak_n},
+        },
+        "monthly_net_pnl": monthly_list,
+        "hourly_performance": hourly_list,
+        "weekday_performance": weekday_list,
+        "by_index": by_index,
+        "ce_pe": ce_pe,
+        "exit_reasons": exit_reasons,
+        "strategy_weekly_splits": weekly_by_strategy,
+        "filters": {"index": idx_upper, "from_date": from_d.isoformat(), "to_date": to_d.isoformat()},
+        "active_subscriptions_scope": active_sub_scope,
+        "active_strategies": active_strategies_out,
+    }
 
 
 @router.get("/daily-pnl")

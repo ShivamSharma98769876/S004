@@ -10,6 +10,10 @@ def validate_strategy_details(details: dict) -> list[str]:
     if not isinstance(details, dict):
         return ["Strategy details must be a JSON object."]
 
+    pi = details.get("positionIntent")
+    if pi is not None and str(pi).strip().lower() not in ("long_premium", "short_premium", ""):
+        errors.append("'positionIntent' must be 'long_premium' or 'short_premium'.")
+
     strategy_type = str(details.get("strategyType", "rule-based")).strip().lower()
 
     # heuristics (for heuristic-voting strategy type)
@@ -69,6 +73,8 @@ def validate_strategy_details(details: dict) -> list[str]:
             elif isinstance(val, dict) and key == "ivr":
                 if "maxThreshold" in val and not isinstance(val.get("maxThreshold"), (int, float)):
                     errors.append("'indicators.ivr.maxThreshold' must be a number.")
+                if "minThreshold" in val and not isinstance(val.get("minThreshold"), (int, float)):
+                    errors.append("'indicators.ivr.minThreshold' must be a number.")
             elif isinstance(val, dict) and key == "volumeSpike":
                 if "minRatio" in val and not isinstance(val.get("minRatio"), (int, float)):
                     errors.append("'indicators.volumeSpike.minRatio' must be a number.")
@@ -88,6 +94,10 @@ def validate_strategy_details(details: dict) -> list[str]:
             errors.append("'strikeSelection.deltaPreferredCE' must be a number.")
         if "deltaPreferredPE" in strike and not isinstance(strike.get("deltaPreferredPE"), (int, float)):
             errors.append("'strikeSelection.deltaPreferredPE' must be a number.")
+        if "deltaMinAbs" in strike and not isinstance(strike.get("deltaMinAbs"), (int, float)):
+            errors.append("'strikeSelection.deltaMinAbs' must be a number.")
+        if "deltaMaxAbs" in strike and not isinstance(strike.get("deltaMaxAbs"), (int, float)):
+            errors.append("'strikeSelection.deltaMaxAbs' must be a number.")
 
     # score thresholds
     for key, label in [

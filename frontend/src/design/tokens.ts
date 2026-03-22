@@ -31,6 +31,7 @@ export const USER_NAV_ITEMS: readonly AppNavItem[] = [
 export const REPORTS_NAV_ITEMS: readonly AppNavItem[] = [
   { href: "/reports", label: "Performance Snapshot", icon: "PS" },
   { href: "/reports/performance-analytics", label: "Performance Analytics", icon: "PA" },
+  { href: "/reports/strategy-performance", label: "Strategy Performance", icon: "SP" },
 ] as const;
 
 /** Nav items visible only to Admin */

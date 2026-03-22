@@ -1,5 +1,7 @@
 """Admin user management endpoints."""
 
+import json
+
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, EmailStr
 
@@ -21,30 +23,73 @@ class UpdateApprovalPayload(BaseModel):
     approved_live: bool | None = None
 
 
+def _parse_active_strategies(raw: object) -> list[dict]:
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        return raw
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, list) else []
+        except json.JSONDecodeError:
+            return []
+    return []
+
+
 @router.get("/users")
 async def list_users(admin_id: int = Depends(require_admin)) -> list[dict]:
-    """List all users (admin only)."""
+    """List all users (admin only), including ACTIVE marketplace strategy subscriptions per user."""
     rows = await fetch(
         """
-        SELECT id, username, email, full_name, role, status, approved_paper, approved_live, created_at
-        FROM s004_users
-        ORDER BY created_at DESC
+        SELECT u.id, u.username, u.email, u.full_name, u.role, u.status, u.approved_paper, u.approved_live, u.created_at,
+               COALESCE(
+                   json_agg(
+                       json_build_object(
+                           'strategy_id', s.strategy_id,
+                           'strategy_version', s.strategy_version,
+                           'display_name', COALESCE(c.display_name, s.strategy_id || ' ' || s.strategy_version)
+                       )
+                       ORDER BY COALESCE(c.display_name, s.strategy_id || ' ' || s.strategy_version)
+                   ) FILTER (WHERE s.strategy_id IS NOT NULL),
+                   '[]'::json
+               ) AS active_strategies
+        FROM s004_users u
+        LEFT JOIN s004_strategy_subscriptions s
+            ON s.user_id = u.id AND s.status = 'ACTIVE'
+        LEFT JOIN s004_strategy_catalog c
+            ON c.strategy_id = s.strategy_id AND c.version = s.strategy_version
+        GROUP BY u.id
+        ORDER BY u.created_at DESC
         """
     )
-    return [
-        {
-            "id": int(r["id"]),
-            "username": str(r.get("username") or ""),
-            "email": str(r.get("email") or ""),
-            "full_name": str(r.get("full_name") or ""),
-            "role": str(r.get("role", "USER")),
-            "status": str(r.get("status", "ACTIVE")),
-            "approved_paper": bool(r.get("approved_paper")),
-            "approved_live": bool(r.get("approved_live")),
-            "created_at": r["created_at"].isoformat() if r.get("created_at") else None,
-        }
-        for r in rows
-    ]
+    out: list[dict] = []
+    for r in rows:
+        subs = _parse_active_strategies(r.get("active_strategies"))
+        normalized = [
+            {
+                "strategy_id": str(x.get("strategy_id") or ""),
+                "strategy_version": str(x.get("strategy_version") or ""),
+                "display_name": str(x.get("display_name") or ""),
+            }
+            for x in subs
+            if isinstance(x, dict)
+        ]
+        out.append(
+            {
+                "id": int(r["id"]),
+                "username": str(r.get("username") or ""),
+                "email": str(r.get("email") or ""),
+                "full_name": str(r.get("full_name") or ""),
+                "role": str(r.get("role", "USER")),
+                "status": str(r.get("status", "ACTIVE")),
+                "approved_paper": bool(r.get("approved_paper")),
+                "approved_live": bool(r.get("approved_live")),
+                "created_at": r["created_at"].isoformat() if r.get("created_at") else None,
+                "active_strategies": normalized,
+            }
+        )
+    return out
 
 
 @router.post("/users")

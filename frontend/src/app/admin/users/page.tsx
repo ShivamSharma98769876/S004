@@ -5,6 +5,12 @@ import AdminGuard from "@/components/AdminGuard";
 import AppFrame from "@/components/AppFrame";
 import { apiJson } from "@/lib/api_client";
 
+type ActiveStrategySub = {
+  strategy_id: string;
+  strategy_version: string;
+  display_name: string;
+};
+
 type UserRow = {
   id: number;
   username: string;
@@ -15,6 +21,7 @@ type UserRow = {
   approved_paper: boolean;
   approved_live: boolean;
   created_at: string | null;
+  active_strategies?: ActiveStrategySub[];
 };
 
 function CreateUserModal({
@@ -148,7 +155,14 @@ export default function AdminUsersPage() {
     if (!sortCol) return users;
     const arr = [...users];
     const mult = sortDir === "asc" ? 1 : -1;
+    const strategiesLabel = (u: UserRow) =>
+      (u.active_strategies ?? [])
+        .map((s) => s.display_name || `${s.strategy_id} ${s.strategy_version}`)
+        .join(", ");
     arr.sort((a, b) => {
+      if (sortCol === "active_strategies") {
+        return mult * strategiesLabel(a).localeCompare(strategiesLabel(b));
+      }
       const av = (a as Record<string, unknown>)[sortCol];
       const bv = (b as Record<string, unknown>)[sortCol];
       if (typeof av === "number" && typeof bv === "number") return mult * (av - bv);
@@ -207,13 +221,16 @@ export default function AdminUsersPage() {
                     <th className="sortable-th" onClick={() => handleSort("status")}>Status {sortCol === "status" && (sortDir === "asc" ? "↑" : "↓")}</th>
                     <th className="sortable-th" onClick={() => handleSort("approved_paper")}>Paper {sortCol === "approved_paper" && (sortDir === "asc" ? "↑" : "↓")}</th>
                     <th className="sortable-th" onClick={() => handleSort("approved_live")}>Live {sortCol === "approved_live" && (sortDir === "asc" ? "↑" : "↓")}</th>
+                    <th className="sortable-th" onClick={() => handleSort("active_strategies")}>
+                      Strategies {sortCol === "active_strategies" && (sortDir === "asc" ? "↑" : "↓")}
+                    </th>
                     <th>Actions</th>
                   </tr>
                 </thead>
                 <tbody>
                   {sortedUsers.length === 0 ? (
                     <tr>
-                      <td colSpan={9} className="empty-state">
+                      <td colSpan={10} className="empty-state">
                         No users yet. Create one to get started.
                       </td>
                     </tr>
@@ -248,6 +265,25 @@ export default function AdminUsersPage() {
                             {u.approved_live ? "Yes" : "No"}
                           </button>
                         </td>
+                        <td className="admin-user-strategies-cell">
+                          {!u.active_strategies?.length ? (
+                            <span className="chip chip-strategy-none" title="No ACTIVE marketplace subscription">
+                              None
+                            </span>
+                          ) : (
+                            <div className="admin-user-strategies-chips">
+                              {u.active_strategies.map((s) => (
+                                <span
+                                  key={`${u.id}-${s.strategy_id}-${s.strategy_version}`}
+                                  className="chip chip-strategy-sub"
+                                  title={`${s.strategy_id} ${s.strategy_version}`}
+                                >
+                                  {s.display_name || `${s.strategy_id} v${s.strategy_version}`}
+                                </span>
+                              ))}
+                            </div>
+                          )}
+                        </td>
                         <td>—</td>
                       </tr>
                     ))
@@ -259,6 +295,8 @@ export default function AdminUsersPage() {
         </section>
         <p className="settings-hint" style={{ marginTop: 12 }}>
           Approve <b>Paper</b> and/or <b>Live</b> for each user. Users can only select Trade Type in Settings if they have approval for that mode.
+          <br />
+          <b>Strategies</b> lists Marketplace subscriptions with status <b>ACTIVE</b> (a user may have more than one).
         </p>
         {createOpen && (
           <CreateUserModal onClose={() => setCreateOpen(false)} onCreated={loadUsers} />

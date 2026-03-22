@@ -23,6 +23,30 @@ def _parse_optional_float_or_none(d: dict[str, Any], key: str, *, default: float
     return float(v)
 
 
+# Canonical JSON fragment for strategy_details_json["heuristicEnhancements"] (enabled).
+DEFAULT_HEURISTIC_ENHANCEMENTS: dict[str, Any] = {
+    "enabled": True,
+    "maxMoneynessPct": 1.2,
+    "moneynessOverrideMinScore": 4.5,
+    "flatSpotBandPct": 0.08,
+    "flatOiPct": 0.5,
+    "volumeHighRatio": 1.5,
+    "oiChurnAbsPct": 0.35,
+    "churnScoreMultiplier": 0.94,
+    "ltpStrongPct": 2.0,
+    "oiWeightWhenLtpStrong": 0.45,
+    "maxLtpOiCombinedWeightShare": 0.88,
+    "jointMinMult": 0.72,
+    "jointMaxMult": 1.08,
+    "bestPerSideMinGap": 0.35,
+    "singleDirectionOnly": False,
+    "singleDirectionMinSpread": 0.4,
+    "ceRequiresSpotNotDown": False,
+    "peRequiresSpotNotUp": False,
+    "directionalGateFlatBandPct": 0.05,
+}
+
+
 # Default (moneyness_bucket, dte_bucket) -> (eligible, score_cap or None)
 # ineligible => signal forced off; score_cap => min(raw_score, cap) after multipliers
 DEFAULT_MONEYNESS_DTE_RULES: dict[tuple[str, str], tuple[bool, float | None]] = {

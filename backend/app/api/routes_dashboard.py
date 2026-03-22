@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime, timedelta
 
 import asyncpg
 from fastapi import APIRouter, Depends
@@ -10,6 +10,54 @@ from app.api.auth_context import get_user_id
 from app.db_client import ensure_user, execute, fetch, fetchrow
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
+
+
+def _consecutive_iso_week_streak(sorted_iso_keys_desc: list[str]) -> int:
+    """ISO weeks (IYYYIW) with ≥1 close; count backward from most recent without gaps."""
+    if not sorted_iso_keys_desc:
+        return 0
+    active = set(sorted_iso_keys_desc)
+    cur = sorted_iso_keys_desc[0]
+    n = 0
+    while cur in active:
+        n += 1
+        if len(cur) != 6:
+            break
+        y = int(cur[:4])
+        w = int(cur[4:6])
+        d = date.fromisocalendar(y, w, 1) - timedelta(days=7)
+        ic = d.isocalendar()
+        cur = f"{ic.year:04d}{ic.week:02d}"
+    return n
+
+
+async def _fetch_trading_week_streak(user_id: int) -> int:
+    # IST calendar date of each close, then ISO year+week (Mon-based). Order by last close in week
+    # (string sort of IYYYIW is wrong across calendar years).
+    # Assumes closed_at is TIMESTAMP WITHOUT TIME ZONE in UTC. If already IST-naive, replace inner
+    # expression with: ((closed_at AT TIME ZONE 'Asia/Kolkata') AT TIME ZONE 'Asia/Kolkata')::date
+    rows = await fetch(
+        """
+        SELECT iso_week
+        FROM (
+            SELECT
+                to_char(d, 'IYYYIW') AS iso_week,
+                MAX(d) AS last_d
+            FROM (
+                SELECT ((closed_at AT TIME ZONE 'UTC') AT TIME ZONE 'Asia/Kolkata')::date AS d
+                FROM s004_live_trades
+                WHERE user_id = $1
+                  AND current_state = 'EXIT'
+                  AND closed_at IS NOT NULL
+            ) x
+            GROUP BY to_char(d, 'IYYYIW')
+        ) y
+        ORDER BY last_d DESC
+        """,
+        user_id,
+    )
+    keys = [str(r["iso_week"]) for r in rows if r.get("iso_week")]
+    return _consecutive_iso_week_streak(keys)
 
 
 def _est_charges_per_trade(
@@ -105,6 +153,7 @@ async def get_dashboard_summary(user_id: int = Depends(get_user_id)) -> dict:
     )
 
     if summary is None:
+        tws = await _fetch_trading_week_streak(user_id)
         return {
             "open_trades": 0,
             "closed_trades": 0,
@@ -113,6 +162,7 @@ async def get_dashboard_summary(user_id: int = Depends(get_user_id)) -> dict:
             "gross_pnl": 0.0,
             "charges_today": 0.0,
             "win_rate_pct": 0.0,
+            "trading_week_streak": tws,
             "updated_at": datetime.utcnow().isoformat() + "Z",
         }
 
@@ -197,6 +247,7 @@ async def get_dashboard_summary(user_id: int = Depends(get_user_id)) -> dict:
         charges_today = round(trade_count * charges_per_trade, 2)
 
     unrealized = float(summary["unrealized_pnl"] or 0.0)
+    trading_week_streak = await _fetch_trading_week_streak(user_id)
 
     return {
         "open_trades": int(summary["open_trades"] or 0),
@@ -206,6 +257,7 @@ async def get_dashboard_summary(user_id: int = Depends(get_user_id)) -> dict:
         "gross_pnl": round(realized + unrealized, 2),
         "charges_today": charges_today,
         "win_rate_pct": win_rate,
+        "trading_week_streak": trading_week_streak,
         "updated_at": summary["latest_update_at"].isoformat() if summary["latest_update_at"] else datetime.utcnow().isoformat() + "Z",
     }
 

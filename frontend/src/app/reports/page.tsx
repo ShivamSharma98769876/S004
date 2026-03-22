@@ -22,6 +22,38 @@ type ReportTrade = {
   manual_execute?: boolean | null;
 };
 
+type StrategyOption = {
+  strategy_id: string;
+  strategy_version: string;
+  display_name: string;
+};
+
+const STRAT_SEP = "\u0001";
+
+function buildReportsQuery(params: {
+  fromDate: string;
+  toDate: string;
+  tradeType: "BOTH" | "PAPER" | "LIVE";
+  strategyId: string;
+  strategyVersion: string;
+  filterUserId: number | "all";
+  takenBy: "ALL" | "AUTO" | "MANUAL";
+  admin: boolean;
+}): string {
+  const q = new URLSearchParams();
+  if (params.fromDate.trim()) q.set("from_date", params.fromDate.trim());
+  if (params.toDate.trim()) q.set("to_date", params.toDate.trim());
+  if (params.tradeType !== "BOTH") q.set("mode", params.tradeType);
+  if (params.strategyId.trim()) {
+    q.set("strategy_id", params.strategyId.trim());
+    if (params.strategyVersion.trim()) q.set("strategy_version", params.strategyVersion.trim());
+  }
+  if (params.admin && params.filterUserId !== "all") q.set("userId", String(params.filterUserId));
+  if (params.takenBy !== "ALL") q.set("taken_by", params.takenBy);
+  const s = q.toString();
+  return s ? `/api/trades/reports?${s}` : "/api/trades/reports";
+}
+
 function formatTime(iso: string | null | undefined): string {
   if (!iso) return "--:--:--";
   try {
@@ -55,11 +87,20 @@ export default function ReportsPage() {
   const [error, setError] = useState<string | null>(null);
   const admin = isAdmin();
 
-  const fetchReports = useCallback(async () => {
+  const [fromDate, setFromDate] = useState("");
+  const [toDate, setToDate] = useState("");
+  const [tradeType, setTradeType] = useState<"BOTH" | "PAPER" | "LIVE">("BOTH");
+  const [strategyKey, setStrategyKey] = useState("");
+  const [takenBy, setTakenBy] = useState<"ALL" | "AUTO" | "MANUAL">("ALL");
+  const [filterUserId, setFilterUserId] = useState<number | "all">("all");
+  const [strategyOptions, setStrategyOptions] = useState<StrategyOption[]>([]);
+  const [userOptions, setUserOptions] = useState<{ id: number; username: string }[]>([]);
+
+  const loadReportsUrl = useCallback(async (url: string) => {
     setLoading(true);
     setError(null);
     try {
-      const data = await apiJson<ReportTrade[]>("/api/trades/reports");
+      const data = await apiJson<ReportTrade[]>(url);
       setTrades(Array.isArray(data) ? data : []);
     } catch (e) {
       setTrades([]);
@@ -69,9 +110,55 @@ export default function ReportsPage() {
     }
   }, []);
 
+  const applyFilters = useCallback(() => {
+    let sid = "";
+    let sver = "";
+    if (strategyKey.includes(STRAT_SEP)) {
+      const [a, b] = strategyKey.split(STRAT_SEP);
+      sid = a || "";
+      sver = b || "";
+    }
+    const url = buildReportsQuery({
+      fromDate,
+      toDate,
+      tradeType,
+      strategyId: sid,
+      strategyVersion: sver,
+      filterUserId,
+      takenBy,
+      admin,
+    });
+    return loadReportsUrl(url);
+  }, [admin, fromDate, toDate, tradeType, strategyKey, takenBy, filterUserId, loadReportsUrl]);
+
   useEffect(() => {
-    fetchReports();
-  }, [fetchReports]);
+    loadReportsUrl("/api/trades/reports");
+  }, [loadReportsUrl]);
+
+  useEffect(() => {
+    apiJson<{ strategies: StrategyOption[] }>("/api/trades/reports/strategies")
+      .then((r) => setStrategyOptions(Array.isArray(r?.strategies) ? r.strategies : []))
+      .catch(() => setStrategyOptions([]));
+  }, []);
+
+  useEffect(() => {
+    if (!admin) return;
+    apiJson<{ id: number; username: string }[]>("/api/admin/users")
+      .then((rows) =>
+        setUserOptions(Array.isArray(rows) ? rows.map((u) => ({ id: u.id, username: u.username || `user${u.id}` })) : [])
+      )
+      .catch(() => setUserOptions([]));
+  }, [admin]);
+
+  const resetFilters = () => {
+    setFromDate("");
+    setToDate("");
+    setTradeType("BOTH");
+    setStrategyKey("");
+    setTakenBy("ALL");
+    setFilterUserId("all");
+    void loadReportsUrl("/api/trades/reports");
+  };
 
   const [sortCol, setSortCol] = useState<string>("");
   const [sortDir, setSortDir] = useState<"asc" | "desc">("asc");
@@ -145,11 +232,127 @@ export default function ReportsPage() {
 
   return (
     <AppFrame title="Reports & Backtesting" subtitle="Review performance history and validate strategy consistency.">
+      <section
+        className="panel-accent-chain"
+        style={{ padding: "1rem 1.25rem", marginBottom: "1rem", borderRadius: 8 }}
+      >
+        <div className="panel-title" style={{ marginBottom: "0.75rem", fontSize: "0.95rem" }}>
+          Filters
+        </div>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: "1rem", alignItems: "flex-end" }}>
+          <label className="field" style={{ marginBottom: 0 }}>
+            <span style={{ fontSize: "0.75rem", color: "var(--text-muted)", marginBottom: 4, display: "block" }}>
+              Trade Date – From
+            </span>
+            <input
+              type="date"
+              className="control-input reports-filter-date"
+              value={fromDate}
+              onChange={(e) => setFromDate(e.target.value)}
+              title="Choose start of trade date range (calendar)"
+              autoComplete="off"
+            />
+          </label>
+          <label className="field" style={{ marginBottom: 0 }}>
+            <span style={{ fontSize: "0.75rem", color: "var(--text-muted)", marginBottom: 4, display: "block" }}>
+              Trade Date – To
+            </span>
+            <input
+              type="date"
+              className="control-input reports-filter-date"
+              value={toDate}
+              onChange={(e) => setToDate(e.target.value)}
+              title="Choose end of trade date range (calendar)"
+              autoComplete="off"
+            />
+          </label>
+          <label className="field" style={{ marginBottom: 0 }}>
+            <span style={{ fontSize: "0.75rem", color: "var(--text-muted)", marginBottom: 4, display: "block" }}>
+              Trade type
+            </span>
+            <select
+              className="control-input"
+              value={tradeType}
+              onChange={(e) => setTradeType(e.target.value as "BOTH" | "PAPER" | "LIVE")}
+              style={{ minWidth: 110 }}
+            >
+              <option value="BOTH">Both</option>
+              <option value="PAPER">Paper</option>
+              <option value="LIVE">Live</option>
+            </select>
+          </label>
+          <label className="field" style={{ marginBottom: 0 }}>
+            <span style={{ fontSize: "0.75rem", color: "var(--text-muted)", marginBottom: 4, display: "block" }}>
+              Strategy
+            </span>
+            <select
+              className="control-input"
+              value={strategyKey}
+              onChange={(e) => setStrategyKey(e.target.value)}
+              style={{ minWidth: 220 }}
+            >
+              <option value="">All strategies</option>
+              {strategyOptions.map((s) => (
+                <option key={`${s.strategy_id}-${s.strategy_version}`} value={`${s.strategy_id}${STRAT_SEP}${s.strategy_version}`}>
+                  {s.display_name} ({s.strategy_version})
+                </option>
+              ))}
+            </select>
+          </label>
+          {admin && (
+            <label className="field" style={{ marginBottom: 0 }}>
+              <span style={{ fontSize: "0.75rem", color: "var(--text-muted)", marginBottom: 4, display: "block" }}>
+                User
+              </span>
+              <select
+                className="control-input"
+                value={filterUserId === "all" ? "all" : String(filterUserId)}
+                onChange={(e) => setFilterUserId(e.target.value === "all" ? "all" : Number(e.target.value))}
+                style={{ minWidth: 160 }}
+              >
+                <option value="all">All users</option>
+                {userOptions.map((u) => (
+                  <option key={u.id} value={String(u.id)}>
+                    {u.username}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
+          <label className="field" style={{ marginBottom: 0 }}>
+            <span style={{ fontSize: "0.75rem", color: "var(--text-muted)", marginBottom: 4, display: "block" }}>
+              Taken by
+            </span>
+            <select
+              className="control-input"
+              value={takenBy}
+              onChange={(e) => setTakenBy(e.target.value as "ALL" | "AUTO" | "MANUAL")}
+              style={{ minWidth: 120 }}
+            >
+              <option value="ALL">All</option>
+              <option value="AUTO">Auto</option>
+              <option value="MANUAL">Manual</option>
+            </select>
+          </label>
+          <button type="button" className="action-button" onClick={() => void applyFilters()} disabled={loading}>
+            {loading ? "Loading..." : "Apply"}
+          </button>
+          <button type="button" className="action-button resume" onClick={resetFilters} disabled={loading}>
+            Reset
+          </button>
+        </div>
+        <p style={{ fontSize: "0.75rem", color: "var(--text-muted)", marginTop: "0.75rem", marginBottom: 0 }}>
+          <strong>Trade Date</strong> range uses each trade’s <strong>exit (sell) date</strong>. Use the calendar in the fields above to
+          pick dates. No dates = latest rows (up to 500); with any filter = up to 2000 rows.
+          {admin ? " User filter is available for Admin only." : ""}
+        </p>
+      </section>
+
       {loading && <div className="empty-state">Loading reports...</div>}
       {error && (
         <div className="empty-state chip-risk-high" style={{ marginBottom: "1rem" }}>
           {error}
-          <button className="action-button" onClick={fetchReports} style={{ marginLeft: "0.5rem" }}>
+          <button className="action-button" onClick={() => void applyFilters()} style={{ marginLeft: "0.5rem" }}>
             Retry
           </button>
         </div>
