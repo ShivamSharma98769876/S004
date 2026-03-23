@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import AdminGuard from "@/components/AdminGuard";
 import AppFrame from "@/components/AppFrame";
 import { getAuthHeaders } from "@/lib/api_client";
+import { formatDateTimeIST } from "@/lib/datetime_ist";
 
 type BuildupType = "Long Buildup" | "Short Buildup" | "Short Covering" | "Long Unwinding" | "—";
 
@@ -206,15 +207,7 @@ export default function AnalyticsPage() {
     const step = instrument === "NIFTY" ? 50 : 100;
     return spot ? Math.round(spot / step) * step : 0;
   }, [instrument, spot]);
-  const updated = data?.updated
-    ? new Date(data.updated).toLocaleString("en-IN", {
-        day: "2-digit",
-        month: "short",
-        hour: "2-digit",
-        minute: "2-digit",
-        second: "2-digit",
-      })
-    : "—";
+  const updated = data?.updated ? formatDateTimeIST(data.updated, "—", { seconds: true }) : "—";
 
   return (
     <AdminGuard>

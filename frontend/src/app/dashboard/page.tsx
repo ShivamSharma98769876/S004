@@ -9,6 +9,7 @@ import {
   type TradingSetup,
 } from "@/lib/trading_setup";
 import { apiJson } from "@/lib/api_client";
+import { formatClockNowIST, formatTimeIST } from "@/lib/datetime_ist";
 
 type ClosedTrade = {
   symbol: string;
@@ -58,25 +59,11 @@ function formatInr(n: number): string {
 }
 
 function formatTime(iso: string | null | undefined): string {
-  if (!iso) return "--:--:--";
-  try {
-    const d = new Date(iso);
-    if (Number.isNaN(d.getTime())) return "--:--:--";
-    return d.toLocaleTimeString("en-IN", { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" });
-  } catch {
-    return "--:--:--";
-  }
+  return formatTimeIST(iso, { seconds: true, fallback: "--:--:--" });
 }
 
 function formatTimeShort(iso: string | null | undefined): string {
-  if (!iso) return "00:00";
-  try {
-    const d = new Date(iso);
-    if (Number.isNaN(d.getTime())) return "00:00";
-    return d.toLocaleTimeString("en-IN", { hour12: false, hour: "2-digit", minute: "2-digit" });
-  } catch {
-    return "00:00";
-  }
+  return formatTimeIST(iso, { fallback: "00:00" });
 }
 
 type IntradayPoint = { time: string; pnl: number };
@@ -304,8 +291,8 @@ export default function DashboardPage() {
   useEffect(() => {
     const s = loadTradingSetup();
     setSetup(s);
-    setClock(new Date().toLocaleTimeString("en-IN"));
-    const timer = setInterval(() => setClock(new Date().toLocaleTimeString("en-IN")), 1000);
+    setClock(formatClockNowIST());
+    const timer = setInterval(() => setClock(formatClockNowIST()), 1000);
     const sync = setInterval(() => setSetup(loadTradingSetup()), 1200);
     return () => {
       clearInterval(timer);
@@ -515,13 +502,17 @@ export default function DashboardPage() {
     } else {
       setRuntimeMessage("Engine stopped manually.");
     }
+    const previous = setup;
     const next = { ...setup, master: { ...setup.master, engineRunning: run } };
     setSetup(next);
     saveTradingSetup(next);
     try {
       await apiJson("/api/dashboard/engine", "PUT", { engineRunning: run, mode: setup.master.mode });
-    } catch {
-      setRuntimeMessage("Failed to sync engine status with server.");
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Failed to sync engine status with server.";
+      setRuntimeMessage(msg || "Failed to sync engine status with server.");
+      setSetup(previous);
+      saveTradingSetup(previous);
     }
   };
 
@@ -802,8 +793,8 @@ export default function DashboardPage() {
                       </span>
                       <span className="dash-signal-time">
                         {s.created_at
-                          ? new Date(s.created_at).toLocaleTimeString("en-IN", { hour12: false })
-                          : new Date().toLocaleTimeString("en-IN", { hour12: false })}
+                          ? formatTimeIST(s.created_at, { fallback: "—" })
+                          : formatTimeIST(new Date(), { fallback: "—" })}
                       </span>
                     </div>
                   </div>

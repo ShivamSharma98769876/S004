@@ -1,9 +1,10 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import AdminGuard from "@/components/AdminGuard";
 import AppFrame from "@/components/AppFrame";
 import { apiJson } from "@/lib/api_client";
+import { formatDateTimeIST } from "@/lib/datetime_ist";
 
 type ActiveStrategySub = {
   strategy_id: string;
@@ -20,6 +21,8 @@ type UserRow = {
   status: string;
   approved_paper: boolean;
   approved_live: boolean;
+  engine_running?: boolean;
+  engine_mode?: string;
   created_at: string | null;
   active_strategies?: ActiveStrategySub[];
 };
@@ -126,13 +129,24 @@ function CreateUserModal({
   );
 }
 
+type PlatformRisk = {
+  trading_paused: boolean;
+  pause_reason: string | null;
+  updated_at: string | null;
+  schema_ready?: boolean;
+};
+
 export default function AdminUsersPage() {
   const [users, setUsers] = useState<UserRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [createOpen, setCreateOpen] = useState(false);
+  const [platform, setPlatform] = useState<PlatformRisk | null>(null);
+  const [platformReason, setPlatformReason] = useState("");
+  const [platformSaving, setPlatformSaving] = useState(false);
+  const [platformErr, setPlatformErr] = useState("");
 
-  const loadUsers = async () => {
+  const loadUsers = useCallback(async () => {
     setError("");
     try {
       const rows = await apiJson<UserRow[]>("/api/admin/users");
@@ -142,11 +156,57 @@ export default function AdminUsersPage() {
     } finally {
       setLoading(false);
     }
+  }, []);
+
+  const refreshUsersSilent = useCallback(async () => {
+    try {
+      const rows = await apiJson<UserRow[]>("/api/admin/users");
+      setUsers(rows ?? []);
+    } catch {
+      /* keep last good list */
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadUsers();
+  }, [loadUsers]);
+
+  useEffect(() => {
+    const t = setInterval(() => void refreshUsersSilent(), 12000);
+    return () => clearInterval(t);
+  }, [refreshUsersSilent]);
+
+  const loadPlatform = async () => {
+    try {
+      const p = await apiJson<PlatformRisk>("/api/admin/platform");
+      setPlatform(p);
+      setPlatformReason(p.pause_reason || "");
+      setPlatformErr("");
+    } catch {
+      setPlatform(null);
+    }
   };
 
   useEffect(() => {
-    loadUsers();
+    loadPlatform();
   }, []);
+
+  const savePlatformPause = async (paused: boolean) => {
+    setPlatformSaving(true);
+    setPlatformErr("");
+    try {
+      const p = await apiJson<PlatformRisk>("/api/admin/platform", "PUT", {
+        trading_paused: paused,
+        pause_reason: paused ? platformReason.trim() || "Paused by admin" : null,
+      });
+      setPlatform(p);
+      setPlatformReason(p.pause_reason || "");
+    } catch (e) {
+      setPlatformErr(e instanceof Error ? e.message : "Failed to update platform risk.");
+    } finally {
+      setPlatformSaving(false);
+    }
+  };
 
   const [sortCol, setSortCol] = useState<string>("");
   const [sortDir, setSortDir] = useState<"asc" | "desc">("asc");
@@ -196,7 +256,7 @@ export default function AdminUsersPage() {
     <AdminGuard>
       <AppFrame
         title="User Management"
-        subtitle="Create users and approve Paper/Live trade types."
+        subtitle="Create users, approve Paper/Live, and monitor each user’s trading engine (refreshes every ~12s)."
       >
         {error && <div className="notice warning">{error}</div>}
         <section className="table-card">
@@ -221,6 +281,9 @@ export default function AdminUsersPage() {
                     <th className="sortable-th" onClick={() => handleSort("status")}>Status {sortCol === "status" && (sortDir === "asc" ? "↑" : "↓")}</th>
                     <th className="sortable-th" onClick={() => handleSort("approved_paper")}>Paper {sortCol === "approved_paper" && (sortDir === "asc" ? "↑" : "↓")}</th>
                     <th className="sortable-th" onClick={() => handleSort("approved_live")}>Live {sortCol === "approved_live" && (sortDir === "asc" ? "↑" : "↓")}</th>
+                    <th className="sortable-th" onClick={() => handleSort("engine_running")}>
+                      Engine {sortCol === "engine_running" && (sortDir === "asc" ? "↑" : "↓")}
+                    </th>
                     <th className="sortable-th" onClick={() => handleSort("active_strategies")}>
                       Strategies {sortCol === "active_strategies" && (sortDir === "asc" ? "↑" : "↓")}
                     </th>
@@ -230,7 +293,7 @@ export default function AdminUsersPage() {
                 <tbody>
                   {sortedUsers.length === 0 ? (
                     <tr>
-                      <td colSpan={10} className="empty-state">
+                      <td colSpan={11} className="empty-state">
                         No users yet. Create one to get started.
                       </td>
                     </tr>
@@ -265,6 +328,17 @@ export default function AdminUsersPage() {
                             {u.approved_live ? "Yes" : "No"}
                           </button>
                         </td>
+                        <td>
+                          <span
+                            className={`chip ${u.engine_running ? "chip-status-active" : "chip-status-paused"}`}
+                            title={`Trade mode: ${(u.engine_mode || "PAPER").toUpperCase()}`}
+                          >
+                            {u.engine_running ? "Running" : "Stopped"}
+                          </span>
+                          <div className="settings-hint" style={{ marginTop: 4, fontSize: "0.75rem", opacity: 0.85 }}>
+                            {(u.engine_mode || "PAPER").toUpperCase()}
+                          </div>
+                        </td>
                         <td className="admin-user-strategies-cell">
                           {!u.active_strategies?.length ? (
                             <span className="chip chip-strategy-none" title="No ACTIVE marketplace subscription">
@@ -293,8 +367,57 @@ export default function AdminUsersPage() {
             </div>
           )}
         </section>
+        <section className="table-card" style={{ marginTop: 20 }}>
+          <div className="panel-title settings-panel-title">Platform risk (kill switch)</div>
+          {platform?.schema_ready === false && (
+            <div className="notice warning" style={{ margin: "0 1rem 1rem" }}>
+              Run DB migration <code>platform_risk_schema.sql</code> (or <code>apply_db_schema.py</code>) so the trading pause table exists.
+            </div>
+          )}
+          {platformErr && <div className="notice error" style={{ margin: "0 1rem 1rem" }}>{platformErr}</div>}
+          <div style={{ padding: "0 1rem 1.25rem", display: "flex", flexDirection: "column", gap: 12, maxWidth: 520 }}>
+            <p className="settings-hint" style={{ margin: 0 }}>
+              When <b>paused</b>, no new trades execute (manual or auto) for any user until resumed.
+            </p>
+            <label className="field" style={{ margin: 0 }}>
+              <span>Optional reason (shown to users)</span>
+              <input
+                type="text"
+                className="control-input"
+                value={platformReason}
+                onChange={(e) => setPlatformReason(e.target.value)}
+                placeholder="e.g. Maintenance / volatility event"
+                disabled={platformSaving}
+              />
+            </label>
+            <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
+              <button
+                type="button"
+                className="action-button pause"
+                disabled={platformSaving || platform?.trading_paused}
+                onClick={() => savePlatformPause(true)}
+              >
+                {platformSaving ? "…" : "Pause all new trades"}
+              </button>
+              <button
+                type="button"
+                className="action-button resume"
+                disabled={platformSaving || !platform?.trading_paused}
+                onClick={() => savePlatformPause(false)}
+              >
+                Resume trading
+              </button>
+              {platform?.updated_at && (
+                <span className="settings-hint">Last change: {formatDateTimeIST(platform.updated_at)}</span>
+              )}
+            </div>
+          </div>
+        </section>
+
         <p className="settings-hint" style={{ marginTop: 12 }}>
           Approve <b>Paper</b> and/or <b>Live</b> for each user. Users can only select Trade Type in Settings if they have approval for that mode.
+          <br />
+          <b>Engine</b> shows whether Start Trading is on (<b>Running</b> / <b>Stopped</b>) and their <b>PAPER</b> or <b>LIVE</b> mode from the server.
           <br />
           <b>Strategies</b> lists Marketplace subscriptions with status <b>ACTIVE</b> (a user may have more than one).
         </p>

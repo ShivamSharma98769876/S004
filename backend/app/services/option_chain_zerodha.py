@@ -6,6 +6,7 @@ import os
 from datetime import date, datetime, timedelta
 import statistics
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from kiteconnect import KiteConnect
 
@@ -17,6 +18,9 @@ SPOT_SYMBOLS = {
     "SENSEX": "BSE:SENSEX",
     "FINNIFTY": "NSE:NIFTY FINANCIAL SERVICES",
 }
+
+# Kite historical_data from/to are interpreted in exchange local time (IST for NSE), not UTC.
+_NSE_IST = ZoneInfo("Asia/Kolkata")
 
 _BASE_SPOTS = {
     "NIFTY": 22450.0,
@@ -571,11 +575,57 @@ def _fetch_spot_candles(kite: KiteConnect, instrument: str, interval: str = "min
     if not tok:
         return []
     try:
-        to_dt = datetime.utcnow()
+        to_dt = datetime.now(_NSE_IST)
         from_dt = to_dt - timedelta(days=1)
         data = kite.historical_data(tok, from_dt, to_dt, interval)
         if isinstance(data, list):
             return [{"open": d["open"], "high": d["high"], "low": d["low"], "close": d["close"], "volume": d.get("volume", 0)} for d in data]
+    except Exception:
+        pass
+    return []
+
+
+def fetch_index_candles_sync(
+    kite: KiteConnect | None,
+    instrument: str,
+    interval: str = "5minute",
+    days_back: int = 5,
+) -> list[dict[str, Any]]:
+    """Fetch OHLCV for an index (NIFTY, etc.) via Kite historical_data.
+
+    ``interval`` examples: ``minute``, ``3minute``, ``5minute``, ``15minute``, ``60minute``, ``day``.
+
+    Uses **IST** bounds for ``from``/``to``. Passing UTC wall clock makes Zerodha treat it as IST,
+    so e.g. 10:52 IST becomes an effective end time of ~05:22 IST and drops the current session.
+    """
+    if kite is None:
+        return []
+    tok = _get_spot_token(kite, instrument)
+    if not tok:
+        return []
+    try:
+        to_dt = datetime.now(_NSE_IST)
+        from_dt = to_dt - timedelta(days=max(1, int(days_back)))
+        data = kite.historical_data(tok, from_dt, to_dt, interval)
+        if isinstance(data, list):
+            out: list[dict[str, Any]] = []
+            for d in data:
+                dt = d.get("date")
+                if hasattr(dt, "isoformat"):
+                    t_iso = dt.isoformat()
+                else:
+                    t_iso = str(dt) if dt else ""
+                out.append(
+                    {
+                        "open": float(d["open"]),
+                        "high": float(d["high"]),
+                        "low": float(d["low"]),
+                        "close": float(d["close"]),
+                        "volume": float(d.get("volume") or 0),
+                        "time": t_iso,
+                    }
+                )
+            return out
     except Exception:
         pass
     return []

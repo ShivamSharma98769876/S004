@@ -1,8 +1,11 @@
 import asyncio
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+
+from app.middleware.request_logging import RequestLoggingMiddleware
 
 from app.api import (
     routes_admin,
@@ -10,7 +13,9 @@ from app.api import (
     routes_auth,
     routes_dashboard,
     routes_health,
+    routes_landing,
     routes_marketplace,
+    routes_metrics,
     routes_settings,
     routes_trades,
 )
@@ -48,8 +53,13 @@ async def lifespan(_: FastAPI):
 
 
 def create_app() -> FastAPI:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
     app = FastAPI(title="S004 Backend", version="0.1.0", lifespan=lifespan)
 
+    app.add_middleware(RequestLoggingMiddleware)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
@@ -58,6 +68,7 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
+    app.include_router(routes_metrics.router)
     app.include_router(routes_health.router, prefix="/api")
     app.include_router(routes_auth.router, prefix="/api")
     app.include_router(routes_admin.router, prefix="/api")
@@ -66,6 +77,7 @@ def create_app() -> FastAPI:
     app.include_router(routes_settings.router, prefix="/api")
     app.include_router(routes_trades.router, prefix="/api")
     app.include_router(routes_dashboard.router, prefix="/api")
+    app.include_router(routes_landing.router, prefix="/api")
     return app
 
 

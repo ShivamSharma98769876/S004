@@ -1,0 +1,133 @@
+/**
+ * All user-visible dates/times use **IST (Asia/Kolkata)** so display matches NSE session
+ * regardless of browser/OS timezone (e.g. UTC on corporate laptops).
+ */
+
+export const APP_TIMEZONE = "Asia/Kolkata";
+
+function parseInstant(input: string | number | Date): Date {
+  return input instanceof Date ? input : new Date(input);
+}
+
+export function formatTimeIST(
+  input: string | number | Date | null | undefined,
+  opts?: { seconds?: boolean; fallback?: string; hour12?: boolean },
+): string {
+  const fb = opts?.fallback ?? "—";
+  if (input == null) return fb;
+  try {
+    const d = parseInstant(input);
+    if (Number.isNaN(d.getTime())) return fb;
+    return d.toLocaleTimeString("en-IN", {
+      hour12: opts?.hour12 ?? false,
+      hour: "2-digit",
+      minute: "2-digit",
+      ...(opts?.seconds ? { second: "2-digit" } : {}),
+      timeZone: APP_TIMEZONE,
+    });
+  } catch {
+    return fb;
+  }
+}
+
+/** Date + time in IST (compact, for tooltips / admin / analytics “updated”). */
+export function formatDateTimeIST(
+  input: string | number | Date | null | undefined,
+  fallback = "—",
+  opts?: { seconds?: boolean },
+): string {
+  if (input == null) return fallback;
+  try {
+    const d = parseInstant(input);
+    if (Number.isNaN(d.getTime())) return fallback;
+    return d.toLocaleString("en-IN", {
+      hour12: false,
+      day: "2-digit",
+      month: "short",
+      year: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+      ...(opts?.seconds ? { second: "2-digit" } : {}),
+      timeZone: APP_TIMEZONE,
+    });
+  } catch {
+    return fallback;
+  }
+}
+
+/**
+ * Calendar date in IST as `YYYY-MM-DD` (for query params, CSV filenames, presets).
+ * Pass any instant; the **IST** calendar date is used (not UTC midnight).
+ */
+export function toYmdIST(d: Date = new Date()): string {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: APP_TIMEZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(d);
+}
+
+/** Shift a Date by whole days in IST is approximated via UTC ms (good enough for report presets). */
+export function addDaysIST(base: Date, days: number): Date {
+  return new Date(base.getTime() + days * 24 * 60 * 60 * 1000);
+}
+
+/** Live clock string in IST (e.g. dashboard header). */
+export function formatClockNowIST(): string {
+  return new Date().toLocaleTimeString("en-IN", {
+    hour12: false,
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    timeZone: APP_TIMEZONE,
+  });
+}
+
+/** Short day+month label in IST (e.g. performance charts). */
+export function formatDateShortIST(input: string | number | Date | null | undefined, fallback = "—"): string {
+  if (input == null) return fallback;
+  try {
+    const d = parseInstant(input);
+    if (Number.isNaN(d.getTime())) return fallback;
+    return d.toLocaleDateString("en-IN", {
+      day: "numeric",
+      month: "short",
+      timeZone: APP_TIMEZONE,
+    });
+  } catch {
+    return fallback;
+  }
+}
+
+/** Numeric YYYY-MM-DD in IST for table columns (reports). */
+export function formatDateYmdIST(input: string | number | Date | null | undefined, fallback = "--"): string {
+  if (input == null) return fallback;
+  try {
+    const d = parseInstant(input);
+    if (Number.isNaN(d.getTime())) return fallback;
+    return new Intl.DateTimeFormat("en-CA", {
+      timeZone: APP_TIMEZONE,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    }).format(d);
+  } catch {
+    return fallback;
+  }
+}
+
+/** Options shared with chart axis formatters (TrendPulse, etc.). */
+export const intlTimeOptionsIST: Intl.DateTimeFormatOptions = {
+  hour12: false,
+  hour: "2-digit",
+  minute: "2-digit",
+  timeZone: APP_TIMEZONE,
+};
+
+export const intlDateTimeOptionsIST: Intl.DateTimeFormatOptions = {
+  hour12: false,
+  day: "2-digit",
+  month: "short",
+  ...intlTimeOptionsIST,
+};

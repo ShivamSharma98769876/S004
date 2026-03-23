@@ -6,6 +6,7 @@ import { useEffect, useState } from "react";
 import type { CSSProperties, ReactNode } from "react";
 import { clearAuth, getAuth, isAdmin } from "@/lib/api_client";
 import { ADMIN_NAV_ITEMS, DESIGN_TOKENS, REPORTS_NAV_ITEMS, USER_NAV_ITEMS } from "@/design/tokens";
+import RiskStatusBanner from "@/components/RiskStatusBanner";
 
 type AppFrameProps = {
   title: string;
@@ -169,6 +170,8 @@ export default function AppFrame({ title, subtitle, children }: AppFrameProps) {
           <h1>{title}</h1>
           <p>{subtitle}</p>
         </section>
+
+        <RiskStatusBanner />
 
         {children}
       </section>

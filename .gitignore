@@ -54,6 +54,8 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 .pnpm-debug.log*
+# Icon processing backup from remove_rupee_coin_bg.py
+frontend/public/images/*.png.bak
 
 # -----------------------------------------------------------------------------
 # Local database backups & dumps (may contain live/trading data)

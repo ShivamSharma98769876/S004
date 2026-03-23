@@ -16,6 +16,40 @@ def validate_strategy_details(details: dict) -> list[str]:
 
     strategy_type = str(details.get("strategyType", "rule-based")).strip().lower()
 
+    if strategy_type == "trendpulse-z":
+        tpz = details.get("trendPulseZ")
+        if tpz is not None and not isinstance(tpz, dict):
+            errors.append("'trendPulseZ' must be an object.")
+        elif isinstance(tpz, dict):
+            prof = tpz.get("profile")
+            if prof is not None and str(prof).strip().lower() not in ("conservative", "balanced", "aggressive", ""):
+                errors.append("'trendPulseZ.profile' must be 'conservative', 'balanced', or 'aggressive'.")
+            sess = tpz.get("session")
+            if sess is not None and not isinstance(sess, dict):
+                errors.append("'trendPulseZ.session' must be an object.")
+            br = tpz.get("breadth")
+            if br is not None and not isinstance(br, dict):
+                errors.append("'trendPulseZ.breadth' must be an object.")
+            for key, label in [
+                ("zWindow", "trendPulseZ.zWindow"),
+                ("slopeLookback", "trendPulseZ.slopeLookback"),
+                ("adxPeriod", "trendPulseZ.adxPeriod"),
+                ("htfEmaFast", "trendPulseZ.htfEmaFast"),
+                ("htfEmaSlow", "trendPulseZ.htfEmaSlow"),
+                ("candleDaysBack", "trendPulseZ.candleDaysBack"),
+            ]:
+                if key in tpz and not isinstance(tpz.get(key), (int, float)):
+                    errors.append(f"'{label}' must be a number.")
+            for key, label in [
+                ("adxMin", "trendPulseZ.adxMin"),
+                ("ivRankMaxPercentile", "trendPulseZ.ivRankMaxPercentile"),
+            ]:
+                if key in tpz and not isinstance(tpz.get(key), (int, float)):
+                    errors.append(f"'{label}' must be a number.")
+        pi = str(details.get("positionIntent", "long_premium")).strip().lower()
+        if pi and pi != "long_premium":
+            errors.append("TrendPulse Z requires positionIntent 'long_premium'.")
+
     # heuristics (for heuristic-voting strategy type)
     if strategy_type == "heuristic-voting":
         heuristics = details.get("heuristics")

@@ -307,7 +307,12 @@ ALTER TABLE IF EXISTS s004_live_trades
     ADD COLUMN IF NOT EXISTS realized_pnl NUMERIC(14,4) NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS unrealized_pnl NUMERIC(14,4) NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS opened_at TIMESTAMP,
+    ADD COLUMN IF NOT EXISTS closed_at TIMESTAMP,
     ADD COLUMN IF NOT EXISTS broker_order_id VARCHAR(128);
+
+-- Older deployments may have created s004_execution_orders without this column
+ALTER TABLE IF EXISTS s004_execution_orders
+    ADD COLUMN IF NOT EXISTS manual_execute BOOLEAN NOT NULL DEFAULT TRUE;
 
 ALTER TABLE IF EXISTS s004_user_master_settings
     ADD COLUMN IF NOT EXISTS charges_per_trade NUMERIC(10,2) NOT NULL DEFAULT 20;

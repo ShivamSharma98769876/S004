@@ -53,7 +53,7 @@ export default function LoginPage() {
         approved_paper: user.approved_paper,
         approved_live: user.approved_live,
       });
-      router.push("/dashboard");
+      router.push("/landing");
       router.refresh();
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Login failed.";

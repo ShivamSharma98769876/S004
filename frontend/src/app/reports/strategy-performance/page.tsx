@@ -3,6 +3,7 @@
 import { Fragment, useCallback, useEffect, useMemo, useState } from "react";
 import AppFrame from "@/components/AppFrame";
 import { apiJson, isAdmin } from "@/lib/api_client";
+import { addDaysIST, formatTimeIST, toYmdIST } from "@/lib/datetime_ist";
 
 type StrategyRow = {
   strategy_id: string;
@@ -101,10 +102,6 @@ type StrategyPerformanceResponse = {
 };
 
 type UserOption = { id: number; username: string };
-
-function toYMD(d: Date): string {
-  return d.toISOString().slice(0, 10);
-}
 
 type DatePreset = "7" | "30" | "90" | "all" | "custom";
 
@@ -282,13 +279,13 @@ export default function StrategyPerformancePage() {
   const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
   const [expandedKey, setExpandedKey] = useState<string | null>(null);
 
-  const today = useMemo(() => toYMD(new Date()), []);
+  const today = useMemo(() => toYmdIST(), []);
   const presetRanges = useMemo(() => {
     const t = new Date();
     return {
-      "7": { from: toYMD(new Date(t.getTime() - 6 * 24 * 60 * 60 * 1000)), to: today },
-      "30": { from: toYMD(new Date(t.getTime() - 29 * 24 * 60 * 60 * 1000)), to: today },
-      "90": { from: toYMD(new Date(t.getTime() - 89 * 24 * 60 * 60 * 1000)), to: today },
+      "7": { from: toYmdIST(addDaysIST(t, -6)), to: today },
+      "30": { from: toYmdIST(addDaysIST(t, -29)), to: today },
+      "90": { from: toYmdIST(addDaysIST(t, -89)), to: today },
       all: { from: "2020-01-01", to: today },
     };
   }, [today]);
@@ -484,7 +481,7 @@ export default function StrategyPerformancePage() {
         <div className="sp-updated">
           Updated{" "}
           {updatedAt
-            ? updatedAt.toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", hour12: true })
+            ? formatTimeIST(updatedAt, { hour12: true })
             : "—"}
         </div>
       </section>

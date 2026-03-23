@@ -8,6 +8,11 @@ from pydantic import BaseModel
 
 from app.api.auth_context import get_user_id
 from app.db_client import ensure_user, execute, fetch, fetchrow
+from app.services.platform_risk import (
+    evaluate_trade_entry_allowed,
+    get_platform_trading_paused,
+    user_today_realized_pnl_ist,
+)
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 
@@ -87,7 +92,7 @@ async def get_engine_status(user_id: int = Depends(get_user_id)) -> dict:
     row = await fetchrow(
         """
         SELECT m.engine_running, m.mode, m.broker_connected, m.shared_api_connected,
-               u.role
+               u.role, u.approved_live
         FROM s004_user_master_settings m
         LEFT JOIN s004_users u ON u.id = m.user_id
         WHERE m.user_id = $1
@@ -106,6 +111,19 @@ async def get_engine_status(user_id: int = Depends(get_user_id)) -> dict:
     broker_connected = bool(row.get("broker_connected"))
     shared_api = bool(row.get("shared_api_connected", True))
     is_admin = row and str(row.get("role", "")).upper() == "ADMIN"
+    mode = str(row.get("mode") or "PAPER").upper()
+    approved_live = bool(row.get("approved_live"))
+    if not is_admin and mode == "LIVE" and not approved_live:
+        mode = "PAPER"
+        await execute(
+            """
+            UPDATE s004_user_master_settings
+            SET mode = $2, updated_at = NOW()
+            WHERE user_id = $1
+            """,
+            user_id,
+            mode,
+        )
     if is_admin and broker_connected:
         kite_status = "connected"
     elif shared_api:
@@ -114,7 +132,7 @@ async def get_engine_status(user_id: int = Depends(get_user_id)) -> dict:
         kite_status = "none"
     return {
         "engineRunning": bool(row.get("engine_running")),
-        "mode": str(row.get("mode") or "PAPER"),
+        "mode": mode,
         "brokerConnected": broker_connected,
         "sharedApiConnected": shared_api,
         "isAdmin": is_admin,
@@ -139,6 +157,35 @@ async def set_engine_status(payload: EnginePayload, user_id: int = Depends(get_u
         payload.mode.upper() if payload.mode else "PAPER",
     )
     return {"engineRunning": payload.engineRunning, "mode": payload.mode}
+
+
+@router.get("/risk-status")
+async def get_risk_status(user_id: int = Depends(get_user_id)) -> dict:
+    """Today's realized P&L vs daily caps, platform pause, and whether new trades are allowed."""
+    await ensure_user(user_id)
+    paused, pause_reason = await get_platform_trading_paused()
+    today = await user_today_realized_pnl_ist(user_id)
+    master = await fetchrow(
+        """
+        SELECT COALESCE(max_loss_day, 0)::float AS max_loss_day,
+               COALESCE(max_profit_day, 0)::float AS max_profit_day
+        FROM s004_user_master_settings
+        WHERE user_id = $1
+        """,
+        user_id,
+    )
+    max_loss = float(master["max_loss_day"] or 0) if master else 0.0
+    max_profit = float(master["max_profit_day"] or 0) if master else 0.0
+    allowed, code, _msg = await evaluate_trade_entry_allowed(user_id)
+    return {
+        "platformTradingPaused": paused,
+        "platformPauseReason": pause_reason,
+        "todayRealizedPnl": round(today, 2),
+        "maxLossDay": round(max_loss, 2),
+        "maxProfitDay": round(max_profit, 2),
+        "newTradesAllowed": allowed,
+        "blockReasonCode": code if not allowed else None,
+    }
 
 
 @router.get("/summary")

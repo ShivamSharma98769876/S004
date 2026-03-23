@@ -165,6 +165,80 @@ SET display_name = EXCLUDED.display_name,
     strategy_details_json = COALESCE(EXCLUDED.strategy_details_json, s004_strategy_catalog.strategy_details_json),
     updated_at = NOW();
 
+-- TrendPulse Z: PS_z vs VS_z on 5m, HTF 15m bias, ADX gate (long CE/PE)
+INSERT INTO s004_strategy_catalog (
+    strategy_id,
+    version,
+    display_name,
+    description,
+    risk_profile,
+    owner_type,
+    publish_status,
+    execution_modes,
+    supported_segments,
+    performance_snapshot,
+    strategy_details_json,
+    created_by
+)
+SELECT
+    'strat-trendpulse-z',
+    '1.0.0',
+    'TrendPulse Z (Balanced)',
+    'NIFTY long options when z-scored price momentum crosses volume momentum on 5m and 15m HTF bias agrees. ADX gate on ST; chain IVR cap per strike. See docs/strategies/TRENDPULSE_Z_IMPLEMENTATION_PLAN.md.',
+    'MEDIUM',
+    'ADMIN',
+    'PUBLISHED',
+    ARRAY['PAPER', 'LIVE'],
+    ARRAY['NIFTY'],
+    '{"win_rate_30d": 0, "pnl_30d": 0}'::jsonb,
+    '{
+      "strategyType": "trendpulse-z",
+      "positionIntent": "long_premium",
+      "displayName": "TrendPulse Z (Balanced)",
+      "description": "HTF 15m EMA bias; ST 5m PS_z vs VS_z cross; ADX on ST must exceed minimum. Long CE on bullish cross + bullish HTF; long PE on bearish cross + bearish HTF. Strikes filtered by liquidity and per-strike IVR.",
+      "trendPulseZ": {
+        "profile": "balanced",
+        "stInterval": "5minute",
+        "htfInterval": "15minute",
+        "zWindow": 50,
+        "slopeLookback": 4,
+        "adxMin": 18,
+        "adxPeriod": 14,
+        "htfEmaFast": 13,
+        "htfEmaSlow": 34,
+        "ivRankMaxPercentile": 70,
+        "candleDaysBack": 5,
+        "session": { "enabled": false, "blockFirstMinutes": 15, "blockLastMinutes": 25 },
+        "breadth": { "enabled": false, "requireSpotAligned": true, "minAbsSpotChgPct": 0.05, "requirePcrAligned": false }
+      },
+      "strikeSelection": {
+        "minOi": 10000,
+        "minVolume": 500,
+        "maxOtmSteps": 3,
+        "deltaPreferredCE": 0.35,
+        "deltaPreferredPE": -0.35,
+        "description": "Same liquidity band as other NIFTY long strategies."
+      },
+      "scoreThreshold": 5,
+      "scoreMax": 5,
+      "autoTradeScoreThreshold": 5,
+      "scoreDescription": "Signal when TrendPulse engine fires (HTF/ST cross + ADX). Recommendation score is fixed at scoreMax when eligible; auto-trade uses autoTradeScoreThreshold."
+    }'::jsonb,
+    u.id
+FROM s004_users u
+WHERE u.username = 'admin'
+ON CONFLICT (strategy_id, version) DO UPDATE
+SET display_name = EXCLUDED.display_name,
+    description = EXCLUDED.description,
+    risk_profile = EXCLUDED.risk_profile,
+    owner_type = EXCLUDED.owner_type,
+    publish_status = EXCLUDED.publish_status,
+    execution_modes = EXCLUDED.execution_modes,
+    supported_segments = EXCLUDED.supported_segments,
+    performance_snapshot = EXCLUDED.performance_snapshot,
+    strategy_details_json = COALESCE(EXCLUDED.strategy_details_json, s004_strategy_catalog.strategy_details_json),
+    updated_at = NOW();
+
 -- NIFTY naked short premium: high chain IVR + spot trend; bullish -> short PE, bearish -> short CE
 INSERT INTO s004_strategy_catalog (
     strategy_id,

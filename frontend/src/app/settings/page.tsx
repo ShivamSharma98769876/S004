@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import AppFrame from "@/components/AppFrame";
 import {
   DEFAULT_TRADING_SETUP,
@@ -15,6 +15,7 @@ import {
   type ZerodhaCredentials,
 } from "@/lib/trading_setup";
 import { apiJson } from "@/lib/api_client";
+import { formatDateTimeIST } from "@/lib/datetime_ist";
 
 export default function SettingsPage() {
   const [master, setMaster] = useState<MasterSetup>(DEFAULT_TRADING_SETUP.master);
@@ -82,6 +83,26 @@ export default function SettingsPage() {
 
     loadSettingsForStrategy(null, null);
   }, []);
+
+  /** Shown in UI; can differ briefly from master.mode while LIVE is being coerced to PAPER. */
+  const effectiveTradeMode: TradeMode = useMemo(() => {
+    if (!approval) return master.mode;
+    if (master.mode === "LIVE" && !approval.approved_live) return "PAPER";
+    return master.mode;
+  }, [approval, master.mode]);
+
+  /** Align local state/cache when DB still had LIVE but user is Paper-only (server fixes DB on GET /settings or GET /dashboard/engine). */
+  useEffect(() => {
+    if (!approval) return;
+    if (master.mode !== "LIVE" || approval.approved_live) return;
+    setMaster((m) => ({ ...m, mode: "PAPER" }));
+    const setup = loadTradingSetup();
+    saveTradingSetup({
+      ...setup,
+      master: { ...setup.master, mode: "PAPER" },
+      updatedAt: setup.updatedAt,
+    });
+  }, [approval, master.mode]);
 
   const onStrategyChange = (sid: string, ver: string) => {
     setLoadingStrategy(true);
@@ -213,7 +234,7 @@ export default function SettingsPage() {
         </div>
         <div className="summary-card">
           <div className="summary-label">Trading Mode</div>
-          <div className="summary-value">{master.mode}</div>
+          <div className="summary-value">{effectiveTradeMode}</div>
         </div>
         <div className="summary-card">
           <div className="summary-label">Initial Capital</div>
@@ -221,7 +242,7 @@ export default function SettingsPage() {
         </div>
         <div className="summary-card">
           <div className="summary-label">Last Saved</div>
-          <div className="summary-value setup-saved-at">{savedAt ? new Date(savedAt).toLocaleString("en-IN") : "—"}</div>
+          <div className="summary-value setup-saved-at">{savedAt ? formatDateTimeIST(savedAt) : "—"}</div>
         </div>
       </section>
 

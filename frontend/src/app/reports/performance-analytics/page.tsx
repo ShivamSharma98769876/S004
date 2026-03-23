@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import AppFrame from "@/components/AppFrame";
 import { apiJson, isAdmin } from "@/lib/api_client";
+import { addDaysIST, formatDateShortIST, toYmdIST } from "@/lib/datetime_ist";
 
 type DailyPnlPoint = { date: string; pnl: number };
 type UserPnlPoint = { userId: number; username: string; pnl: number };
@@ -11,17 +12,7 @@ type PerformanceData = { dailyPnl: DailyPnlPoint[]; userPnl: UserPnlPoint[]; tra
 type UserOption = { id: number; username: string };
 
 function formatDateLabel(iso: string): string {
-  try {
-    const d = new Date(iso);
-    if (Number.isNaN(d.getTime())) return iso;
-    return d.toLocaleDateString("en-IN", { day: "numeric", month: "short" });
-  } catch {
-    return iso;
-  }
-}
-
-function toYMD(d: Date): string {
-  return d.toISOString().slice(0, 10);
+  return formatDateShortIST(iso, iso);
 }
 
 function CumulativePnlChart({ data }: { data: DailyPnlPoint[] }) {
@@ -229,13 +220,13 @@ export default function PerformanceAnalyticsPage() {
   const [tradeSortCol, setTradeSortCol] = useState<string>("trade_date");
   const [tradeSortDir, setTradeSortDir] = useState<"asc" | "desc">("desc");
 
-  const today = useMemo(() => toYMD(new Date()), []);
+  const today = useMemo(() => toYmdIST(), []);
   const presetRanges = useMemo(() => {
     const t = new Date();
     return {
-      "7": { from: toYMD(new Date(t.getTime() - 6 * 24 * 60 * 60 * 1000)), to: today },
-      "30": { from: toYMD(new Date(t.getTime() - 29 * 24 * 60 * 60 * 1000)), to: today },
-      "90": { from: toYMD(new Date(t.getTime() - 89 * 24 * 60 * 60 * 1000)), to: today },
+      "7": { from: toYmdIST(addDaysIST(t, -6)), to: today },
+      "30": { from: toYmdIST(addDaysIST(t, -29)), to: today },
+      "90": { from: toYmdIST(addDaysIST(t, -89)), to: today },
     };
   }, [today]);
 

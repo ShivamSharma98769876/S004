@@ -233,6 +233,27 @@ async def get_settings(
     else:
         strategy_details = DEFAULT_STRATEGY_DETAILS
 
+    # Non-admins cannot keep LIVE in DB without approved_live (avoids UI/API mismatch).
+    appr = await fetchrow(
+        "SELECT approved_paper, approved_live, role FROM s004_users WHERE id = $1",
+        user_id,
+    )
+    stored_mode = str(master["mode"] or "PAPER").upper()
+    effective_mode = stored_mode
+    if appr and str(appr.get("role", "")).upper() != "ADMIN":
+        if effective_mode == "LIVE" and not appr.get("approved_live"):
+            effective_mode = "PAPER"
+    if effective_mode != stored_mode:
+        await execute(
+            """
+            UPDATE s004_user_master_settings
+            SET mode = $2, updated_at = NOW()
+            WHERE user_id = $1
+            """,
+            user_id,
+            effective_mode,
+        )
+
     return SettingsResponse(
         master={
             "goLive": master["go_live"],
@@ -240,7 +261,7 @@ async def get_settings(
             "brokerConnected": master["broker_connected"],
             "sharedApiConnected": master["shared_api_connected"],
             "platformApiOnline": master["platform_api_online"],
-            "mode": master["mode"],
+            "mode": effective_mode,
             "maxTrades": master["max_parallel_trades"],
             "dailyLossLimit": float(master["max_loss_day"]),
         },

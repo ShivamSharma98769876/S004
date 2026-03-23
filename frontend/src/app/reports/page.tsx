@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import AppFrame from "@/components/AppFrame";
 import { apiJson, isAdmin } from "@/lib/api_client";
+import { formatDateYmdIST, formatTimeIST, toYmdIST } from "@/lib/datetime_ist";
 
 type ReportTrade = {
   trade_ref: string;
@@ -55,25 +56,11 @@ function buildReportsQuery(params: {
 }
 
 function formatTime(iso: string | null | undefined): string {
-  if (!iso) return "--:--:--";
-  try {
-    const d = new Date(iso);
-    if (Number.isNaN(d.getTime())) return "--:--:--";
-    return d.toLocaleTimeString("en-IN", { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" });
-  } catch {
-    return "--:--:--";
-  }
+  return formatTimeIST(iso, { seconds: true, fallback: "--:--:--" });
 }
 
 function formatDate(iso: string | null | undefined): string {
-  if (!iso) return "--";
-  try {
-    const d = new Date(iso);
-    if (Number.isNaN(d.getTime())) return "--";
-    return d.toLocaleDateString("en-CA", { year: "numeric", month: "2-digit", day: "2-digit" });
-  } catch {
-    return "--";
-  }
+  return formatDateYmdIST(iso, "--");
 }
 
 function escapeCsv(val: string): string {
@@ -220,7 +207,7 @@ export default function ReportsPage() {
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `performance-snapshot-${new Date().toISOString().slice(0, 10)}.csv`;
+    a.download = `performance-snapshot-${toYmdIST()}.csv`;
     a.click();
     URL.revokeObjectURL(url);
   };
@@ -231,7 +218,7 @@ export default function ReportsPage() {
   const colSpan = admin ? 15 : 14;
 
   return (
-    <AppFrame title="Reports & Backtesting" subtitle="Review performance history and validate strategy consistency.">
+    <AppFrame title="Reports" subtitle="Review performance history and strategy consistency.">
       <section
         className="panel-accent-chain"
         style={{ padding: "1rem 1.25rem", marginBottom: "1rem", borderRadius: 8 }}

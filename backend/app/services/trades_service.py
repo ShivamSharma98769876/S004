@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from typing import Any
 from uuid import uuid4
@@ -11,6 +11,11 @@ from uuid import uuid4
 from kiteconnect import KiteConnect
 
 from app.db_client import execute, fetch, fetchrow
+from app.services.platform_risk import (
+    evaluate_trade_entry_allowed,
+    evaluate_user_daily_pnl_limits,
+    get_platform_trading_paused,
+)
 from app.services.heuristic_scorer import score_leg as heuristic_score_leg
 from app.services.heuristic_enhancements import (
     DEFAULT_HEURISTIC_ENHANCEMENTS,
@@ -25,7 +30,14 @@ from app.services.heuristic_enhancements import (
     spot_direction,
     volume_oi_multiplier,
 )
-from app.services.option_chain_zerodha import fetch_option_chain_sync, get_expiries_for_instrument
+from app.services.option_chain_zerodha import (
+    fetch_index_candles_sync,
+    fetch_option_chain_sync,
+    get_expiries_for_instrument,
+)
+from app.services.trendpulse_phase3 import apply_trendpulse_hard_gates, resolve_trendpulse_z_config
+from app.services.trendpulse_z import evaluate_trendpulse_signal
+from app.services.market_micro_snapshot import build_market_context_for_log, entry_snapshot_from_rec_and_market
 
 
 async def _get_kite_for_user(user_id: int) -> KiteConnect | None:
@@ -305,6 +317,186 @@ async def _get_live_candidates(
                     "option_type": opt_type,
                 }
             )
+    recs.sort(
+        key=lambda x: (
+            -x["score"],
+            -x["volume_spike_ratio"],
+            -x["oi_chg_pct"],
+            x["delta_distance"],
+            abs(x["distance_to_atm"]),
+        )
+    )
+    return recs
+
+
+async def _get_live_candidates_trendpulse_z(
+    kite: KiteConnect | None,
+    max_strike_distance: int,
+    score_params: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Long CE/PE from PS_z vs VS_z cross + HTF bias; strike filters match rule-based long premium."""
+    if kite is None:
+        return []
+    tpc = score_params.get("trendpulse_config") or {}
+    if not isinstance(tpc, dict):
+        tpc = {}
+    st_int = str(tpc.get("stInterval", "5minute"))
+    htf_int = str(tpc.get("htfInterval", "15minute"))
+    days = int(tpc.get("candleDaysBack", 5))
+    z_window = int(tpc.get("zWindow", 50))
+    slope_k = int(tpc.get("slopeLookback", 4))
+    adx_period = int(tpc.get("adxPeriod", 14))
+    adx_min = float(tpc.get("adxMin", 18.0))
+    htf_ef = int(tpc.get("htfEmaFast", 13))
+    htf_es = int(tpc.get("htfEmaSlow", 34))
+    iv_rank_max = float(tpc.get("ivRankMaxPercentile", 70.0))
+
+    st = await asyncio.to_thread(fetch_index_candles_sync, kite, "NIFTY", st_int, days)
+    htf = await asyncio.to_thread(fetch_index_candles_sync, kite, "NIFTY", htf_int, days)
+    ev = evaluate_trendpulse_signal(
+        st,
+        htf,
+        z_window=z_window,
+        slope_lookback=slope_k,
+        adx_period=adx_period,
+        adx_min=adx_min,
+        htf_ema_fast=htf_ef,
+        htf_ema_slow=htf_es,
+    )
+    if not ev.ok:
+        return []
+
+    opt_type = "CE" if ev.cross == "bullish" else "PE"
+    score_max = int(score_params.get("score_max", 5))
+    strike_min_oi = int(score_params.get("strike_min_oi", 10000))
+    strike_min_volume = int(score_params.get("strike_min_volume", 500))
+    strike_delta_ce = float(score_params.get("strike_delta_ce", 0.35))
+    strike_delta_pe = float(score_params.get("strike_delta_pe", -0.35))
+    strike_max_otm_steps = int(score_params.get("strike_max_otm_steps", 3))
+
+    instrument = "NIFTY"
+    expiries = get_expiries_for_instrument(instrument)
+    if not expiries:
+        return []
+    expiry_str = expiries[0]
+
+    chain_payload = await asyncio.to_thread(
+        fetch_option_chain_sync,
+        kite,
+        instrument,
+        expiry_str,
+        max_strike_distance,
+        max_strike_distance,
+        1,
+        {"positionIntent": "long_premium"},
+    )
+    chain = chain_payload.get("chain", [])
+    spot = float(chain_payload.get("spot") or 0.0)
+    if not chain or spot <= 0:
+        return []
+
+    sc_raw = chain_payload.get("spotChgPct")
+    pc_raw = chain_payload.get("pcr")
+    try:
+        spot_chg_f = float(sc_raw) if sc_raw is not None else None
+    except (TypeError, ValueError):
+        spot_chg_f = None
+    try:
+        pcr_f = float(pc_raw) if pc_raw is not None else None
+    except (TypeError, ValueError):
+        pcr_f = None
+    ev = apply_trendpulse_hard_gates(
+        ev,
+        tpc,
+        spot_chg_pct=spot_chg_f,
+        pcr=pcr_f,
+        now_utc=datetime.now(timezone.utc),
+    )
+    if not ev.ok:
+        return []
+
+    step = 50
+    atm = round(spot / step) * step
+    recs: list[dict[str, Any]] = []
+    conf_denom = max(1, score_max)
+    tf_label = "5m" if "5" in st_int else st_int.replace("minute", "m")
+
+    for row in chain:
+        strike = int(float(row.get("strike", 0)))
+        distance_to_atm = int((strike - atm) / step)
+        if abs(distance_to_atm) > strike_max_otm_steps:
+            continue
+        leg_key, ot = ("call", "CE") if opt_type == "CE" else ("put", "PE")
+        leg = row.get(leg_key) or {}
+        oi = int(float(leg.get("oi") or 0))
+        volume = int(float(leg.get("volume") or 0))
+        if oi < strike_min_oi or volume < strike_min_volume:
+            continue
+        ivr = leg.get("ivr")
+        if ivr is not None:
+            try:
+                if float(ivr) > iv_rank_max:
+                    continue
+            except (TypeError, ValueError):
+                pass
+        ltp = float(leg.get("ltp") or 0.0)
+        delta = float(leg.get("delta") or 0.0)
+        score = score_max
+        signal_eligible = True
+        vol_ratio = float(leg.get("volumeSpikeRatio") or 0.0)
+        base_conf = (score / conf_denom) * 100
+        vol_bonus = max(0.0, min(19.0, (vol_ratio - 1.0) * 10))
+        confidence = min(99.0, round(base_conf + vol_bonus, 2))
+        target_delta = strike_delta_ce if opt_type == "CE" else strike_delta_pe
+        delta_distance = abs(delta - target_delta)
+        symbol = str(leg.get("tradingsymbol") or "").strip() or _compact_option_symbol(
+            instrument, expiry_str, strike, opt_type
+        )
+        recs.append(
+            {
+                "instrument": instrument,
+                "expiry": expiry_str,
+                "symbol": symbol,
+                "side": "BUY",
+                "entry_price": round(ltp, 2),
+                "target_price": round(ltp * 1.08, 2),
+                "stop_loss_price": round(ltp * 0.94, 2),
+                "confidence_score": confidence,
+                "vwap": float(leg.get("vwap") or 0.0),
+                "ema9": float(leg.get("ema9") or 0.0),
+                "ema21": float(leg.get("ema21") or 0.0),
+                "rsi": float(leg.get("rsi") or 0.0),
+                "volume": volume,
+                "avg_volume": float(leg.get("avgVolume") or 0.0),
+                "volume_spike_ratio": vol_ratio,
+                "score": score,
+                "primary_ok": bool(leg.get("primaryOk")),
+                "ema_ok": bool(leg.get("emaOk")),
+                "ema_crossover_ok": bool(leg.get("emaCrossoverOk")),
+                "rsi_ok": bool(leg.get("rsiOk")),
+                "volume_ok": bool(leg.get("volumeOk")),
+                "signal_eligible": signal_eligible,
+                "failed_conditions": "PASS",
+                "spot_price": round(spot, 2),
+                "timeframe": tf_label,
+                "refresh_interval_sec": 30,
+                "distance_to_atm": distance_to_atm,
+                "oi": oi,
+                "oi_chg_pct": float(leg.get("oiChgPct") or 0.0),
+                "delta": delta,
+                "delta_distance": delta_distance,
+                "option_type": opt_type,
+                "trendpulse": {
+                    "htf_bias": ev.htf_bias,
+                    "cross": ev.cross,
+                    "ps_z": round(ev.ps_z, 4),
+                    "vs_z": round(ev.vs_z, 4),
+                    "adx_st": round(ev.adx_st, 2),
+                    "reason": ev.reason,
+                },
+            }
+        )
+
     recs.sort(
         key=lambda x: (
             -x["score"],
@@ -617,6 +809,16 @@ async def get_strategy_score_params(
         else (0.35 if position_intent == "short_premium" else 1.0)
     )
 
+    tpz_raw = details.get("trendPulseZ")
+    if not isinstance(tpz_raw, dict):
+        tpz_raw = {}
+    trendpulse_config = resolve_trendpulse_z_config(tpz_raw)
+
+    strike_max_otm_steps = int(strike_cfg.get("maxOtmSteps", 3))
+    # Guardrail for TrendSnap Momentum: never go beyond +/-3 strikes from ATM on NIFTY.
+    if strategy_id == "strat-trendsnap-momentum":
+        strike_max_otm_steps = min(strike_max_otm_steps, 3)
+
     return {
         "strategy_type": strategy_type,
         "position_intent": position_intent,
@@ -644,7 +846,8 @@ async def get_strategy_score_params(
         "strike_min_volume": int(strike_cfg.get("minVolume", 500)),
         "strike_delta_ce": float(strike_cfg.get("deltaPreferredCE", 0.35)),
         "strike_delta_pe": float(strike_cfg.get("deltaPreferredPE", -0.35)),
-        "strike_max_otm_steps": int(strike_cfg.get("maxOtmSteps", 3)),
+        "strike_max_otm_steps": strike_max_otm_steps,
+        "trendpulse_config": trendpulse_config,
     }
 
 
@@ -799,7 +1002,13 @@ async def ensure_recommendations(user_id: int, kite: KiteConnect | None = None) 
 
         generated_rows: list[dict] = []
         try:
-            if strategy_type == "heuristic-voting":
+            if strategy_type == "trendpulse-z":
+                generated_rows = await _get_live_candidates_trendpulse_z(
+                    kite,
+                    max_strike_distance,
+                    score_params,
+                )
+            elif strategy_type == "heuristic-voting":
                 heuristics_cfg = score_params.get("heuristics") or {}
                 raw_enh = score_params.get("heuristic_enhancements")
                 # Missing/empty → DEFAULT_HEURISTIC_ENHANCEMENTS (enabled, loss-reduction filters on).
@@ -886,6 +1095,7 @@ async def ensure_recommendations(user_id: int, kite: KiteConnect | None = None) 
                 "timeframe": rec["timeframe"],
                 "refresh_interval_sec": rec["refresh_interval_sec"],
                 "atm_distance": rec["distance_to_atm"],
+                "trendpulse": rec.get("trendpulse"),
             }
             for uid in subscribed_users:
                 rec_id = f"rec-{uuid4().hex[:10]}"
@@ -974,9 +1184,13 @@ async def execute_recommendation(
     mode: str,
     quantity: int = 1,
     manual: bool = False,
+    market_snapshot: dict[str, Any] | None = None,
 ) -> dict:
     """Execute a recommendation and create trade. Returns {trade_ref, order_ref}."""
     await _check_mode_approval(user_id, mode)
+    risk_ok, _, risk_msg = await evaluate_trade_entry_allowed(user_id)
+    if not risk_ok:
+        raise ValueError(risk_msg)
     rec = await fetchrow(
         """
         SELECT * FROM s004_trade_recommendations
@@ -1038,6 +1252,7 @@ async def execute_recommendation(
 
     order_ref = f"ord-{uuid4().hex[:10]}"
     trade_ref = f"trd-{uuid4().hex[:10]}"
+    entry_snap = entry_snapshot_from_rec_and_market(dict(rec), market_snapshot)
 
     await execute(
         """
@@ -1058,15 +1273,7 @@ async def execute_recommendation(
         broker_order_id,
     )
 
-    await execute(
-        """
-        INSERT INTO s004_live_trades (
-            trade_ref, order_ref, recommendation_id, user_id, strategy_id, strategy_version, symbol, mode, side, quantity,
-            entry_price, current_price, target_price, stop_loss_price, current_state,
-            realized_pnl, unrealized_pnl, broker_order_id, opened_at, created_at, updated_at
-        )
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$11,$12,$13,'ACTIVE',0,0,$14,NOW(),NOW(),NOW())
-        """,
+    live_trade_params = (
         trade_ref,
         order_ref,
         recommendation_id,
@@ -1082,6 +1289,31 @@ async def execute_recommendation(
         stop_loss_price,
         broker_order_id,
     )
+    try:
+        await execute(
+            """
+            INSERT INTO s004_live_trades (
+                trade_ref, order_ref, recommendation_id, user_id, strategy_id, strategy_version, symbol, mode, side, quantity,
+                entry_price, current_price, target_price, stop_loss_price, current_state,
+                realized_pnl, unrealized_pnl, broker_order_id, entry_market_snapshot, opened_at, created_at, updated_at
+            )
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$11,$12,$13,'ACTIVE',0,0,$14,$15::jsonb,NOW(),NOW(),NOW())
+            """,
+            *live_trade_params,
+            json.dumps(entry_snap),
+        )
+    except Exception:
+        await execute(
+            """
+            INSERT INTO s004_live_trades (
+                trade_ref, order_ref, recommendation_id, user_id, strategy_id, strategy_version, symbol, mode, side, quantity,
+                entry_price, current_price, target_price, stop_loss_price, current_state,
+                realized_pnl, unrealized_pnl, broker_order_id, opened_at, created_at, updated_at
+            )
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$11,$12,$13,'ACTIVE',0,0,$14,NOW(),NOW(),NOW())
+            """,
+            *live_trade_params,
+        )
 
     await execute(
         """
@@ -1154,8 +1386,189 @@ def _is_within_trade_window(trade_start: datetime.time, trade_end: datetime.time
     return trade_start <= now_ist or now_ist <= trade_end
 
 
+def _ist_day_utc_naive_bounds_today() -> tuple[datetime, datetime]:
+    ist = ZoneInfo("Asia/Kolkata")
+    d = datetime.now(ist).date()
+    start_ist = datetime.combine(d, datetime.min.time(), tzinfo=ist)
+    end_ist = start_ist + timedelta(days=1)
+    return (
+        start_ist.astimezone(timezone.utc).replace(tzinfo=None),
+        end_ist.astimezone(timezone.utc).replace(tzinfo=None),
+    )
+
+
+_DECISION_LOG_LAST: dict[int, float] = {}
+_DECISION_LOG_MIN_SEC = 50.0
+
+
+async def _maybe_insert_auto_execute_decision_log(
+    *,
+    user_id: int,
+    mode: str | None,
+    strategy_id: str | None,
+    strategy_version: str | None,
+    gate_blocked: bool,
+    gate_reason: str | None,
+    cycle_summary: str,
+    auto_trade_threshold: float | None,
+    score_display_threshold: float | None,
+    min_confidence_threshold: float,
+    open_trades: int | None,
+    trades_today: int | None,
+    max_parallel: int | None,
+    max_trades_day: int | None,
+    within_trade_window: bool | None,
+    has_kite_live: bool | None,
+    daily_pnl_ok: bool | None,
+    market_context: dict[str, Any],
+    evaluations: list[dict[str, Any]],
+    executed_ids: list[str],
+) -> None:
+    """Throttle per user to limit row volume; failures are silent if table missing."""
+    now = time.monotonic()
+    if now - _DECISION_LOG_LAST.get(user_id, 0.0) < _DECISION_LOG_MIN_SEC:
+        return
+    _DECISION_LOG_LAST[user_id] = now
+    try:
+        await execute(
+            """
+            INSERT INTO s004_auto_execute_decision_log (
+                user_id, mode, strategy_id, strategy_version,
+                gate_blocked, gate_reason, cycle_summary,
+                auto_trade_threshold, score_display_threshold, min_confidence_threshold,
+                open_trades, trades_today, max_parallel, max_trades_day,
+                within_trade_window, has_kite_live, daily_pnl_ok,
+                market_context, evaluations, executed_recommendation_ids
+            )
+            VALUES (
+                $1, $2, $3, $4,
+                $5, $6, $7,
+                $8, $9, $10,
+                $11, $12, $13, $14,
+                $15, $16, $17,
+                $18::jsonb, $19::jsonb, $20::jsonb
+            )
+            """,
+            user_id,
+            (mode or "")[:10] or None,
+            strategy_id,
+            strategy_version,
+            gate_blocked,
+            (gate_reason or None)[:96] if gate_reason else None,
+            (cycle_summary or "")[:48],
+            auto_trade_threshold,
+            score_display_threshold,
+            min_confidence_threshold,
+            open_trades,
+            trades_today,
+            max_parallel,
+            max_trades_day,
+            within_trade_window,
+            has_kite_live,
+            daily_pnl_ok,
+            json.dumps(market_context or {}),
+            json.dumps(evaluations or []),
+            json.dumps(executed_ids or []),
+        )
+    except Exception:
+        pass
+
+
+async def _audit_generated_evaluations(
+    user_id: int,
+    mode: str,
+    min_confidence_line: float = 80.0,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Factual per-recommendation eligibility vs auto-execute rules (for decision log)."""
+    strategy_id, strategy_version = await _get_user_strategy(user_id)
+    score_params = await get_strategy_score_params(strategy_id, strategy_version, user_id)
+    auto_thresh = float(score_params["auto_trade_score_threshold"])
+    score_threshold = float(score_params.get("score_threshold", 3))
+    rows = await fetch(
+        """
+        SELECT t.recommendation_id, t.symbol, t.confidence_score, t.score, t.rank_value, t.reason_code, t.created_at
+        FROM (
+            SELECT recommendation_id, symbol, side, confidence_score, score, rank_value, reason_code, created_at,
+                   ROW_NUMBER() OVER (PARTITION BY symbol, side ORDER BY created_at DESC) AS rn
+            FROM s004_trade_recommendations
+            WHERE user_id = $1 AND strategy_id = $2 AND strategy_version = $3 AND status = 'GENERATED'
+        ) t
+        WHERE t.rn = 1
+        ORDER BY t.rank_value ASC NULLS LAST, t.created_at DESC
+        LIMIT 25
+        """,
+        user_id,
+        strategy_id,
+        strategy_version,
+    )
+    cache = _REC_DETAILS_CACHE.get(user_id, {})
+    evaluations: list[dict[str, Any]] = []
+    for r in rows or []:
+        rec_id = str(r.get("recommendation_id") or "")
+        details = cache.get(rec_id, {})
+        conf = float(r.get("confidence_score") or 0)
+        score_raw = details.get("score") if details.get("score") is not None else r.get("score")
+        score_val: float | None
+        try:
+            score_val = float(score_raw) if score_raw is not None else None
+        except (TypeError, ValueError):
+            score_val = None
+        signal_eligible = details.get("signal_eligible")
+        if signal_eligible is None and score_val is not None:
+            signal_eligible = score_val >= score_threshold
+        reasons: list[str] = []
+        if conf < min_confidence_line:
+            reasons.append(f"confidence_{round(conf, 2)}_below_{min_confidence_line}")
+        if score_val is None:
+            reasons.append("score_missing")
+        elif score_val < auto_thresh:
+            reasons.append("below_auto_trade_score_threshold")
+        if signal_eligible is not True:
+            reasons.append("signal_not_eligible_vs_display_threshold")
+        eligible = (
+            conf >= min_confidence_line
+            and score_val is not None
+            and score_val >= auto_thresh
+            and signal_eligible is True
+        )
+        evaluations.append(
+            {
+                "recommendation_id": rec_id,
+                "symbol": str(r.get("symbol") or ""),
+                "confidence": round(conf, 4),
+                "score": score_val,
+                "rank_value": int(r.get("rank_value") or 0),
+                "reason_code": str(r.get("reason_code") or ""),
+                "auto_trade_score_threshold": auto_thresh,
+                "score_display_threshold": score_threshold,
+                "min_confidence_for_auto": min_confidence_line,
+                "signal_eligible": bool(signal_eligible) if signal_eligible is not None else None,
+                "eligible_for_auto_execute": eligible,
+                "block_reasons": reasons if not eligible else [],
+            }
+        )
+    meta = {
+        "strategy_id": strategy_id,
+        "strategy_version": strategy_version,
+        "auto_trade_score_threshold": auto_thresh,
+        "score_display_threshold": score_threshold,
+        "min_confidence_for_auto": min_confidence_line,
+    }
+    return meta, evaluations
+
+
 async def run_auto_execute_cycle() -> None:
     """Run auto-execute for all users with engine_running=true. Respects Trade Start/End from Settings. Picks trades with score >= threshold, Eligible=Yes, confidence>=80."""
+    if (await get_platform_trading_paused())[0]:
+        return
+    kite_shared = await _get_kite_for_any_user()
+    market_ctx: dict[str, Any] = {}
+    if kite_shared:
+        try:
+            market_ctx = await build_market_context_for_log(kite_shared)
+        except Exception:
+            market_ctx = {}
+    day_start, day_end = _ist_day_utc_naive_bounds_today()
     rows = await fetch(
         """
         SELECT m.user_id, m.mode, m.max_parallel_trades, m.max_trades_day
@@ -1168,13 +1581,92 @@ async def run_auto_execute_cycle() -> None:
         mode = str(r.get("mode") or "PAPER").upper()
         if mode not in ("PAPER", "LIVE"):
             continue
+        try:
+            strategy_id, strategy_version = await _get_user_strategy(user_id)
+            score_params = await get_strategy_score_params(strategy_id, strategy_version, user_id)
+            auto_t = float(score_params["auto_trade_score_threshold"])
+            disp_t = float(score_params.get("score_threshold", 3))
+        except Exception:
+            strategy_id, strategy_version = "", ""
+            auto_t, disp_t = None, None
+
         trade_start, trade_end = await _get_trade_window(user_id)
-        if not _is_within_trade_window(trade_start, trade_end):
+        within = _is_within_trade_window(trade_start, trade_end)
+        if not within:
+            await _maybe_insert_auto_execute_decision_log(
+                user_id=user_id,
+                mode=mode,
+                strategy_id=strategy_id or None,
+                strategy_version=strategy_version or None,
+                gate_blocked=True,
+                gate_reason="outside_trade_window",
+                cycle_summary="SKIPPED_GATE",
+                auto_trade_threshold=auto_t,
+                score_display_threshold=disp_t,
+                min_confidence_threshold=80.0,
+                open_trades=None,
+                trades_today=None,
+                max_parallel=int(r.get("max_parallel_trades") or 3),
+                max_trades_day=int(r.get("max_trades_day") or 4),
+                within_trade_window=False,
+                has_kite_live=None,
+                daily_pnl_ok=None,
+                market_context=market_ctx,
+                evaluations=[],
+                executed_ids=[],
+            )
             continue
         if mode == "LIVE":
             kite_user = await _get_kite_for_user(user_id)
             if not kite_user:
-                continue  # Skip LIVE users without valid Kite credentials
+                await _maybe_insert_auto_execute_decision_log(
+                    user_id=user_id,
+                    mode=mode,
+                    strategy_id=strategy_id or None,
+                    strategy_version=strategy_version or None,
+                    gate_blocked=True,
+                    gate_reason="live_no_broker_session",
+                    cycle_summary="SKIPPED_GATE",
+                    auto_trade_threshold=auto_t,
+                    score_display_threshold=disp_t,
+                    min_confidence_threshold=80.0,
+                    open_trades=None,
+                    trades_today=None,
+                    max_parallel=int(r.get("max_parallel_trades") or 3),
+                    max_trades_day=int(r.get("max_trades_day") or 4),
+                    within_trade_window=True,
+                    has_kite_live=False,
+                    daily_pnl_ok=None,
+                    market_context=market_ctx,
+                    evaluations=[],
+                    executed_ids=[],
+                )
+                continue
+        daily_ok, _, _ = await evaluate_user_daily_pnl_limits(user_id)
+        if not daily_ok:
+            await _maybe_insert_auto_execute_decision_log(
+                user_id=user_id,
+                mode=mode,
+                strategy_id=strategy_id or None,
+                strategy_version=strategy_version or None,
+                gate_blocked=True,
+                gate_reason="daily_pnl_limit_blocked",
+                cycle_summary="SKIPPED_GATE",
+                auto_trade_threshold=auto_t,
+                score_display_threshold=disp_t,
+                min_confidence_threshold=80.0,
+                open_trades=None,
+                trades_today=None,
+                max_parallel=int(r.get("max_parallel_trades") or 3),
+                max_trades_day=int(r.get("max_trades_day") or 4),
+                within_trade_window=True,
+                has_kite_live=True,
+                daily_pnl_ok=False,
+                market_context=market_ctx,
+                evaluations=[],
+                executed_ids=[],
+            )
+            continue
         try:
             open_count = await fetchrow(
                 """
@@ -1186,28 +1678,109 @@ async def run_auto_execute_cycle() -> None:
             open_trades = int(open_count["n"] or 0) if open_count else 0
             max_parallel = int(r.get("max_parallel_trades") or 3)
             if open_trades >= max_parallel:
+                await _maybe_insert_auto_execute_decision_log(
+                    user_id=user_id,
+                    mode=mode,
+                    strategy_id=strategy_id or None,
+                    strategy_version=strategy_version or None,
+                    gate_blocked=True,
+                    gate_reason="max_parallel_trades_reached",
+                    cycle_summary="SKIPPED_GATE",
+                    auto_trade_threshold=auto_t,
+                    score_display_threshold=disp_t,
+                    min_confidence_threshold=80.0,
+                    open_trades=open_trades,
+                    trades_today=None,
+                    max_parallel=max_parallel,
+                    max_trades_day=int(r.get("max_trades_day") or 4),
+                    within_trade_window=True,
+                    has_kite_live=True,
+                    daily_pnl_ok=True,
+                    market_context=market_ctx,
+                    evaluations=[],
+                    executed_ids=[],
+                )
                 continue
 
-            trades_today = await fetchrow(
+            trades_today_row = await fetchrow(
                 """
                 SELECT COUNT(*) AS n FROM s004_live_trades
-                WHERE user_id = $1 AND created_at::date = CURRENT_DATE
+                WHERE user_id = $1 AND opened_at >= $2 AND opened_at < $3
                 """,
                 user_id,
+                day_start,
+                day_end,
             )
-            trades_today = int(trades_today["n"] or 0) if trades_today else 0
+            trades_today = int(trades_today_row["n"] or 0) if trades_today_row else 0
             max_per_day = int(r.get("max_trades_day") or 4)
             if trades_today >= max_per_day:
+                await _maybe_insert_auto_execute_decision_log(
+                    user_id=user_id,
+                    mode=mode,
+                    strategy_id=strategy_id or None,
+                    strategy_version=strategy_version or None,
+                    gate_blocked=True,
+                    gate_reason="max_trades_per_day_reached",
+                    cycle_summary="SKIPPED_GATE",
+                    auto_trade_threshold=auto_t,
+                    score_display_threshold=disp_t,
+                    min_confidence_threshold=80.0,
+                    open_trades=open_trades,
+                    trades_today=trades_today,
+                    max_parallel=max_parallel,
+                    max_trades_day=max_per_day,
+                    within_trade_window=True,
+                    has_kite_live=True,
+                    daily_pnl_ok=True,
+                    market_context=market_ctx,
+                    evaluations=[],
+                    executed_ids=[],
+                )
                 continue
 
-            kite = await _get_kite_for_any_user()  # Shared API for recommendations; user's connection only needed for Live execution
+            kite = kite_shared
             await ensure_recommendations(user_id, kite)
+            meta, evaluations = await _audit_generated_evaluations(user_id, mode, min_confidence_line=80.0)
+            auto_t = float(meta.get("auto_trade_score_threshold") or 0)
+            disp_t = float(meta.get("score_display_threshold") or 0)
             eligible = await get_auto_execute_eligible_recommendations(user_id, mode, min_confidence=80.0)
+            executed_ids: list[str] = []
             for rec in eligible[: max_parallel - open_trades]:
                 try:
-                    await execute_recommendation(user_id, rec["recommendation_id"], mode, quantity=1, manual=False)
+                    await execute_recommendation(
+                        user_id,
+                        rec["recommendation_id"],
+                        mode,
+                        quantity=1,
+                        manual=False,
+                        market_snapshot=market_ctx,
+                    )
+                    executed_ids.append(str(rec["recommendation_id"]))
                 except Exception:
                     pass
+            summary = "EXECUTED" if executed_ids else ("NO_ELIGIBLE" if not any(e.get("eligible_for_auto_execute") for e in evaluations) else "ELIGIBLE_NONE_EXECUTED")
+            await _maybe_insert_auto_execute_decision_log(
+                user_id=user_id,
+                mode=mode,
+                strategy_id=str(meta.get("strategy_id") or strategy_id) or None,
+                strategy_version=str(meta.get("strategy_version") or strategy_version) or None,
+                gate_blocked=False,
+                gate_reason=None,
+                cycle_summary=summary[:48],
+                auto_trade_threshold=auto_t,
+                score_display_threshold=disp_t,
+                min_confidence_threshold=80.0,
+                open_trades=open_trades,
+                trades_today=trades_today,
+                max_parallel=max_parallel,
+                max_trades_day=max_per_day,
+                within_trade_window=True,
+                has_kite_live=True,
+                daily_pnl_ok=True,
+                market_context=market_ctx,
+                evaluations=evaluations,
+                executed_ids=executed_ids,
+            )
         except Exception:
             pass
 

@@ -1,24 +1,55 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import os
+from pathlib import Path
 from typing import Any
 
 import asyncpg
 from dotenv import load_dotenv
 
 _pool: asyncpg.Pool | None = None
+_logger = logging.getLogger("s004.db")
 
 
 async def init_db_pool() -> None:
     global _pool
     if _pool is not None:
         return
-    load_dotenv()
+    env_path = Path(__file__).resolve().parents[1] / ".env"
+    load_dotenv(dotenv_path=env_path, override=False)
+    load_dotenv(override=False)
     db_url = os.getenv("DATABASE_URL")
     if not db_url:
         raise RuntimeError("DATABASE_URL is not set.")
-    _pool = await asyncpg.create_pool(dsn=db_url, min_size=1, max_size=8)
+    max_attempts = int(os.getenv("DB_CONNECT_MAX_ATTEMPTS", "5"))
+    retry_delay_sec = float(os.getenv("DB_CONNECT_RETRY_DELAY_SEC", "2"))
+    last_error: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            _pool = await asyncpg.create_pool(
+                dsn=db_url,
+                min_size=1,
+                max_size=8,
+                timeout=15,
+            )
+            return
+        except Exception as exc:
+            last_error = exc
+            if attempt >= max_attempts:
+                break
+            _logger.warning(
+                "DB connect attempt %s/%s failed (%s). Retrying in %.1fs...",
+                attempt,
+                max_attempts,
+                type(exc).__name__,
+                retry_delay_sec,
+            )
+            await asyncio.sleep(retry_delay_sec)
+    assert last_error is not None
+    raise last_error
 
 
 async def close_db_pool() -> None:
