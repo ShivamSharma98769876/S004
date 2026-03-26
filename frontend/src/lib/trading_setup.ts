@@ -140,7 +140,7 @@ export const DEFAULT_TRADING_SETUP: TradingSetup = {
       FINNIFTY: false,
       MIDCPNIFTY: false,
     },
-    tradeStart: "09:20",
+    tradeStart: "09:15",
     tradeEnd: "15:00",
     autoPauseAfterLosses: 3,
   },

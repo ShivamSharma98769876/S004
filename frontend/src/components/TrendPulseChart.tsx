@@ -2,7 +2,7 @@
 
 import { useCallback, useMemo, useState } from "react";
 import { createPortal } from "react-dom";
-import { intlDateTimeOptionsIST, intlTimeOptionsIST } from "@/lib/datetime_ist";
+import { intlDateTimeOptionsIST, intlTimeOptionsIST, parseBackendUtcNaive } from "@/lib/datetime_ist";
 
 /** Top GENERATED row from s004_trade_recommendations for this strategy (camelCase from API). */
 export type TrendPulseRecommendation = {
@@ -88,7 +88,7 @@ const SIGNAL_ICON_PX = (40 * 2) / 3;
 function formatTick(t: string): string {
   if (!t) return "";
   try {
-    const d = new Date(t);
+    const d = parseBackendUtcNaive(t);
     if (Number.isNaN(d.getTime())) return "";
     return d.toLocaleTimeString("en-IN", intlTimeOptionsIST);
   } catch {
@@ -99,7 +99,7 @@ function formatTick(t: string): string {
 function formatBarHint(t: string): string {
   if (!t) return "";
   try {
-    const d = new Date(t);
+    const d = parseBackendUtcNaive(t);
     if (Number.isNaN(d.getTime())) return "";
     const wall = d.toLocaleString("en-IN", intlDateTimeOptionsIST);
     return `${wall} IST`;
@@ -111,7 +111,7 @@ function formatBarHint(t: string): string {
 function formatTimeOnlyIST(t: string): string {
   if (!t) return "";
   try {
-    const d = new Date(t);
+    const d = parseBackendUtcNaive(t);
     if (Number.isNaN(d.getTime())) return "";
     const hhmmss = d.toLocaleTimeString("en-IN", {
       hour12: false,

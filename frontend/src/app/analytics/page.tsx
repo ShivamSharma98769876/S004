@@ -55,7 +55,7 @@ type OptionChainResponse = {
 type IndicesSpot = { spot: number; spotChgPct: number };
 type IndicesData = { NIFTY: IndicesSpot; BANKNIFTY: IndicesSpot; SENSEX: IndicesSpot };
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+const apiBase = typeof window !== "undefined" ? "" : process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 const INSTRUMENTS = [
   { label: "NIFTY 50", value: "NIFTY" },
   { label: "BANK NIFTY", value: "BANKNIFTY" },
@@ -93,6 +93,9 @@ export default function AnalyticsPage() {
   const [error, setError] = useState<string | null>(null);
   const [rateLimitMessage, setRateLimitMessage] = useState<string | null>(null);
   const [chainSortDir, setChainSortDir] = useState<"asc" | "desc">("asc");
+  const [brokerSessionOk, setBrokerSessionOk] = useState<boolean | null>(null);
+  const [credentialsPresent, setCredentialsPresent] = useState<boolean | null>(null);
+  const [expirySource, setExpirySource] = useState<string | null>(null);
 
   const sortedChain = useMemo(() => {
     const c = data?.chain ?? [];
@@ -116,11 +119,18 @@ export default function AnalyticsPage() {
           strikes_up: String(strikesUp),
           strikes_down: String(strikesDown),
         });
-        const res = await fetch(`${API_BASE}/api/analytics/option-chain?${params}`, { headers: getAuthHeaders() });
+        const res = await fetch(`${apiBase}/api/analytics/option-chain?${params}`, { headers: getAuthHeaders() });
         const json = await res.json();
         if (!res.ok) {
           if (res.status === 429) {
             setRateLimitMessage(json?.detail || "Kite rate limit. Showing previous data.");
+          } else if (res.status === 401) {
+            setError(
+              typeof json?.detail === "string"
+                ? json.detail
+                : "Zerodha session invalid. Reconnect in Settings."
+            );
+            setBrokerSessionOk(false);
           } else {
             setError(json?.detail || res.statusText || "Failed to load option chain");
           }
@@ -139,7 +149,7 @@ export default function AnalyticsPage() {
 
   useEffect(() => {
     let cancelled = false;
-    fetch(`${API_BASE}/api/analytics/config`, { headers: getAuthHeaders() })
+    fetch(`${apiBase}/api/analytics/config`, { headers: getAuthHeaders() })
       .then((r) => (r.ok ? r.json() : null))
       .then((json: { option_chain_refresh_seconds?: number; require_live_broker?: boolean; recent_window_fetches?: number } | null) => {
         if (cancelled || !json) return;
@@ -158,14 +168,34 @@ export default function AnalyticsPage() {
     let cancelled = false;
     setExpiriesLoading(true);
     setExpiries([]);
-    fetch(`${API_BASE}/api/analytics/expiries?instrument=${encodeURIComponent(instrument)}`, { headers: getAuthHeaders() })
+    fetch(`${apiBase}/api/analytics/expiries?instrument=${encodeURIComponent(instrument)}`, { headers: getAuthHeaders() })
       .then((r) => (r.ok ? r.json() : null))
-      .then((json: { expiries?: string[] } | null) => {
+      .then(
+        (
+          json: {
+            expiries?: string[];
+            broker_session_ok?: boolean;
+            credentials_present?: boolean;
+            expiry_source?: string;
+          } | null
+        ) => {
         if (cancelled) return;
-        const list = Array.isArray(json?.expiries) ? json.expiries : [];
+        if (!json) {
+          setExpiries([]);
+          setExpiry("");
+          setBrokerSessionOk(false);
+          setCredentialsPresent(null);
+          setExpirySource(null);
+          return;
+        }
+        const list = Array.isArray(json.expiries) ? json.expiries : [];
         setExpiries(list);
         setExpiry((prev) => (list.includes(prev) ? prev : list[0] || ""));
-      })
+        setBrokerSessionOk(typeof json.broker_session_ok === "boolean" ? json.broker_session_ok : false);
+        setCredentialsPresent(typeof json.credentials_present === "boolean" ? json.credentials_present : null);
+        setExpirySource(json.expiry_source ?? null);
+      }
+      )
       .catch(() => {
         if (!cancelled) setExpiries([]);
       })
@@ -187,7 +217,7 @@ export default function AnalyticsPage() {
   }, [fetchChain, refreshSeconds]);
 
   const fetchIndices = useCallback(() => {
-    fetch(`${API_BASE}/api/analytics/indices`, { headers: getAuthHeaders() })
+    fetch(`${apiBase}/api/analytics/indices`, { headers: getAuthHeaders() })
       .then((r) => (r.ok ? r.json() : null))
       .then((json: IndicesData | null) => {
         if (json) setIndicesData(json);
@@ -247,9 +277,26 @@ export default function AnalyticsPage() {
 
       {rateLimitMessage && <div className="notice warning">{rateLimitMessage}</div>}
       {error && <div className="notice error">{error}</div>}
-      {requireLiveBroker && (
+      {requireLiveBroker && brokerSessionOk === false && (
+        <div className="notice error" role="alert">
+          {credentialsPresent === false
+            ? "Zerodha API key or access token is not saved. Open Settings → Zerodha and connect before live option chain data can load."
+            : "Zerodha session is not valid (access tokens expire daily). Open Settings, reconnect Kite, then refresh this page."}
+        </div>
+      )}
+      {requireLiveBroker && brokerSessionOk && expirySource === "estimated_weeklies" && (
         <div className="notice warning">
-          Real broker mode enabled. OI/Volume changes are computed from the last {recentWindowFetches} in-memory fetches only.
+          Using estimated weekly dates for expiry — real NFO dates could not be loaded. If this persists, reconnect Zerodha in Settings.
+        </div>
+      )}
+      {requireLiveBroker && brokerSessionOk && expirySource === "zerodha_nfo" && (
+        <div className="notice warning">
+          Expiries loaded from Zerodha NFO. OI/Volume change columns use the last {recentWindowFetches} in-memory fetches only.
+        </div>
+      )}
+      {!requireLiveBroker && (
+        <div className="notice info">
+          Live broker not required (OPTION_CHAIN_REQUIRE_LIVE=0). Chain may use synthetic data when Kite is unavailable.
         </div>
       )}
 
@@ -297,9 +344,14 @@ export default function AnalyticsPage() {
         <button className="action-button" onClick={() => fetchChain(true)}>
           {loading ? "Refreshing..." : "Refresh"}
         </button>
-        {data && (
-          <span className={`chip ${data.using_live_broker ? "chip-status-active" : "chip-status-paused"}`}>
-            Live Broker: {data.using_live_broker ? "Connected" : "Disconnected"}
+        {brokerSessionOk !== null && (
+          <span className={`chip ${brokerSessionOk ? "chip-status-active" : "chip-status-paused"}`} title="Validated via Kite profile()">
+            Zerodha API: {brokerSessionOk ? "Session OK" : "Not connected"}
+          </span>
+        )}
+        {data?.using_live_broker === false && brokerSessionOk && (
+          <span className="chip chip-status-paused" title="This response used synthetic chain">
+            Chain: synthetic
           </span>
         )}
         {!loading && chain.length > 0 && (

@@ -9,7 +9,7 @@ import {
   type TradingSetup,
 } from "@/lib/trading_setup";
 import { apiJson } from "@/lib/api_client";
-import { formatClockNowIST, formatTimeIST } from "@/lib/datetime_ist";
+import { backendInstantMs, formatClockNowIST, formatTimeIST } from "@/lib/datetime_ist";
 
 type ClosedTrade = {
   symbol: string;
@@ -59,11 +59,11 @@ function formatInr(n: number): string {
 }
 
 function formatTime(iso: string | null | undefined): string {
-  return formatTimeIST(iso, { seconds: true, fallback: "--:--:--" });
+  return formatTimeIST(iso, { seconds: true, fallback: "--:--:--", appendIstLabel: true });
 }
 
 function formatTimeShort(iso: string | null | undefined): string {
-  return formatTimeIST(iso, { fallback: "00:00" });
+  return formatTimeIST(iso, { fallback: "00:00", appendIstLabel: true });
 }
 
 type IntradayPoint = { time: string; pnl: number };
@@ -208,10 +208,47 @@ type BackendTrade = {
   confidence_score?: number | null;
 };
 
+/** Dashboard STRATEGY SIGNALS blurb — must not hardcode TrendPulse Z for all strategies. */
+function strategySignalsSubtitle(strategyKey: string | undefined): string {
+  const k = (strategyKey || "").toLowerCase();
+  if (k.includes("trendpulse") || k.includes("strat-trendpulse")) {
+    return "TrendPulse Z: Tier 1 = index (cross + HTF + ADX); Tier 2 = strike (δ band, extrinsic %, liquidity).";
+  }
+  if (
+    k.includes("ivr-trend-short") ||
+    k.includes("nifty-ivr") ||
+    k.includes("nifty ivr trend") ||
+    k.includes("ivr trend short")
+  ) {
+    return "Nifty IVR Trend Short: NIFTY spot trend score + chain IVR + |δ| 0.29–0.35; roll to next weekly if calendar DTE < 3; lowest gamma among eligible strikes.";
+  }
+  if (k.includes("trendsnap") || k.includes("momentum")) {
+    return "TrendSnap Momentum: rule-based chain scores, indicators, and strike filters.";
+  }
+  return "Eligible strikes (score + filters) appear here when conditions align.";
+}
+
+function strategySignalsEmptyMessage(strategyKey: string | undefined): string {
+  const k = (strategyKey || "").toLowerCase();
+  if (
+    k.includes("ivr-trend-short") ||
+    k.includes("nifty-ivr") ||
+    k.includes("nifty ivr trend") ||
+    k.includes("ivr trend short")
+  ) {
+    return "No eligible short strikes yet (Eligible=Yes). Needs spot regime, leg IVR, δ band, liquidity, and min calendar DTE. Auto-execute opens when score meets threshold.";
+  }
+  if (k.includes("trendpulse") || k.includes("strat-trendpulse")) {
+    return "No eligible strikes (Eligible=Yes). Auto-execute will open trades when score meets threshold.";
+  }
+  return "No eligible recommendations (Eligible=Yes). Auto-execute will open trades when score meets threshold.";
+}
+
 type SignalRecommendation = {
   recommendation_id: string;
   symbol: string;
   strategy_name?: string | null;
+  strategy_id?: string | null;
   rank_value: number;
   confidence_score?: number | null;
   score?: number | null;
@@ -222,10 +259,27 @@ type SignalRecommendation = {
   ema9?: number | null;
   ema21?: number | null;
   rsi?: number | null;
+  /** IV rank proxy for this strike within the same expiry chain (0–100). */
+  ivr?: number | null;
   volume_spike_ratio?: number | null;
   timeframe?: string | null;
   refresh_interval_sec?: number | null;
   created_at?: string;
+  trendpulse?: {
+    tier1?: { cross?: string; htf_bias?: string; adx?: number; opening_block?: boolean };
+    tier2?: {
+      delta?: number;
+      extrinsic_share?: number;
+      extrinsic_min?: number;
+      expiry?: string;
+      delta_band?: number[];
+    };
+    cross?: string;
+    htf_bias?: string;
+  } | null;
+  option_type?: string | null;
+  delta?: number | null;
+  oi?: number | null;
 };
 
 export default function DashboardPage() {
@@ -244,6 +298,20 @@ export default function DashboardPage() {
   const [openSortDir, setOpenSortDir] = useState<"asc" | "desc">("asc");
   const [closedSortCol, setClosedSortCol] = useState<string>("");
   const [closedSortDir, setClosedSortDir] = useState<"asc" | "desc">("asc");
+  /** Server-resolved strategy (subscription + settings); strip must not rely on stale localStorage alone. */
+  const [activeStrategyBanner, setActiveStrategyBanner] = useState<{
+    strategyId: string;
+    strategyVersion: string;
+    displayName: string;
+  } | null>(null);
+
+  const strategyKeyForSignals = useMemo(
+    () =>
+      activeStrategyBanner
+        ? `${activeStrategyBanner.strategyId} ${activeStrategyBanner.displayName}`
+        : setup.strategy.strategyName || (setup.strategy.details as { displayName?: string } | undefined)?.displayName,
+    [activeStrategyBanner, setup.strategy.strategyName, setup.strategy.details]
+  );
 
   const refreshSignalsAndOpen = useCallback(async () => {
     setSignalExecuteError(null);
@@ -315,6 +383,13 @@ export default function DashboardPage() {
             sharedApiConnected?: boolean;
             isAdmin?: boolean;
             kiteStatus?: "connected" | "shared" | "none";
+            platformApiOnline?: boolean;
+            maxTradesDay?: number;
+            activeStrategy?: {
+              strategyId: string;
+              strategyVersion: string;
+              displayName: string;
+            };
           }>("/api/dashboard/engine").catch(() => null),
         ]);
         setSummary(s);
@@ -322,9 +397,15 @@ export default function DashboardPage() {
         setOpenTradesRows(o);
         setClosedTradesRows((c || []).slice(0, 20));
         if (engine) {
+          setActiveStrategyBanner(engine.activeStrategy ?? null);
           const prev = loadTradingSetup();
           const kiteStatus = (engine as { kiteStatus?: string }).kiteStatus;
           const sharedApi = (engine as { sharedApiConnected?: boolean }).sharedApiConnected ?? prev.master.sharedApiConnected;
+          const eng = engine as {
+            platformApiOnline?: boolean;
+            maxTradesDay?: number;
+            activeStrategy?: { strategyId: string; strategyVersion: string; displayName: string };
+          };
           const merged = {
             ...prev,
             master: {
@@ -334,6 +415,17 @@ export default function DashboardPage() {
               brokerConnected: (engine as { brokerConnected?: boolean }).brokerConnected ?? prev.master.brokerConnected,
               sharedApiConnected: sharedApi,
               kiteStatus,
+              platformApiOnline: eng.platformApiOnline ?? prev.master.platformApiOnline,
+              maxTrades: eng.maxTradesDay ?? prev.master.maxTrades,
+            },
+            strategy: {
+              ...prev.strategy,
+              ...(eng.activeStrategy
+                ? {
+                    strategyName: eng.activeStrategy.displayName,
+                    strategyVersion: eng.activeStrategy.strategyVersion,
+                  }
+                : {}),
             },
           };
           setSetup(merged);
@@ -384,7 +476,7 @@ export default function DashboardPage() {
     const trades = closedTradesRows.length
       ? [...closedTradesRows].sort(
           (a, b) =>
-            new Date((a as any).closed_at || 0).getTime() - new Date((b as any).closed_at || 0).getTime()
+            backendInstantMs((a as any).closed_at) - backendInstantMs((b as any).closed_at)
         )
       : [];
     const points: IntradayPoint[] = [];
@@ -446,8 +538,8 @@ export default function DashboardPage() {
         av = Number(a.realized_pnl ?? a.pnl ?? 0);
         bv = Number(b.realized_pnl ?? b.pnl ?? 0);
       } else if (closedSortCol === "opened_at" || closedSortCol === "closed_at") {
-        av = new Date(av ?? 0).getTime();
-        bv = new Date(bv ?? 0).getTime();
+        av = backendInstantMs(String(av ?? ""));
+        bv = backendInstantMs(String(bv ?? ""));
       } else if (closedSortCol === "manual_execute") {
         av = a.manual_execute === false ? 0 : a.manual_execute === true ? 1 : -1;
         bv = b.manual_execute === false ? 0 : b.manual_execute === true ? 1 : -1;
@@ -627,8 +719,15 @@ export default function DashboardPage() {
         <span>
           Platform API: <b>{setup.master.platformApiOnline ? "Online" : "Offline"}</b>
         </span>
-        <span>
-          Strategy: <b>{setup.strategy.strategyName}</b>
+        <span
+          title={
+            activeStrategyBanner
+              ? `${activeStrategyBanner.strategyId} · v${activeStrategyBanner.strategyVersion}`
+              : "Open Settings and save after changing subscription so local cache matches the server."
+          }
+        >
+          Strategy:{" "}
+          <b>{activeStrategyBanner?.displayName ?? setup.strategy.strategyName}</b>
         </span>
         <span className="dash-clock" suppressHydrationWarning>{clock}</span>
       </section>
@@ -681,7 +780,7 @@ export default function DashboardPage() {
           <div className="summary-label">CURRENT STREAK</div>
           <div
             className="summary-value metric-positive"
-            title="Consecutive weeks (IST, Mon start) with at least one closed trade; closed_at treated as UTC in the database"
+            title="Consecutive weeks (IST, Mon start) with at least one closed trade; closed_at stored as UTC-naive, grouped by IST date"
           >
             {tradingWeekStreakLabel}
           </div>
@@ -702,7 +801,12 @@ export default function DashboardPage() {
         </div>
         <div className="table-card panel-accent-signals">
           <div className="dash-signals-head">
-            <div className="panel-title">STRATEGY SIGNALS</div>
+            <div>
+              <div className="panel-title">STRATEGY SIGNALS</div>
+              <div className="dash-signals-sub muted" style={{ fontSize: 11, marginTop: 4 }}>
+                {strategySignalsSubtitle(strategyKeyForSignals)}
+              </div>
+            </div>
             <button className="dash-signal-refresh" title="Auto-refresh enabled" aria-label="Auto refresh enabled">
               ↻
             </button>
@@ -717,7 +821,7 @@ export default function DashboardPage() {
               <div className="dash-signal-empty">Engine not running - click Start Trading</div>
             ) : signals.length === 0 ? (
               <div className="dash-signal-empty">
-                No eligible strikes (Eligible=Yes). Auto-execute will open trades when score meets threshold.
+                {strategySignalsEmptyMessage(strategyKeyForSignals)}
               </div>
             ) : (
               signals.map((s) => {
@@ -768,6 +872,28 @@ export default function DashboardPage() {
                       <span className="dash-signal-key">E21:</span>
                       <span className="dash-signal-val">{s.ema21?.toFixed(2) ?? "—"}</span>
                     </div>
+                    {s.trendpulse?.tier1 ? (
+                      <div className="dash-signal-row">
+                        <span className="dash-signal-key">Tier 1:</span>
+                        <span className="dash-signal-val" title="Index signal">
+                          {s.trendpulse.tier1.cross ?? s.trendpulse.cross ?? "—"} · HTF {s.trendpulse.tier1.htf_bias ?? s.trendpulse.htf_bias ?? "—"}
+                          {s.trendpulse.tier1.adx != null ? ` · ADX ${Number(s.trendpulse.tier1.adx).toFixed(1)}` : ""}
+                        </span>
+                      </div>
+                    ) : null}
+                    {s.trendpulse?.tier2 ? (
+                      <div className="dash-signal-row">
+                        <span className="dash-signal-key">Tier 2:</span>
+                        <span className="dash-signal-val" title="Strike filters">
+                          Δ {s.trendpulse.tier2.delta != null ? s.trendpulse.tier2.delta.toFixed(2) : s.delta != null ? s.delta.toFixed(2) : "—"}
+                          {s.trendpulse.tier2.extrinsic_share != null
+                            ? ` · TV ${(s.trendpulse.tier2.extrinsic_share * 100).toFixed(0)}%`
+                            : ""}
+                          {s.option_type ? ` · ${s.option_type}` : ""}
+                          {s.trendpulse.tier2.expiry ? ` · ${s.trendpulse.tier2.expiry}` : ""}
+                        </span>
+                      </div>
+                    ) : null}
                     <div className="dash-signal-row">
                       <span className="dash-signal-key">Score:</span>
                       <span className="dash-signal-val">{s.score != null ? (s.score_max != null ? `${s.score}/${s.score_max}` : String(s.score)) : "—"}</span>
@@ -785,6 +911,13 @@ export default function DashboardPage() {
                       <span className="dash-signal-val">{s.rsi?.toFixed(2) ?? "—"}</span>
                       <span className="dash-signal-key">VWAP:</span>
                       <span className="dash-signal-val">{s.vwap?.toFixed(2) ?? "—"}</span>
+                      <span className="dash-signal-key">IVR:</span>
+                      <span
+                        className="dash-signal-val"
+                        title="IV rank proxy within this expiry chain (0–100; higher vs other strikes)"
+                      >
+                        {typeof s.ivr === "number" ? s.ivr.toFixed(1) : "—"}
+                      </span>
                     </div>
                     <div className="dash-signal-row-bottom">
                       <span>
@@ -888,9 +1021,9 @@ export default function DashboardPage() {
                 <th className="sortable-th" onClick={() => handleClosedSort("manual_execute")}>TAKEN BY {closedSortCol === "manual_execute" && (closedSortDir === "asc" ? "↑" : "↓")}</th>
                 <th>SCORE</th>
                 <th>CONFIDENCE</th>
-                <th className="sortable-th" onClick={() => handleClosedSort("opened_at")}>BUY TIME {closedSortCol === "opened_at" && (closedSortDir === "asc" ? "↑" : "↓")}</th>
+                <th className="sortable-th" onClick={() => handleClosedSort("opened_at")}>BUY TIME (IST) {closedSortCol === "opened_at" && (closedSortDir === "asc" ? "↑" : "↓")}</th>
                 <th className="sortable-th" onClick={() => handleClosedSort("entry_price")}>ENTRY {closedSortCol === "entry_price" && (closedSortDir === "asc" ? "↑" : "↓")}</th>
-                <th className="sortable-th" onClick={() => handleClosedSort("closed_at")}>SELL TIME {closedSortCol === "closed_at" && (closedSortDir === "asc" ? "↑" : "↓")}</th>
+                <th className="sortable-th" onClick={() => handleClosedSort("closed_at")}>SELL TIME (IST) {closedSortCol === "closed_at" && (closedSortDir === "asc" ? "↑" : "↓")}</th>
                 <th className="sortable-th" onClick={() => handleClosedSort("current_price")}>EXIT {closedSortCol === "current_price" && (closedSortDir === "asc" ? "↑" : "↓")}</th>
                 <th className="sortable-th" onClick={() => handleClosedSort("qty")}>QTY {closedSortCol === "qty" && (closedSortDir === "asc" ? "↑" : "↓")}</th>
                 <th className="sortable-th" onClick={() => handleClosedSort("realized_pnl")}>P&L {closedSortCol === "realized_pnl" && (closedSortDir === "asc" ? "↑" : "↓")}</th>
@@ -901,7 +1034,7 @@ export default function DashboardPage() {
               {sortedClosedTrades.length === 0 ? (
                 <tr>
                   <td colSpan={14} className="empty-state">
-                    No closed trades today
+                    No closed trades today (IST calendar day)
                   </td>
                 </tr>
               ) : (

@@ -89,7 +89,7 @@ def test_chart_series_kite_naive_ist_timestamps():
     """Kite returns naive datetimes in exchange local (IST), not UTC."""
     st: list[dict] = []
     for i in range(55):
-        t = datetime(2026, 3, 23, 9, 15) + timedelta(minutes=5 * i)
+        t = datetime(2026, 3, 24, 9, 15) + timedelta(minutes=5 * i)
         st.append(
             {
                 "time": t.isoformat(),
@@ -100,7 +100,7 @@ def test_chart_series_kite_naive_ist_timestamps():
                 "volume": 1000,
             }
         )
-    now = datetime(2026, 3, 23, 6, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 3, 24, 6, 0, tzinfo=timezone.utc)
     r = build_trendpulse_chart_series(
         st,
         z_window=20,
@@ -108,14 +108,16 @@ def test_chart_series_kite_naive_ist_timestamps():
         tail=120,
         now_utc=now,
     )
-    assert r["displayDate"] == "2026-03-23"
+    assert r["displayDate"] == "2026-03-24"
     assert not r.get("noBarsForDisplayDate")
     assert r["tail_start_index"] == 22
     assert len(r["times"]) == 33
+    # Naive Kite times are IST wall; API must emit UTC ...Z for frontend parseBackendUtcNaive.
+    assert all(isinstance(t, str) and t.endswith("Z") for t in r["times"])
 
 
 def test_chart_series_strict_today_no_stale_previous_session():
-    """Do not plot Mar 20 when current IST day is Mar 23 and feed has no Mar 23 bars."""
+    """Do not plot Mar 20 when current IST day is Mar 24 and feed has no Mar 24 bars."""
     st: list[dict] = []
     for i in range(80):
         t = datetime(2026, 3, 20, 9, 15) + timedelta(minutes=5 * i)
@@ -129,7 +131,7 @@ def test_chart_series_strict_today_no_stale_previous_session():
                 "volume": 1000,
             }
         )
-    now = datetime(2026, 3, 23, 8, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 3, 24, 8, 0, tzinfo=timezone.utc)
     r = build_trendpulse_chart_series(
         st,
         z_window=20,
@@ -138,7 +140,7 @@ def test_chart_series_strict_today_no_stale_previous_session():
         now_utc=now,
     )
     assert r.get("noBarsForDisplayDate") is True
-    assert r["displayDate"] == "2026-03-23"
+    assert r["displayDate"] == "2026-03-24"
     assert len(r["times"]) == 0
     assert r["chartHint"]
 

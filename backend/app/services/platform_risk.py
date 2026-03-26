@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from app.db_client import fetchrow
+from app.services.ist_time_sql import IST_TODAY, closed_at_ist_date_bare
 
 _PLATFORM_CACHE_KEY = "s004:platform:settings"
 
@@ -43,15 +44,13 @@ async def invalidate_platform_settings_cache() -> None:
 async def user_today_realized_pnl_ist(user_id: int) -> float:
     """Sum realized_pnl for trades closed today (IST calendar date)."""
     row = await fetchrow(
-        """
+        f"""
         SELECT COALESCE(SUM(realized_pnl), 0)::float AS pnl
         FROM s004_live_trades
         WHERE user_id = $1
           AND current_state = 'EXIT'
           AND closed_at IS NOT NULL
-          AND (
-            (closed_at AT TIME ZONE 'UTC') AT TIME ZONE 'Asia/Kolkata'
-          )::date = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')::date
+          AND {closed_at_ist_date_bare()} = {IST_TODAY}
         """,
         user_id,
     )

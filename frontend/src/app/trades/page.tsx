@@ -17,6 +17,7 @@ type Recommendation = {
   ema9?: number | null;
   ema21?: number | null;
   rsi?: number | null;
+  ivr?: number | null;
   volume?: number | null;
   avg_volume?: number | null;
   volume_spike_ratio?: number | null;
@@ -260,6 +261,13 @@ export default function TradesPage() {
                 <th className="sortable-th" onClick={() => handleRecSort("ema21")}>E21 {recSortCol === "ema21" && (recSortDir === "asc" ? "↑" : "↓")}</th>
                 <th className="sortable-th" onClick={() => handleRecSort("rsi")}>RSI {recSortCol === "rsi" && (recSortDir === "asc" ? "↑" : "↓")}</th>
                 <th className="sortable-th" onClick={() => handleRecSort("vwap")}>VWAP {recSortCol === "vwap" && (recSortDir === "asc" ? "↑" : "↓")}</th>
+                <th
+                  className="sortable-th"
+                  title="IV rank proxy within this expiry chain (0–100)"
+                  onClick={() => handleRecSort("ivr")}
+                >
+                  IVR {recSortCol === "ivr" && (recSortDir === "asc" ? "↑" : "↓")}
+                </th>
                 <th className="sortable-th" onClick={() => handleRecSort("timeframe")}>TF / Refresh {recSortCol === "timeframe" && (recSortDir === "asc" ? "↑" : "↓")}</th>
                 <th className="sortable-th" onClick={() => handleRecSort("confidence_score")}>Confidence {recSortCol === "confidence_score" && (recSortDir === "asc" ? "↑" : "↓")}</th>
                 <th className="sortable-th" onClick={() => handleRecSort("score")}>Score {recSortCol === "score" && (recSortDir === "asc" ? "↑" : "↓")}</th>
@@ -272,7 +280,7 @@ export default function TradesPage() {
             <tbody>
               {sortedRecs.length === 0 ? (
                 <tr>
-                  <td colSpan={14} className="empty-state">
+                  <td colSpan={15} className="empty-state">
                     No recommendations available.
                   </td>
                 </tr>
@@ -286,6 +294,9 @@ export default function TradesPage() {
                     <td>{row.ema21 != null ? Number(row.ema21).toFixed(2) : "—"}</td>
                     <td>{row.rsi != null ? Number(row.rsi).toFixed(2) : "—"}</td>
                     <td>{row.vwap != null ? Number(row.vwap).toFixed(2) : "—"}</td>
+                    <td title="IV rank proxy within this expiry chain (0–100)">
+                      {row.ivr != null ? Number(row.ivr).toFixed(1) : "—"}
+                    </td>
                     <td className="summary-label">
                       {(row.timeframe || "3m").replace("-", "")} · {row.refresh_interval_sec ?? 30}s
                     </td>

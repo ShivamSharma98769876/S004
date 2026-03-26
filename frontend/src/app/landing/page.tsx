@@ -9,14 +9,20 @@ import TrendPulseChart, {
   type TrendPulseTradeSignal,
 } from "@/components/TrendPulseChart";
 import {
+  CePeFlowArena,
   ConfidenceGauge,
   CumulativeWaterfall,
-  DirectionChip,
   LandingWidgetHelp,
   MiniSparkline,
   RegimeBadge,
 } from "@/components/landing/LandingDashWidgets";
 import StrategyDayFitWidget, { type StrategyDayFitPayload } from "@/components/landing/StrategyDayFitWidget";
+import { type NewsSentimentPayload } from "@/components/landing/NewsSentimentWidget";
+import MarketVerdictWidget, {
+  formatTpInterval,
+  htfTrendBias,
+  sessionTrendBias,
+} from "@/components/landing/MarketVerdictWidget";
 import { apiJson, getAuth } from "@/lib/api_client";
 import { formatTimeIST } from "@/lib/datetime_ist";
 
@@ -52,18 +58,49 @@ type TrendPulsePayload = {
   message: string | null;
 };
 
+type OptionsIntelPayload = {
+  hasChainData?: boolean;
+  ceOiPct?: number | null;
+  peOiPct?: number | null;
+  oiDominant?: string;
+  volDominant?: string;
+  modelOptionTilt?: string;
+  optionFlowScore?: number;
+  flowBlendScore?: number;
+  optionsOnlyScore?: number;
+  bullishWingLabel?: string;
+  headline?: string;
+  dataCaveat?: string;
+  playbookHeadline?: string;
+  playbookDetail?: string;
+  ceStrengthPct?: number;
+  peStrengthPct?: number;
+  suggestion?: string;
+};
+
 type SentimentPayload = {
   sentimentLabel: string;
   directionLabel: "BULLISH" | "BEARISH" | "NEUTRAL" | string;
   directionScore: number;
   confidence: number;
   regime: string;
+  inputs?: {
+    pcr?: number;
+    pcrVol?: number;
+    spotChgPct?: number;
+    ceOi?: number;
+    peOi?: number;
+    ceVol?: number;
+    peVol?: number;
+  };
+  optionsIntel?: OptionsIntelPayload | null;
   drivers: Array<{
     key: string;
     label: string;
     direction: "bullish" | "bearish";
     impact: number;
     value: number;
+    reading?: string;
   }>;
   alerts: string[];
 };
@@ -73,6 +110,7 @@ type DecisionSnapshotPayload = {
   sentiment: SentimentPayload;
   trendpulse: TrendPulsePayload;
   strategyDayFit?: StrategyDayFitPayload;
+  newsSentiment?: NewsSentimentPayload;
   updatedAt: string;
 };
 
@@ -83,6 +121,8 @@ type SentimentHistoryPoint = {
   directionLabel: string;
   sentimentLabel: string;
   regime: string;
+  modelOptionTilt?: string;
+  ceStrengthPct?: number;
 };
 
 type SentimentReplayItem = {
@@ -105,6 +145,7 @@ export default function LandingPage() {
   const [tp, setTp] = useState<TrendPulsePayload | null>(null);
   const [history, setHistory] = useState<SentimentHistoryPayload | null>(null);
   const [strategyFit, setStrategyFit] = useState<StrategyDayFitPayload | null>(null);
+  const [newsSentiment, setNewsSentiment] = useState<NewsSentimentPayload | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
@@ -117,6 +158,7 @@ export default function LandingPage() {
       setSentiment(snapshot.sentiment);
       setTp(snapshot.trendpulse);
       setStrategyFit(snapshot.strategyDayFit ?? null);
+      setNewsSentiment(snapshot.newsSentiment ?? null);
       setHistory(hist);
     } catch (e) {
       setErr(e instanceof Error ? e.message : "Failed to load");
@@ -143,8 +185,19 @@ export default function LandingPage() {
   const latestReplay = history?.replay?.[history.replay.length - 1];
   const waterfallDrivers = (latestReplay?.sentiment?.drivers ?? sentiment?.drivers ?? []).slice(0, 6);
   const trendChart = useMemo(() => {
-    if (trendPoints.length < 2) return { linePath: "", areaPath: "", zeroY: 50, yMin: -100, yMax: 100 };
-    const vals = trendPoints.map((p) => Number(p.directionScore) || 0);
+    const raw = trendPoints.map((p) => Number(p.directionScore) || 0);
+    if (raw.length === 0) {
+      return {
+        linePath: "",
+        areaPath: "",
+        zeroY: 50,
+        yMin: -100,
+        yMax: 100,
+        singlePoint: false,
+      };
+    }
+    // One snapshot → duplicate so the line renders (flat until the next poll adds a second point).
+    const vals = raw.length === 1 ? [raw[0]!, raw[0]!] : raw;
     const loRaw = Math.min(...vals, -10);
     const hiRaw = Math.max(...vals, 10);
     const pad = Math.max(8, (hiRaw - loRaw) * 0.12);
@@ -156,7 +209,14 @@ export default function LandingPage() {
     const line = vals.map((v, i) => `${i === 0 ? "M" : "L"} ${xn(i).toFixed(3)} ${yn(v).toFixed(3)}`).join(" ");
     const area = `${line} L 100 100 L 0 100 Z`;
     const zeroY = yn(0);
-    return { linePath: line, areaPath: area, zeroY, yMin: lo, yMax: hi };
+    return {
+      linePath: line,
+      areaPath: area,
+      zeroY,
+      yMin: lo,
+      yMax: hi,
+      singlePoint: raw.length === 1,
+    };
   }, [trendPoints]);
   const trendStart = trendPoints[0]?.timestamp;
   const trendEnd = trendPoints[trendPoints.length - 1]?.timestamp;
@@ -167,8 +227,18 @@ export default function LandingPage() {
     if (raw.length === 1) return [raw[0]!, raw[0]!];
     return raw;
   }, [trendPoints]);
-  const htfClass =
-    tp?.htfBias === "bullish" ? "landing-htf-chip--bull" : tp?.htfBias === "bearish" ? "landing-htf-chip--bear" : "landing-htf-chip--flat";
+  const pcrDisplay =
+    snap?.pcr != null
+      ? snap.pcr
+      : typeof sentiment?.inputs?.pcr === "number" && Number.isFinite(sentiment.inputs.pcr)
+        ? sentiment.inputs.pcr
+        : null;
+
+  const optIntel = sentiment?.optionsIntel;
+  const replayOptIntel = latestReplay?.sentiment?.optionsIntel;
+
+  const heroSessionBias = loading && !snap ? null : sessionTrendBias(snap?.intradayTrendLabel);
+  const heroHtfBias = tp?.trendpulseEnabled ? htfTrendBias(tp.htfBias) : null;
   const trendGradId = `landingTrendFill-${useId().replace(/:/g, "")}`;
   const tpSessionNote =
     tp?.series?.displayDate != null && tp?.series?.displayDate !== ""
@@ -176,7 +246,7 @@ export default function LandingPage() {
       : null;
 
   return (
-    <AppFrame title="Home" subtitle="Live context, sentiment, and TrendPulse — one screen.">
+    <AppFrame>
       {err && (
         <div className="panel-accent-chain" style={{ padding: "0.75rem 1rem", marginBottom: "1rem", borderRadius: 8 }}>
           {err}
@@ -205,16 +275,28 @@ export default function LandingPage() {
 
           <div className="landing-hero-cell landing-hero-flow landing-widget-help-host">
             <LandingWidgetHelp
-              meaning="Options sentiment label, direction score (bullish/bearish strength), and PCR."
-              usage="Treat as directional bias, not a trade signal by itself. Align option leg choice (CE vs PE) with the stronger side when your plan allows."
+              meaning="Put/call ratio (PCR) from the live option chain when your broker is connected. Detail and direction score are in Market pulse below."
+              usage="PCR above ~1 means more put OI/volume than calls (often read as cautious); below ~1 the opposite. Not a trade signal by itself."
             />
             <span className="landing-hero-eyebrow">Option flow</span>
-            <div className="landing-hero-flow-inline">
-              <p className={`landing-hero-sent-label ${dirClass}`}>
-                {loading && !sentiment ? "…" : sentiment?.sentimentLabel ?? snap?.sentimentLabel ?? "—"}
-              </p>
-              <DirectionChip label={String(sentiment?.directionLabel ?? "NEUTRAL")} score={Number(sentiment?.directionScore ?? 0)} />
-              <span className="landing-hero-pcr landing-hero-pcr--inline">PCR {snap?.pcr != null ? snap.pcr.toFixed(2) : "—"}</span>
+            <div className="landing-hero-flow-inline landing-hero-flow-inline--pcr">
+              <span
+                className="landing-hero-pcr landing-hero-pcr--hero"
+                title={
+                  pcrDisplay != null
+                    ? "Put/call ratio from chain"
+                    : "Connect broker / ensure option chain is available for live PCR"
+                }
+              >
+                <span className="landing-hero-pcr-k">PCR</span>
+                <span className="landing-hero-pcr-v">
+                  {loading && !snap && !sentiment
+                    ? "…"
+                    : pcrDisplay != null
+                      ? pcrDisplay.toFixed(2)
+                      : "n/a"}
+                </span>
+              </span>
             </div>
           </div>
 
@@ -222,30 +304,59 @@ export default function LandingPage() {
 
           <div className="landing-hero-cell landing-hero-trend landing-widget-help-host">
             <LandingWidgetHelp
-              meaning="Intraday trend label plus higher-timeframe (HTF) TrendPulse bias."
-              usage="Prefer trades that align with HTF bias; counter-trend entries need stricter risk checks in your settings."
+              meaning="Session = today’s NIFTY % move as Bullish/Bearish/Sideways. HTF shows TrendPulse higher-timeframe bias and its chart interval. Signal = TrendPulse chart timeframe (see Market pulse)."
+              usage="Prefer trades that align with HTF bias when TrendPulse is on; counter-trend entries need stricter risk checks in your settings."
             />
             <span className="landing-hero-eyebrow">Trend</span>
-            <div className="landing-hero-trend-row">
-              <span className="landing-intraday-pill">
-                {loading && !snap ? "…" : snap?.intradayTrendLabel ?? "—"}
-              </span>
-              {tp?.trendpulseEnabled ? (
-                <span className={`landing-htf-chip ${htfClass}`}>
-                  HTF {(tp.htfInterval ?? "15minute").replace("minute", "m")} · {tp.htfBias ?? "—"}
+            <div className="landing-hero-trend-stack">
+              <div className="landing-hero-tf-row">
+                <div className="landing-hero-tf-meta">
+                  <span className="landing-hero-tf-name">Session</span>
+                  <span className="landing-hero-tf-sub muted">NIFTY day %</span>
+                </div>
+                <span
+                  className={
+                    heroSessionBias == null
+                      ? "landing-hero-tf-bias landing-hero-tf-bias--loading muted"
+                      : `landing-hero-tf-bias landing-hero-tf-bias--${heroSessionBias.toLowerCase()}`
+                  }
+                >
+                  {heroSessionBias ?? "…"}
                 </span>
-              ) : (
-                <span className="landing-htf-chip landing-htf-chip--muted">TPZ below</span>
-              )}
+              </div>
+              {tp?.trendpulseEnabled && heroHtfBias ? (
+                <div className="landing-hero-tf-row">
+                  <div className="landing-hero-tf-meta">
+                    <span className="landing-hero-tf-name">HTF {formatTpInterval(tp.htfInterval)}</span>
+                    <span className="landing-hero-tf-sub muted">TrendPulse</span>
+                  </div>
+                  <span className={`landing-hero-tf-bias landing-hero-tf-bias--${heroHtfBias.toLowerCase()}`}>
+                    {heroHtfBias}
+                  </span>
+                </div>
+              ) : null}
+              {tp?.trendpulseEnabled ? (
+                <p className="landing-hero-tf-signal muted">
+                  Signal <strong>{formatTpInterval(tp.stInterval)}</strong>
+                </p>
+              ) : null}
             </div>
           </div>
         </section>
+
+        <MarketVerdictWidget
+          loading={loading}
+          sentiment={sentiment}
+          snap={snap}
+          tp={tp}
+          news={newsSentiment}
+        />
 
         <section className="landing-bento" aria-label="Sentiment analytics">
           <div className="landing-bento-conviction landing-bento-cell panel-accent-signals landing-widget-help-host">
             <LandingWidgetHelp
               meaning="Confidence in the current bias plus market regime (e.g. trending vs choppy)."
-              usage="Higher confidence in a trending regime usually supports cleaner directional follow-through; low confidence or chop suggests smaller size or waiting. Score path and alerts below are part of this picture."
+              usage="CE vs PE block uses the same inputs as Drivers (PCR, OI, volume, momentum). Flow tilt CE means the chain skews toward call-side participation in this model; PE the opposite. Higher confidence in a trending regime usually supports cleaner follow-through; low confidence or chop suggests smaller size or waiting."
             />
             <header className="landing-bento-head">
               <span className="landing-bento-title">Conviction</span>
@@ -267,8 +378,60 @@ export default function LandingPage() {
               </div>
               <div className="landing-kpi-tile">
                 <span className="landing-kpi-k">PCR</span>
-                <span className="landing-kpi-v">{snap?.pcr != null ? snap.pcr.toFixed(2) : "—"}</span>
+                <span className="landing-kpi-v">
+                  {loading && !sentiment && pcrDisplay == null
+                    ? "—"
+                    : pcrDisplay != null
+                      ? pcrDisplay.toFixed(2)
+                      : "—"}
+                </span>
               </div>
+            </div>
+            <div className="landing-options-intel" role="region" aria-label="CE versus PE option positioning">
+              <CePeFlowArena
+                variant="full"
+                loading={loading && !sentiment}
+                cePct={optIntel?.ceStrengthPct ?? 50}
+                pePct={optIntel?.peStrengthPct ?? 50}
+                wingLabel={optIntel?.bullishWingLabel ?? "CE / PE balanced"}
+                tilt={optIntel?.modelOptionTilt ?? "NEUTRAL"}
+                playbookHeadline={optIntel?.playbookHeadline ?? "Playbook loads with snapshot."}
+              />
+              <div className="landing-options-intel-chips">
+                {optIntel?.oiDominant && optIntel.oiDominant !== "EVEN" ? (
+                  <span className={`landing-opt-chip landing-opt-chip--dom landing-opt-chip--${optIntel.oiDominant.toLowerCase()}`}>
+                    OI lead: {optIntel.oiDominant}
+                  </span>
+                ) : null}
+                {optIntel?.volDominant && optIntel.volDominant !== "EVEN" ? (
+                  <span className={`landing-opt-chip landing-opt-chip--dom landing-opt-chip--${optIntel.volDominant.toLowerCase()}`}>
+                    Vol lead: {optIntel.volDominant}
+                  </span>
+                ) : null}
+                {typeof optIntel?.flowBlendScore === "number" ? (
+                  <span className="landing-opt-chip landing-opt-chip--meta" title="Blended options + index direction (-1 PE … +1 CE)">
+                    Blend {optIntel.flowBlendScore >= 0 ? "+" : ""}
+                    {optIntel.flowBlendScore.toFixed(2)}
+                  </span>
+                ) : null}
+              </div>
+              {optIntel?.ceOiPct != null && optIntel?.peOiPct != null ? (
+                <p className="landing-options-intel-split muted">
+                  Chain OI share · CE {optIntel.ceOiPct.toFixed(0)}% · PE {optIntel.peOiPct.toFixed(0)}%
+                </p>
+              ) : null}
+              <p className="landing-options-intel-headline">
+                {loading && !sentiment ? "…" : optIntel?.headline ?? "Option skew loads with the live chain."}
+              </p>
+              {optIntel?.playbookDetail ? (
+                <p className="landing-options-intel-playbook-detail">{optIntel.playbookDetail}</p>
+              ) : null}
+              {optIntel?.dataCaveat ? (
+                <p className="landing-options-intel-caveat muted">{optIntel.dataCaveat}</p>
+              ) : null}
+              <p className="landing-options-intel-suggest muted">
+                {loading && !sentiment ? "" : optIntel?.suggestion ?? ""}
+              </p>
             </div>
             <div className="landing-bento-spark-block">
               <div className="landing-bento-spark-head">
@@ -295,29 +458,48 @@ export default function LandingPage() {
 
           <div className="landing-bento-replay landing-bento-cell panel-accent-chain landing-widget-help-host">
             <LandingWidgetHelp
-              meaning="History of the direction score; the dashed line is neutral (0)."
-              usage="Judge persistence: a steady drift above or below zero is more meaningful than one spike. Needs a few Home refreshes (polls) before the line appears."
+              meaning="History of the option-flow direction score; dashed line is neutral (0)."
+              usage="Each time Home loads (or auto-refreshes every 60s), the server saves one point. You see a flat line after the first point; the path moves once there are two or more snapshots. With Redis configured, history survives server restarts."
             />
             <header className="landing-bento-head">
               <div>
                 <span className="landing-bento-title">Sentiment replay</span>
-                <p className="landing-bento-sub">Direction score over time (zero line = neutral)</p>
+                <p className="landing-bento-sub">
+                  Direction score over time (zero line = neutral). Dots below show how CE vs PE tilt evolved on each saved
+                  snapshot (last 16 points).
+                </p>
               </div>
-              {trendPoints.length >= 2 ? (
+              {trendPoints.length === 0 ? (
+                <span className="landing-pill-stat landing-pill-stat--dim">No history yet</span>
+              ) : trendChart.singlePoint ? (
+                <span className="landing-pill-stat landing-pill-stat--dim" title="Wait for next refresh or revisit Home">
+                  n=1 · next poll draws slope
+                </span>
+              ) : (
                 <span className="landing-pill-stat">
                   n={trendPoints.length} · [{Math.round(trendChart.yMin)}, {Math.round(trendChart.yMax)}]
                 </span>
-              ) : (
-                <span className="landing-pill-stat landing-pill-stat--dim">Need 2+ polls</span>
               )}
             </header>
-            {trendPoints.length < 2 ? (
+            {trendPoints.length === 0 ? (
               <div className="landing-replay-empty landing-replay-empty--short">
                 <MiniSparkline values={[]} />
-                <p className="muted landing-replay-empty-text">Stay on Home or revisit — each load adds a snapshot.</p>
+                <p className="muted landing-replay-empty-text">
+                  Open Home once the backend is up — the first snapshot is stored when this page loads successfully.
+                </p>
               </div>
             ) : (
               <div className="landing-trend-widget landing-trend-widget--bento">
+                {trendChart.singlePoint ? (
+                  <p className="landing-replay-single-hint muted" role="status">
+                    Current direction score:{" "}
+                    <strong className="landing-replay-single-val">
+                      {(Number(trendPoints[0]?.directionScore) || 0).toFixed(1)}
+                    </strong>
+                    {" — "}
+                    flat line until a second snapshot arrives (stay on this page ~60s or refresh).
+                  </p>
+                ) : null}
                 <svg
                   className="landing-trend-svg landing-trend-svg--bento"
                   viewBox="0 0 100 100"
@@ -350,6 +532,28 @@ export default function LandingPage() {
                   </span>
                   <span title="Newest snapshot">{trendEndLabel}</span>
                 </div>
+                {replayOptIntel?.headline ? (
+                  <p className="landing-replay-opt-foot muted" role="note">
+                    Latest snapshot option read: <strong>{replayOptIntel.headline}</strong>
+                  </p>
+                ) : null}
+                {trendPoints.length >= 2 ? (
+                  <div className="landing-replay-cepe-strip" role="img" aria-label="Flow tilt over recent snapshots">
+                    <span className="landing-replay-cepe-strip-label muted">Flow tilt trail</span>
+                    <div className="landing-replay-cepe-dots">
+                      {trendPoints.slice(-16).map((p, i) => {
+                        const t = (p.modelOptionTilt ?? "NEUTRAL").toLowerCase();
+                        return (
+                          <span
+                            key={`${p.timestamp}-${i}`}
+                            className={`landing-replay-cepe-dot landing-replay-cepe-dot--${t}`}
+                            title={`${formatTimeIST(p.timestamp, { fallback: "—" })} · ${p.modelOptionTilt ?? "NEUTRAL"}${p.ceStrengthPct != null ? ` · CE ${p.ceStrengthPct}%` : ""}`}
+                          />
+                        );
+                      })}
+                    </div>
+                  </div>
+                ) : null}
               </div>
             )}
           </div>
@@ -357,12 +561,20 @@ export default function LandingPage() {
           <div className="landing-bento-drivers landing-bento-cell panel-accent-chain landing-widget-help-host">
             <LandingWidgetHelp
               meaning="Breakdown of what pushed the direction score (spot, PCR, momentum, etc.)."
-              usage="Several drivers pointing the same way is stronger than one dominant driver. If one item explains almost everything, the read can flip quickly when that input changes."
+              usage="The number on the right is each driver’s weighted impact on the direction score, not raw PCR. PCR ≈ 1.0 and balanced OI produce ~0 impact even when data is present. The smaller line under each name shows the live reading (ratios, OI counts). Several drivers aligned is stronger than one dominant driver."
             />
             <header className="landing-bento-head">
               <div>
                 <span className="landing-bento-title">Drivers</span>
-                <p className="landing-bento-sub">Who moved the score · bridge + bars</p>
+                <p className="landing-bento-sub">
+                  Who moved the score · bridge + bars
+                  {optIntel?.modelOptionTilt && optIntel.modelOptionTilt !== "NEUTRAL" ? (
+                    <>
+                      {" "}
+                      · model flow tilt <strong className="landing-drivers-tilt">{optIntel.modelOptionTilt}</strong>
+                    </>
+                  ) : null}
+                </p>
               </div>
               {latestReplay?.timestamp && (
                 <time className="landing-waterfall-time" dateTime={latestReplay.timestamp}>
@@ -370,6 +582,15 @@ export default function LandingPage() {
                 </time>
               )}
             </header>
+            <CePeFlowArena
+              variant="compact"
+              loading={loading && !sentiment}
+              cePct={optIntel?.ceStrengthPct ?? 50}
+              pePct={optIntel?.peStrengthPct ?? 50}
+              wingLabel={optIntel?.bullishWingLabel ?? "CE / PE balanced"}
+              tilt={optIntel?.modelOptionTilt ?? "NEUTRAL"}
+              playbookHeadline={optIntel?.playbookHeadline ?? ""}
+            />
             <CumulativeWaterfall
               dense
               drivers={waterfallDrivers.map((d) => ({
@@ -377,6 +598,7 @@ export default function LandingPage() {
                 label: d.label,
                 impact: d.impact,
                 direction: d.direction,
+                reading: d.reading,
               }))}
             />
           </div>

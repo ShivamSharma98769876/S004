@@ -251,6 +251,8 @@ def _indicator_pack_from_series_bearish(
     rsi_min: float = 50,
     rsi_max: float = 75,
     volume_min_ratio: float = 1.5,
+    *,
+    include_volume_in_score: bool = True,
 ) -> dict[str, Any]:
     """Bearish mirror of _indicator_pack_from_series: price below VWAP, EMA9 < EMA21, RSI in lower band."""
     if not ltps:
@@ -300,8 +302,16 @@ def _indicator_pack_from_series_bearish(
     primary_ok = close_now < vwap
     ema_ok = ema9 < ema21
     rsi_ok = rsi_bear_lo <= rsi <= rsi_bear_hi
-    volume_ok = vol_ratio > volume_min_ratio
-    score = (1 if primary_ok else 0) + (1 if ema_ok else 0) + (1 if ema_crossover else 0) + (1 if rsi_ok else 0) + (1 if volume_ok else 0)
+    raw_vol_ok = vol_ratio > volume_min_ratio
+    volume_ok = raw_vol_ok if include_volume_in_score else True
+    vol_pts = (1 if raw_vol_ok else 0) if include_volume_in_score else 0
+    score = (
+        (1 if primary_ok else 0)
+        + (1 if ema_ok else 0)
+        + (1 if ema_crossover else 0)
+        + (1 if rsi_ok else 0)
+        + vol_pts
+    )
     return {
         "ema9": round(ema9, 2),
         "ema21": round(ema21, 2),
@@ -317,6 +327,78 @@ def _indicator_pack_from_series_bearish(
         "volumeOk": volume_ok,
         "signalEligible": primary_ok and score >= score_threshold,
     }
+
+
+def _max_candles_since_cross_int(raw: Any, default: int = 5) -> int:
+    if raw is None:
+        return max(1, default)
+    try:
+        return max(1, int(raw))
+    except (TypeError, ValueError):
+        return max(1, default)
+
+
+def _strike_leg_regime_sell_pe(
+    ltps: list[float],
+    vols: list[float],
+    max_cross_i: int,
+) -> tuple[bool, int | None]:
+    """Sell PE: fresh EMA9 cross above EMA21 on this leg LTP series; last LTP < leg VWAP."""
+    if len(ltps) < 22:
+        return False, None
+    n = min(len(ltps), len(vols))
+    t = ltps[-n:]
+    v = vols[-n:]
+    v_sum = sum(max(0.0, x) for x in v)
+    vwap = sum(p * max(0.0, vol) for p, vol in zip(t, v)) / v_sum if v_sum > 0 else statistics.mean(t)
+    if not (t[-1] < vwap):
+        return False, None
+    bb = _bars_since_bullish_cross(t, 9, 21)
+    if bb is None or bb > max_cross_i:
+        return False, bb
+    return True, bb
+
+
+def _strike_leg_regime_sell_ce(
+    ltps: list[float],
+    vols: list[float],
+    max_cross_i: int,
+) -> tuple[bool, int | None]:
+    """Sell CE: fresh EMA9 cross below EMA21 on this leg LTP series; last LTP < leg VWAP."""
+    if len(ltps) < 22:
+        return False, None
+    n = min(len(ltps), len(vols))
+    t = ltps[-n:]
+    v = vols[-n:]
+    v_sum = sum(max(0.0, x) for x in v)
+    vwap = sum(p * max(0.0, vol) for p, vol in zip(t, v)) / v_sum if v_sum > 0 else statistics.mean(t)
+    if not (t[-1] < vwap):
+        return False, None
+    bb = _bars_since_bearish_cross(t, 9, 21)
+    if bb is None or bb > max_cross_i:
+        return False, bb
+    return True, bb
+
+
+def _resolve_regime_sell_pe_ce_at_strike(
+    put_ltps: list[float],
+    put_vols: list[float],
+    call_ltps: list[float],
+    call_vols: list[float],
+    max_cross_i: int,
+) -> tuple[bool, bool]:
+    """(regimeSellPe, regimeSellCe). If both qualify, keep the side whose cross is more recent (smaller bars-since)."""
+    pe_ok, pb = _strike_leg_regime_sell_pe(put_ltps, put_vols, max_cross_i)
+    ce_ok, cb = _strike_leg_regime_sell_ce(call_ltps, call_vols, max_cross_i)
+    if pe_ok and ce_ok:
+        if pb is not None and cb is not None:
+            if pb < cb:
+                return True, False
+            if cb < pb:
+                return False, True
+            return False, False
+        return False, False
+    return pe_ok, ce_ok
 
 
 def _spot_trend_payload_from_candles(
@@ -336,12 +418,26 @@ def _spot_trend_payload_from_candles(
     if len(closes) < 5:
         return {"spotBullishScore": 0, "spotBearishScore": 0, "spotRegime": None}
     ip = indicator_params or {}
+    mode = str(ip.get("spotRegimeMode") or ip.get("spot_regime_mode") or "").strip().lower()
+    if mode == "ema_cross_vwap":
+        # Regime is computed per strike on option LTP series in _build_live_chain, not on spot.
+        return {"spotBullishScore": 0, "spotBearishScore": 0, "spotRegime": None}
     max_cross = ip.get("max_candles_since_cross")
     rsi_min = float(ip.get("rsi_min", 50))
     rsi_max = float(ip.get("rsi_max", 75))
     vol_min = float(ip.get("volume_min_ratio", 1.5))
+    inc_cross = bool(ip.get("include_ema_crossover_in_score", True))
+    strict_bull = bool(ip.get("strict_bullish_comparisons", False))
     bull = _indicator_pack_from_series(
-        closes, vols, score_threshold, max_cross, rsi_min, rsi_max, vol_min
+        closes,
+        vols,
+        score_threshold,
+        max_cross,
+        rsi_min,
+        rsi_max,
+        vol_min,
+        include_ema_crossover_in_score=inc_cross,
+        strict_bullish_comparisons=strict_bull,
     )
     bear = _indicator_pack_from_series_bearish(
         closes, vols, score_threshold, max_cross, rsi_min, rsi_max, vol_min
@@ -366,6 +462,10 @@ def _indicator_pack_from_series(
     rsi_min: float = 50,
     rsi_max: float = 75,
     volume_min_ratio: float = 1.5,
+    *,
+    include_ema_crossover_in_score: bool = True,
+    strict_bullish_comparisons: bool = False,
+    include_volume_in_score: bool = True,
 ) -> dict[str, Any]:
     if not ltps:
         return {
@@ -407,11 +507,24 @@ def _indicator_pack_from_series(
         vwap = statistics.mean(ltps)
     avg_vol = statistics.mean(vols[:-1]) if len(vols) > 1 else max(1.0, vol_now)
     vol_ratio = (vol_now / avg_vol) if avg_vol > 0 else 0.0
-    primary_ok = close_now >= vwap
-    ema_ok = ema9 >= ema21
+    if strict_bullish_comparisons:
+        primary_ok = close_now > vwap
+        ema_ok = ema9 > ema21
+    else:
+        primary_ok = close_now >= vwap
+        ema_ok = ema9 >= ema21
     rsi_ok = rsi_min <= rsi <= rsi_max
-    volume_ok = vol_ratio > volume_min_ratio
-    score = (1 if primary_ok else 0) + (1 if ema_ok else 0) + (1 if ema_crossover else 0) + (1 if rsi_ok else 0) + (1 if volume_ok else 0)
+    raw_vol_ok = vol_ratio > volume_min_ratio
+    volume_ok = raw_vol_ok if include_volume_in_score else True
+    cross_pts = (1 if ema_crossover else 0) if include_ema_crossover_in_score else 0
+    vol_pts = (1 if raw_vol_ok else 0) if include_volume_in_score else 0
+    score = (
+        (1 if primary_ok else 0)
+        + (1 if ema_ok else 0)
+        + cross_pts
+        + (1 if rsi_ok else 0)
+        + vol_pts
+    )
     return {
         "ema9": round(ema9, 2),
         "ema21": round(ema21, 2),
@@ -438,6 +551,10 @@ def _indicator_pack_from_quote_fallback(
     rsi_min: float = 50,
     rsi_max: float = 75,
     volume_min_ratio: float = 1.5,
+    *,
+    include_ema_crossover_in_score: bool = True,
+    strict_bullish_comparisons: bool = False,
+    include_volume_in_score: bool = True,
 ) -> dict[str, Any]:
     ohlc = quote.get("ohlc") or {}
     o = float(ohlc.get("open") or last_price or 0.0)
@@ -449,8 +566,50 @@ def _indicator_pack_from_quote_fallback(
     ltps = [x for x in [o, l, h, c, lp] if x > 0]
     vols = [base_vol * 0.7, base_vol * 0.8, base_vol * 0.9, base_vol * 0.95, base_vol]
     return _indicator_pack_from_series(
-        ltps, vols[: len(ltps)], score_threshold, max_candles_since_cross,
-        rsi_min, rsi_max, volume_min_ratio,
+        ltps,
+        vols[: len(ltps)],
+        score_threshold,
+        max_candles_since_cross,
+        rsi_min,
+        rsi_max,
+        volume_min_ratio,
+        include_ema_crossover_in_score=include_ema_crossover_in_score,
+        strict_bullish_comparisons=strict_bullish_comparisons,
+        include_volume_in_score=include_volume_in_score,
+    )
+
+
+def _indicator_pack_from_quote_fallback_bearish(
+    quote: dict[str, Any],
+    last_price: float,
+    last_vol: float,
+    score_threshold: int = 3,
+    max_candles_since_cross: int | None = None,
+    rsi_min: float = 50,
+    rsi_max: float = 75,
+    volume_min_ratio: float = 1.5,
+    *,
+    include_volume_in_score: bool = True,
+) -> dict[str, Any]:
+    """Same synthetic OHLC path as bullish fallback, but bearish pack (premium weakness on option LTP)."""
+    ohlc = quote.get("ohlc") or {}
+    o = float(ohlc.get("open") or last_price or 0.0)
+    h = float(ohlc.get("high") or o or last_price or 0.0)
+    l = float(ohlc.get("low") or o or last_price or 0.0)
+    c = float(ohlc.get("close") or o or last_price or 0.0)
+    lp = float(last_price or c or o or 0.0)
+    base_vol = max(1.0, float(last_vol or 0.0))
+    ltps = [x for x in [o, l, h, c, lp] if x > 0]
+    vols = [base_vol * 0.7, base_vol * 0.8, base_vol * 0.9, base_vol * 0.95, base_vol]
+    return _indicator_pack_from_series_bearish(
+        ltps,
+        vols[: len(ltps)],
+        score_threshold,
+        max_candles_since_cross,
+        rsi_min,
+        rsi_max,
+        volume_min_ratio,
+        include_volume_in_score=include_volume_in_score,
     )
 
 
@@ -473,6 +632,7 @@ def _next_weekday_dates(weekday: int, count: int) -> list[date]:
 
 
 def get_expiries_for_instrument(instrument: str) -> list[str]:
+    """Fallback only: next few weekly-ish dates (may not match real NFO expiries). Prefer ``get_expiries_for_analytics``."""
     key = instrument.strip().upper()
     weekday_map = {
         "NIFTY": 1,  # Tuesday
@@ -482,6 +642,133 @@ def get_expiries_for_instrument(instrument: str) -> list[str]:
     }
     wd = weekday_map.get(key, 1)
     return [_format_expiry(x) for x in _next_weekday_dates(wd, 6)]
+
+
+def verify_kite_session_sync(kite: KiteConnect | None) -> bool:
+    """True if access token is valid (lightweight profile call)."""
+    if kite is None:
+        return False
+    try:
+        kite.profile()
+        return True
+    except Exception:
+        return False
+
+
+def list_expiries_from_nfo_sync(kite: KiteConnect, instrument: str, max_expiries: int = 16) -> list[str]:
+    """
+    Distinct option expiries from Zerodha NFO for this underlying name.
+    NIFTY / BANKNIFTY / FINNIFTY only (Sensex FNO is typically BFO — not covered by current chain builder).
+    """
+    inst = instrument.strip().upper()
+    if inst not in {"NIFTY", "BANKNIFTY", "FINNIFTY"}:
+        return []
+    rows = _load_option_instruments(kite, inst)
+    today = date.today()
+    seen: set[date] = set()
+    for row in rows:
+        exp = _expiry_as_date(row.get("expiry"))
+        if exp is None or exp < today:
+            continue
+        seen.add(exp)
+    out_dates = sorted(seen)[: max(1, int(max_expiries))]
+    return [_format_expiry(d) for d in out_dates]
+
+
+def get_expiries_for_analytics(kite: KiteConnect | None, instrument: str) -> tuple[list[str], str]:
+    """
+    Prefer broker-listed NFO expiries; fallback to estimated weeklies.
+    Returns (expiries_ddmmmyyyy, source) where source is ``zerodha_nfo`` or ``estimated_weeklies``.
+    """
+    inst = instrument.strip().upper()
+    if kite is not None and inst in ("NIFTY", "BANKNIFTY", "FINNIFTY"):
+        try:
+            broker_list = list_expiries_from_nfo_sync(kite, inst)
+            if broker_list:
+                return broker_list, "zerodha_nfo"
+        except Exception:
+            pass
+    return get_expiries_for_instrument(inst), "estimated_weeklies"
+
+
+def pick_primary_expiry_str(kite: KiteConnect | None, instrument: str = "NIFTY") -> str | None:
+    """Nearest future NFO expiry when Kite is available; else estimated weekly list."""
+    inst = instrument.strip().upper()
+    expiries, _ = get_expiries_for_analytics(kite, inst)
+    return expiries[0] if expiries else None
+
+
+def _calendar_today_ist() -> date:
+    """IST calendar date for NSE DTE math (avoids UTC server date skew vs exchange)."""
+    return datetime.now(_NSE_IST).date()
+
+
+def select_expiry_min_dte_and_weekday(
+    expiries: list[str],
+    today: date,
+    *,
+    min_dte_days: int,
+    weekday: int | None,
+) -> str | None:
+    """
+    Among broker-listed expiries, pick the **earliest** date that satisfies:
+    - calendar DTE >= min_dte_days (IST ``today`` vs expiry date), and
+    - if ``weekday`` is not None, expiry **date** must be that Python weekday (Mon=0..Sun=6).
+
+    Returns None if nothing qualifies (no silent fallback to nearer weekly).
+    """
+    need = max(0, int(min_dte_days))
+    qualified: list[tuple[date, str]] = []
+    for exp_str in expiries:
+        try:
+            d = datetime.strptime(exp_str.strip().upper(), "%d%b%Y").date()
+        except ValueError:
+            continue
+        if (d - today).days >= need:
+            qualified.append((d, exp_str))
+    if not qualified:
+        return None
+    qualified.sort(key=lambda x: x[0])
+    if weekday is None:
+        return qualified[0][1]
+    for d, exp_str in qualified:
+        if d.weekday() == weekday:
+            return exp_str
+    return None
+
+
+def first_expiry_meeting_min_calendar_dte(
+    expiries: list[str],
+    today: date,
+    *,
+    min_dte_days: int,
+) -> str | None:
+    """Backward-compatible: earliest expiry meeting min DTE only (no weekday filter)."""
+    return select_expiry_min_dte_and_weekday(
+        expiries, today, min_dte_days=min_dte_days, weekday=None
+    )
+
+
+def pick_expiry_with_min_calendar_dte(
+    kite: KiteConnect | None,
+    instrument: str = "NIFTY",
+    *,
+    min_dte_days: int = 2,
+    weekday: int | None = 1,
+) -> str | None:
+    """
+    Listed weekly expiry: calendar DTE (IST) >= min_dte_days, optionally matching NIFTY weekly expiry weekday.
+    ``weekday`` None = ignore weekday (earliest qualifying). Default weekday 1 = Tuesday (typical NIFTY weekly).
+    Returns None when no expiry qualifies.
+    """
+    inst = instrument.strip().upper()
+    expiries, _ = get_expiries_for_analytics(kite, inst)
+    if not expiries:
+        return None
+    today = _calendar_today_ist()
+    return select_expiry_min_dte_and_weekday(
+        expiries, today, min_dte_days=min_dte_days, weekday=weekday
+    )
 
 
 def _ltp_change_pct(last_price: float, prev_close: float) -> float:
@@ -834,7 +1121,10 @@ def _build_live_chain(
             symbol_to_key[symbol] = (strike, opt_type)
 
     if not quote_symbols:
-        raise ValueError(f"No option instruments found for {instrument} {expiry_date.isoformat()}.")
+        raise ValueError(
+            f"No NFO option contracts for {instrument} on expiry {expiry_date.isoformat()} "
+            f"in the selected strike window. Choose an expiry from the dropdown (Zerodha-listed dates)."
+        )
 
     quote_data: dict[str, Any] = {}
     for chunk_symbols in _chunk(quote_symbols, 200):
@@ -849,6 +1139,9 @@ def _build_live_chain(
     history_snapshots = list(previous) if previous else []
     current_snapshot: dict[int, dict[str, float]] = {}
     chain: list[dict[str, Any]] = []
+    ip_global = indicator_params or {}
+    short_premium_legs = str(ip_global.get("positionIntent", "")).lower() == "short_premium"
+    reg_srm = str(ip_global.get("spotRegimeMode") or ip_global.get("spot_regime_mode") or "").strip().lower()
 
     for strike in strikes:
         call_q = quote_data.get(f"NFO:{by_key[(strike, 'CE')]['tradingsymbol']}") if (strike, "CE") in by_key else {}
@@ -889,28 +1182,136 @@ def _build_live_chain(
         put_ltp_series.append(max(0.0, put_ltp))
         call_vol_series.append(max(0.0, call_vol))
         put_vol_series.append(max(0.0, put_vol))
-        ip = indicator_params or {}
+        ip = ip_global
         max_cross = ip.get("max_candles_since_cross")
         rsi_min = float(ip.get("rsi_min", 50))
         rsi_max = float(ip.get("rsi_max", 75))
         vol_min = float(ip.get("volume_min_ratio", 1.5))
-        call_ind = _indicator_pack_from_series(
-            call_ltp_series, call_vol_series, score_threshold, max_cross,
-            rsi_min, rsi_max, vol_min,
-        )
-        put_ind = _indicator_pack_from_series(
-            put_ltp_series, put_vol_series, score_threshold, max_cross,
-            rsi_min, rsi_max, vol_min,
-        )
-        if len(call_ltp_series) < 5 or (call_ind["ema9"] == call_ind["ema21"] == call_ind["vwap"]):
-            call_ind = _indicator_pack_from_quote_fallback(
-                call_q, call_ltp, call_vol, score_threshold, max_cross,
-                rsi_min, rsi_max, vol_min,
+        inc_cross = bool(ip_global.get("include_ema_crossover_in_score", True))
+        strict_bull = bool(ip_global.get("strict_bullish_comparisons", False))
+        inc_vol_score = bool(ip_global.get("include_volume_in_leg_score", True))
+        if short_premium_legs:
+            call_ind = _indicator_pack_from_series_bearish(
+                call_ltp_series,
+                call_vol_series,
+                score_threshold,
+                max_cross,
+                rsi_min,
+                rsi_max,
+                vol_min,
+                include_volume_in_score=inc_vol_score,
             )
-        if len(put_ltp_series) < 5 or (put_ind["ema9"] == put_ind["ema21"] == put_ind["vwap"]):
-            put_ind = _indicator_pack_from_quote_fallback(
-                put_q, put_ltp, put_vol, score_threshold, max_cross,
-                rsi_min, rsi_max, vol_min,
+            put_ind = _indicator_pack_from_series_bearish(
+                put_ltp_series,
+                put_vol_series,
+                score_threshold,
+                max_cross,
+                rsi_min,
+                rsi_max,
+                vol_min,
+                include_volume_in_score=inc_vol_score,
+            )
+        else:
+            call_ind = _indicator_pack_from_series(
+                call_ltp_series,
+                call_vol_series,
+                score_threshold,
+                max_cross,
+                rsi_min,
+                rsi_max,
+                vol_min,
+                include_ema_crossover_in_score=inc_cross,
+                strict_bullish_comparisons=strict_bull,
+                include_volume_in_score=inc_vol_score,
+            )
+            put_ind = _indicator_pack_from_series(
+                put_ltp_series,
+                put_vol_series,
+                score_threshold,
+                max_cross,
+                rsi_min,
+                rsi_max,
+                vol_min,
+                include_ema_crossover_in_score=inc_cross,
+                strict_bullish_comparisons=strict_bull,
+                include_volume_in_score=inc_vol_score,
+            )
+        # Fallback when history is thin or indicators collapsed to zeros — not when EMA≈VWAP on a flat premium (that is valid).
+        c_z = (
+            float(call_ind.get("ema9") or 0) == 0.0
+            and float(call_ind.get("ema21") or 0) == 0.0
+            and float(call_ind.get("vwap") or 0) == 0.0
+        )
+        if len(call_ltp_series) < 5 or c_z:
+            if short_premium_legs:
+                call_ind = _indicator_pack_from_quote_fallback_bearish(
+                    call_q,
+                    call_ltp,
+                    call_vol,
+                    score_threshold,
+                    max_cross,
+                    rsi_min,
+                    rsi_max,
+                    vol_min,
+                    include_volume_in_score=inc_vol_score,
+                )
+            else:
+                call_ind = _indicator_pack_from_quote_fallback(
+                    call_q,
+                    call_ltp,
+                    call_vol,
+                    score_threshold,
+                    max_cross,
+                    rsi_min,
+                    rsi_max,
+                    vol_min,
+                    include_ema_crossover_in_score=inc_cross,
+                    strict_bullish_comparisons=strict_bull,
+                    include_volume_in_score=inc_vol_score,
+                )
+        p_z = (
+            float(put_ind.get("ema9") or 0) == 0.0
+            and float(put_ind.get("ema21") or 0) == 0.0
+            and float(put_ind.get("vwap") or 0) == 0.0
+        )
+        if len(put_ltp_series) < 5 or p_z:
+            if short_premium_legs:
+                put_ind = _indicator_pack_from_quote_fallback_bearish(
+                    put_q,
+                    put_ltp,
+                    put_vol,
+                    score_threshold,
+                    max_cross,
+                    rsi_min,
+                    rsi_max,
+                    vol_min,
+                    include_volume_in_score=inc_vol_score,
+                )
+            else:
+                put_ind = _indicator_pack_from_quote_fallback(
+                    put_q,
+                    put_ltp,
+                    put_vol,
+                    score_threshold,
+                    max_cross,
+                    rsi_min,
+                    rsi_max,
+                    vol_min,
+                    include_ema_crossover_in_score=inc_cross,
+                    strict_bullish_comparisons=strict_bull,
+                    include_volume_in_score=inc_vol_score,
+                )
+
+        regime_sell_pe = False
+        regime_sell_ce = False
+        if short_premium_legs and reg_srm == "ema_cross_vwap":
+            mxi = _max_candles_since_cross_int(max_cross, 5)
+            regime_sell_pe, regime_sell_ce = _resolve_regime_sell_pe_ce_at_strike(
+                put_ltp_series,
+                put_vol_series,
+                call_ltp_series,
+                call_vol_series,
+                mxi,
             )
 
         call_oi_chg = round(((call_oi - prev_call_oi) / prev_call_oi) * 100, 2) if prev_call_oi else 0.0
@@ -960,6 +1361,7 @@ def _build_live_chain(
                     "rsiOk": call_ind["rsiOk"],
                     "volumeOk": call_ind["volumeOk"],
                     "signalEligible": call_ind["signalEligible"],
+                    "regimeSellCe": regime_sell_ce,
                 },
                 "put": {
                     "tradingsymbol": str(put_inst.get("tradingsymbol", "")),
@@ -987,6 +1389,7 @@ def _build_live_chain(
                     "rsiOk": put_ind["rsiOk"],
                     "volumeOk": put_ind["volumeOk"],
                     "signalEligible": put_ind["signalEligible"],
+                    "regimeSellPe": regime_sell_pe,
                 },
             }
         )
@@ -1043,10 +1446,11 @@ def fetch_option_chain_sync(
     ip = dict(indicator_params or {})
     ip.setdefault("spotScoreThreshold", score_threshold)
     short_pm = str(ip.get("positionIntent", "")).lower() == "short_premium"
+    reg_mode_spot = str(ip.get("spotRegimeMode") or ip.get("spot_regime_mode") or "").strip().lower()
 
     spot_candles: list[dict[str, Any]] = []
     if kite and (
-        short_pm
+        (short_pm and reg_mode_spot != "ema_cross_vwap")
         or (ip.get("adx_min_threshold") is not None and float(ip.get("adx_min_threshold") or 0) > 0)
     ):
         spot_candles = _fetch_spot_candles(kite, instrument)
@@ -1073,7 +1477,7 @@ def fetch_option_chain_sync(
                         leg["signalEligible"] = False
 
     spot_trend: dict[str, Any] = {"spotBullishScore": 0, "spotBearishScore": 0, "spotRegime": None}
-    if short_pm and spot_candles:
+    if spot_candles and short_pm and reg_mode_spot != "ema_cross_vwap":
         spot_trend = _spot_trend_payload_from_candles(spot_candles, ip, int(score_threshold))
 
     total_call_oi = sum(float(x["call"]["oi"]) for x in chain)

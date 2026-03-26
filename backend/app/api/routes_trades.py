@@ -2,20 +2,150 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from zoneinfo import ZoneInfo
 from typing import Any
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from kiteconnect import KiteConnect
+from pydantic import ValidationError
 
 from app.db_client import ensure_user, execute, fetch, fetchrow
 from app.api.auth_context import get_user_id
+from app.services.ist_calendar import ist_today
+from app.services.ist_time_sql import IST_TODAY, closed_at_ist_date, closed_at_ist_date_bare
 from app.api.schemas import ExecuteRequest, ExecuteResponse, RecommendationOut, TradeOut
 from app.services.trades_service import ensure_recommendations, execute_recommendation, get_kite_for_quotes, get_strategy_score_params, list_recommendations_for_user
 
 router = APIRouter(prefix="/trades", tags=["trades"])
+logger = logging.getLogger(__name__)
+
+
+def _coerce_recommendation_row(item: dict[str, Any]) -> dict[str, Any]:
+    """Normalize DB + details_json shapes so RecommendationOut validation does not 500 the Trades page."""
+    out = dict(item)
+
+    def to_float(k: str) -> None:
+        v = out.get(k)
+        if v is None:
+            return
+        if isinstance(v, Decimal):
+            out[k] = float(v)
+        elif isinstance(v, bool):
+            return
+        elif isinstance(v, (int, float)):
+            out[k] = float(v)
+        elif isinstance(v, str) and v.strip():
+            try:
+                out[k] = float(v)
+            except ValueError:
+                pass
+
+    for k in (
+        "entry_price",
+        "target_price",
+        "stop_loss_price",
+        "confidence_score",
+        "vwap",
+        "ema9",
+        "ema21",
+        "rsi",
+        "ivr",
+        "volume",
+        "avg_volume",
+        "volume_spike_ratio",
+        "score_max",
+        "spot_price",
+        "delta",
+        "gamma",
+    ):
+        to_float(k)
+    sc = out.get("score")
+    if sc is not None and not isinstance(sc, (int, float)):
+        try:
+            out["score"] = float(sc)
+        except (TypeError, ValueError):
+            out["score"] = None
+    rv = out.get("rank_value")
+    if rv is not None:
+        try:
+            out["rank_value"] = int(rv)
+        except (TypeError, ValueError):
+            out["rank_value"] = 0
+    oi_v = out.get("oi")
+    if oi_v is not None:
+        try:
+            out["oi"] = int(float(oi_v))
+        except (TypeError, ValueError):
+            out["oi"] = None
+    atm = out.get("atm_distance")
+    if atm is not None:
+        try:
+            out["atm_distance"] = int(atm)
+        except (TypeError, ValueError):
+            out["atm_distance"] = None
+    ris = out.get("refresh_interval_sec")
+    if ris is not None:
+        try:
+            out["refresh_interval_sec"] = int(ris)
+        except (TypeError, ValueError):
+            out["refresh_interval_sec"] = None
+    hr = out.get("heuristic_reasons")
+    if hr is None:
+        pass
+    elif isinstance(hr, str):
+        out["heuristic_reasons"] = [hr] if hr.strip() else None
+    elif isinstance(hr, list):
+        out["heuristic_reasons"] = [str(x) for x in hr]
+    else:
+        out["heuristic_reasons"] = None
+    tp = out.get("trendpulse")
+    if tp is not None and not isinstance(tp, dict):
+        out["trendpulse"] = None
+    return out
+
+
+def _coerce_trade_row(item: dict[str, Any]) -> dict[str, Any]:
+    """Normalize asyncpg / legacy rows so TradeOut validation does not 500 Open/Closed lists."""
+    out = dict(item)
+
+    def to_float(k: str) -> None:
+        v = out.get(k)
+        if v is None:
+            return
+        if isinstance(v, Decimal):
+            out[k] = float(v)
+        elif isinstance(v, bool):
+            return
+        elif isinstance(v, (int, float)):
+            out[k] = float(v)
+        elif isinstance(v, str) and v.strip():
+            try:
+                out[k] = float(v)
+            except ValueError:
+                pass
+
+    for k in (
+        "entry_price",
+        "current_price",
+        "target_price",
+        "stop_loss_price",
+        "unrealized_pnl",
+        "realized_pnl",
+        "confidence_score",
+        "score",
+    ):
+        to_float(k)
+    q = out.get("quantity")
+    if q is not None:
+        try:
+            out["quantity"] = int(q)
+        except (TypeError, ValueError):
+            out["quantity"] = 1
+    return out
 
 
 @router.get("/strategy-params")
@@ -93,7 +223,11 @@ async def get_recommendations(
 ) -> list[RecommendationOut]:
     await ensure_user(user_id)
     kite = await get_kite_for_quotes(user_id)  # Shared API for recommendations
-    await ensure_recommendations(user_id, kite)
+    try:
+        await ensure_recommendations(user_id, kite)
+    except Exception:
+        # Admin "all strategies" refresh can fail on one strategy, broker, or schema drift; still return DB rows.
+        logger.exception("ensure_recommendations failed user_id=%s", user_id)
 
     role_row = await fetchrow("SELECT role FROM s004_users WHERE id = $1", user_id)
     is_admin = role_row and str(role_row.get("role", "")).upper() == "ADMIN"
@@ -127,14 +261,28 @@ async def get_recommendations(
         sid = rows[0].get("strategy_id")
         ver = rows[0].get("strategy_version")
         if sid and ver:
-            params = await get_strategy_score_params(str(sid), str(ver), user_id)
-            score_max = params.get("score_max")
-    out = []
+            try:
+                params = await get_strategy_score_params(str(sid), str(ver), user_id)
+                score_max = params.get("score_max")
+            except Exception:
+                logger.exception(
+                    "get_strategy_score_params failed for recommendations sid=%s ver=%s",
+                    sid,
+                    ver,
+                )
+    out: list[RecommendationOut] = []
     for r in rows:
-        item = dict(r)
+        item = _coerce_recommendation_row(dict(r))
         if score_max is not None:
             item["score_max"] = score_max
-        out.append(RecommendationOut(**item))
+        try:
+            out.append(RecommendationOut.model_validate(item))
+        except Exception:
+            logger.warning(
+                "Skipping recommendation row that failed validation recommendation_id=%s",
+                item.get("recommendation_id"),
+                exc_info=True,
+            )
     return out
 
 
@@ -300,7 +448,14 @@ async def get_open_trades(user_id: int = Depends(get_user_id)) -> list[TradeOut]
             if d.get("stop_loss_price") is None:
                 d["stop_loss_price"] = round(entry - sl_pts, 2) if side == "BUY" else round(entry + sl_pts, 2)
             d["qty"] = contracts  # LotSize × quantity
-            out.append(TradeOut(**d))
+            try:
+                out.append(TradeOut.model_validate(_coerce_trade_row(d)))
+            except ValidationError:
+                logger.warning(
+                    "Skipping open trade row (validation) trade_ref=%s",
+                    d.get("trade_ref"),
+                    exc_info=True,
+                )
     else:
         for r in rows:
             lots = int(r.get("quantity") or 1)
@@ -318,7 +473,14 @@ async def get_open_trades(user_id: int = Depends(get_user_id)) -> list[TradeOut]
             if d.get("stop_loss_price") is None:
                 d["stop_loss_price"] = round(entry - sl_pts, 2) if side == "BUY" else round(entry + sl_pts, 2)
             d["qty"] = contracts  # LotSize × quantity
-            out.append(TradeOut(**d))
+            try:
+                out.append(TradeOut.model_validate(_coerce_trade_row(d)))
+            except ValidationError:
+                logger.warning(
+                    "Skipping open trade row (validation) trade_ref=%s",
+                    d.get("trade_ref"),
+                    exc_info=True,
+                )
     return out
 
 
@@ -352,7 +514,14 @@ async def get_closed_trades(user_id: int = Depends(get_user_id)) -> list[TradeOu
         d["reason"] = _format_exit_reason(d.pop("exit_reason_code", None))
         lots = int(d.get("quantity") or 1)
         d["qty"] = lots * lot_size
-        out.append(TradeOut(**d))
+        try:
+            out.append(TradeOut.model_validate(_coerce_trade_row(d)))
+        except ValidationError:
+            logger.warning(
+                "Skipping closed trade row (validation) trade_ref=%s",
+                d.get("trade_ref"),
+                exc_info=True,
+            )
     return out
 
 
@@ -365,7 +534,7 @@ async def get_trade_history(
 
     if today_only:
         rows = await fetch(
-            """
+            f"""
             SELECT t.trade_ref, t.symbol, t.mode, t.side, t.quantity, t.entry_price, t.current_price,
                    t.target_price, t.stop_loss_price, t.current_state, t.realized_pnl, t.unrealized_pnl,
                    t.opened_at, t.closed_at, t.updated_at, o.manual_execute, r.score, r.confidence_score,
@@ -380,7 +549,7 @@ async def get_trade_history(
             WHERE t.user_id = $1
               AND t.current_state = 'EXIT'
               AND t.closed_at IS NOT NULL
-              AND t.closed_at::date = CURRENT_DATE
+              AND {closed_at_ist_date("t")} = {IST_TODAY}
             ORDER BY t.closed_at DESC
             LIMIT 100
             """,
@@ -415,7 +584,14 @@ async def get_trade_history(
         d["reason"] = _format_exit_reason(exit_code) if d.get("current_state") == "EXIT" else None
         lots = int(d.get("quantity") or 1)
         d["qty"] = lots * lot_size
-        out.append(TradeOut(**d))
+        try:
+            out.append(TradeOut.model_validate(_coerce_trade_row(d)))
+        except ValidationError:
+            logger.warning(
+                "Skipping history trade row (validation) trade_ref=%s",
+                d.get("trade_ref"),
+                exc_info=True,
+            )
     return out
 
 
@@ -436,12 +612,13 @@ def _build_reports_filter_sql(
     args: list = []
     idx = 1
 
+    c_ist = closed_at_ist_date("t")
     if from_d is not None:
-        parts.append(f"t.closed_at::date >= ${idx}")
+        parts.append(f"{c_ist} >= ${idx}")
         args.append(from_d)
         idx += 1
     if to_d is not None:
-        parts.append(f"t.closed_at::date <= ${idx}")
+        parts.append(f"{c_ist} <= ${idx}")
         args.append(to_d)
         idx += 1
 
@@ -669,7 +846,7 @@ async def get_performance_analytics(
     role_row = await fetchrow("SELECT role FROM s004_users WHERE id = $1", user_id)
     is_admin = role_row and str(role_row.get("role", "")).upper() == "ADMIN"
 
-    to_d = date.today()
+    to_d = ist_today()
     from_d = to_d - timedelta(days=89)
     if from_date:
         try:
@@ -701,12 +878,13 @@ async def get_performance_analytics(
         user_filter = " AND t.user_id = $3"
         user_args = [filter_user_id]
 
+    cdate = closed_at_ist_date("t")
     query_trades = f"""
-        SELECT t.user_id, t.closed_at::date AS trade_date, t.realized_pnl,
+        SELECT t.user_id, {cdate} AS trade_date, t.realized_pnl,
                t.entry_price, t.current_price, t.quantity
         FROM s004_live_trades t
         WHERE t.current_state = 'EXIT' AND t.closed_at IS NOT NULL
-          AND t.closed_at::date >= $1 AND t.closed_at::date <= $2
+          AND {cdate} >= $1 AND {cdate} <= $2
           {user_filter}
           {mode_filter}
         ORDER BY t.closed_at
@@ -831,7 +1009,7 @@ async def get_strategy_performance(
     if not is_admin and filter_user_id is not None and filter_user_id != user_id:
         filter_user_id = None
 
-    to_d = date.today()
+    to_d = ist_today()
     from_d = to_d - timedelta(days=89)
     if from_date:
         try:
@@ -866,6 +1044,7 @@ async def get_strategy_performance(
     if idx_upper not in ("ALL", "NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "OTHER"):
         idx_upper = "ALL"
 
+    c_ist = closed_at_ist_date("t")
     q = f"""
         SELECT t.user_id, t.strategy_id, t.strategy_version,
                t.closed_at, t.opened_at, t.symbol,
@@ -877,7 +1056,7 @@ async def get_strategy_performance(
         FROM s004_live_trades t
         LEFT JOIN s004_strategy_catalog c ON c.strategy_id = t.strategy_id AND c.version = t.strategy_version
         WHERE t.current_state = 'EXIT' AND t.closed_at IS NOT NULL
-          AND t.closed_at::date >= $1 AND t.closed_at::date <= $2
+          AND {c_ist} >= $1 AND {c_ist} <= $2
           {user_filter}
           {mode_filter}
         ORDER BY t.closed_at
@@ -1350,24 +1529,25 @@ async def get_daily_pnl(user_id: int = Depends(get_user_id)) -> list[dict]:
     role_row = await fetchrow("SELECT role FROM s004_users WHERE id = $1", user_id)
     is_admin = role_row and str(role_row.get("role", "")).upper() == "ADMIN"
 
+    cda = closed_at_ist_date_bare()
     if is_admin:
         rows = await fetch(
-            """
-            SELECT closed_at::date AS trade_date, COALESCE(SUM(realized_pnl), 0)::float AS pnl
+            f"""
+            SELECT {cda} AS trade_date, COALESCE(SUM(realized_pnl), 0)::float AS pnl
             FROM s004_live_trades
             WHERE current_state = 'EXIT' AND closed_at IS NOT NULL
-            GROUP BY closed_at::date
+            GROUP BY {cda}
             ORDER BY trade_date ASC
             LIMIT 90
             """,
         )
     else:
         rows = await fetch(
-            """
-            SELECT closed_at::date AS trade_date, COALESCE(SUM(realized_pnl), 0)::float AS pnl
+            f"""
+            SELECT {cda} AS trade_date, COALESCE(SUM(realized_pnl), 0)::float AS pnl
             FROM s004_live_trades
             WHERE user_id = $1 AND current_state = 'EXIT' AND closed_at IS NOT NULL
-            GROUP BY closed_at::date
+            GROUP BY {cda}
             ORDER BY trade_date ASC
             LIMIT 90
             """,

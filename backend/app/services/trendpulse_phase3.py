@@ -86,6 +86,52 @@ def merge_breadth_config(raw: dict[str, Any] | None) -> dict[str, Any]:
     return out
 
 
+_WEEKDAY_NAME_TO_INT: dict[str, int] = {
+    "MONDAY": 0,
+    "MON": 0,
+    "TUESDAY": 1,
+    "TUE": 1,
+    "WEDNESDAY": 2,
+    "WED": 2,
+    "THURSDAY": 3,
+    "THU": 3,
+    "FRIDAY": 4,
+    "FRI": 4,
+    "SATURDAY": 5,
+    "SAT": 5,
+    "SUNDAY": 6,
+    "SUN": 6,
+}
+
+
+def parse_nifty_weekly_expiry_weekday(raw: Any) -> int | None:
+    """
+    NIFTY weekly index expiry **calendar weekday** (Python: Mon=0 … Sun=6).
+    Default **1 (Tuesday)** — current NSE NIFTY weekly expiry day for standard weeklies.
+    Return ``None`` to skip weekday filtering (earliest expiry that satisfies ``minDteCalendarDays`` only).
+    """
+    if raw is None:
+        return 1
+    if isinstance(raw, str):
+        s = raw.strip().upper()
+        if s in ("ANY", "NONE", "OFF", "*", ""):
+            return None
+        if s.isdigit() and len(s) == 1:
+            v = int(s)
+            if 0 <= v <= 6:
+                return v
+        return _WEEKDAY_NAME_TO_INT.get(s, 1)
+    if isinstance(raw, bool):
+        return 1
+    if isinstance(raw, int):
+        if raw < 0:
+            return None
+        if 0 <= raw <= 6:
+            return raw
+        return 1
+    return 1
+
+
 def resolve_trendpulse_z_config(tpz_raw: dict[str, Any] | None) -> dict[str, Any]:
     """
     Merge profile preset with explicit trendPulseZ fields (explicit always wins).
@@ -110,6 +156,16 @@ def resolve_trendpulse_z_config(tpz_raw: dict[str, Any] | None) -> dict[str, Any
         "profile": profile_key,
         "session": merge_session_config(raw.get("session") if isinstance(raw.get("session"), dict) else None),
         "breadth": merge_breadth_config(raw.get("breadth") if isinstance(raw.get("breadth"), dict) else None),
+        # Two-tier strike defaults (see TRENDPULSE_Z_TWO_TIER_IMPLEMENTATION_SPEC.md)
+        "minDteCalendarDays": int(raw.get("minDteCalendarDays", 2)),
+        "niftyWeeklyExpiryWeekday": parse_nifty_weekly_expiry_weekday(raw.get("niftyWeeklyExpiryWeekday")),
+        "deltaMinAbs": float(raw.get("deltaMinAbs", 0.40)),
+        "deltaMaxAbs": float(raw.get("deltaMaxAbs", 0.50)),
+        "extrinsicShareMin": float(raw.get("extrinsicShareMin", 0.25)),
+        # Strike selection: premium cap (₹ LTP) and max-gamma ranking (see trades_service TrendPulse Z)
+        "maxOptionPremiumInr": float(raw.get("maxOptionPremiumInr", 80.0)),
+        "selectStrikeByMaxGamma": bool(raw.get("selectStrikeByMaxGamma", True)),
+        "maxStrikeRecommendations": int(raw.get("maxStrikeRecommendations", 1)),
     }
     for k in _NUMERIC_OVERRIDE_KEYS:
         if k in raw and raw[k] is not None:
@@ -119,6 +175,18 @@ def resolve_trendpulse_z_config(tpz_raw: dict[str, Any] | None) -> dict[str, Any
                 merged[k] = float(raw[k])
             elif k in ("stInterval", "htfInterval"):
                 merged[k] = str(raw[k])
+    for k in ("minDteCalendarDays",):
+        if k in raw and raw[k] is not None:
+            merged[k] = int(raw[k])
+    for k in ("deltaMinAbs", "deltaMaxAbs", "extrinsicShareMin", "maxOptionPremiumInr"):
+        if k in raw and raw[k] is not None:
+            merged[k] = float(raw[k])
+    if "selectStrikeByMaxGamma" in raw:
+        merged["selectStrikeByMaxGamma"] = bool(raw.get("selectStrikeByMaxGamma"))
+    if "maxStrikeRecommendations" in raw and raw.get("maxStrikeRecommendations") is not None:
+        merged["maxStrikeRecommendations"] = int(raw["maxStrikeRecommendations"])
+    if "niftyWeeklyExpiryWeekday" in raw:
+        merged["niftyWeeklyExpiryWeekday"] = parse_nifty_weekly_expiry_weekday(raw.get("niftyWeeklyExpiryWeekday"))
     return merged
 
 

@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 
 from app.services.trendpulse_phase3 import (
     apply_trendpulse_hard_gates,
+    parse_nifty_weekly_expiry_weekday,
     resolve_trendpulse_z_config,
     session_block_reason,
 )
@@ -30,6 +31,21 @@ def test_risk_profile_alias():
     c = resolve_trendpulse_z_config({"riskProfile": "aggressive"})
     assert c["zWindow"] == 40
     assert c["profile"] == "aggressive"
+
+
+def test_resolve_defaults_min_dte_and_nifty_weekday():
+    c = resolve_trendpulse_z_config({})
+    assert c["minDteCalendarDays"] == 2
+    assert c["niftyWeeklyExpiryWeekday"] == 1  # Tuesday
+    assert c["maxOptionPremiumInr"] == 80.0
+    assert c["selectStrikeByMaxGamma"] is True
+    assert c["maxStrikeRecommendations"] == 1
+
+
+def test_parse_weekday_any():
+    assert parse_nifty_weekly_expiry_weekday("ANY") is None
+    assert parse_nifty_weekly_expiry_weekday("TUE") == 1
+    assert parse_nifty_weekly_expiry_weekday(None) == 1
 
 
 def test_session_weekend_blocked():

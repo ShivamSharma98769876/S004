@@ -31,6 +31,7 @@ from app.services.redis_client import (
     sentiment_history_fetch as _redis_sentiment_fetch,
     sentiment_history_redis_available,
 )
+from app.services.news_sentiment import compute_news_sentiment_snapshot, news_sentiment_failure_payload
 from app.services.strategy_day_fit import attach_strategy_day_fit_to_snapshot
 from app.services.trades_service import get_strategy_score_params, get_kite_for_quotes, _get_user_strategy
 
@@ -101,6 +102,7 @@ def _history_record(
             "regime": sentiment.get("regime"),
             "drivers": sentiment.get("drivers") or [],
             "alerts": sentiment.get("alerts") or [],
+            "optionsIntel": sentiment.get("optionsIntel") or {},
         },
         "trendpulse": {
             "enabled": bool(trendpulse.get("trendpulseEnabled")),
@@ -295,7 +297,18 @@ async def decision_snapshot(user_id: int = Depends(get_user_id)) -> dict[str, An
     await ensure_user(user_id)
     kite = await get_kite_for_quotes(user_id)
     nifty_spot, nifty_chg, pcr, chain_payload = await _fetch_nifty_market_and_chain(kite)
-    tp = await trendpulse_series(user_id)
+    tp, news_raw = await asyncio.gather(
+        trendpulse_series(user_id),
+        compute_news_sentiment_snapshot(),
+        return_exceptions=True,
+    )
+    if isinstance(tp, BaseException):
+        raise tp
+    news_sentiment = (
+        news_sentiment_failure_payload(news_raw)
+        if isinstance(news_raw, BaseException)
+        else news_raw
+    )
     sentiment = compute_sentiment_snapshot(
         chain_payload=chain_payload,
         spot_chg_pct=nifty_chg,
@@ -318,6 +331,7 @@ async def decision_snapshot(user_id: int = Depends(get_user_id)) -> dict[str, An
         "sentiment": sentiment,
         "trendpulse": tp,
         "strategyDayFit": strategy_day_fit,
+        "newsSentiment": news_sentiment,
         "updatedAt": updated_at,
     }
     await _append_sentiment_history(
@@ -464,9 +478,7 @@ async def trendpulse_series(user_id: int = Depends(get_user_id)) -> dict[str, An
             except ValueError:
                 # Fallback to today's IST session date if displayDate is unexpectedly malformed.
                 display_day = datetime.now(ZoneInfo("Asia/Kolkata")).date()
-            # Robust day filter:
-            # - UTC-naive storage interpreted as UTC -> IST date
-            # - legacy/local naive storage interpreted directly by date
+            # opened_at is stored as UTC-naive; IST session date for markers matches chart displayDate.
             # Also fall back from (strategy_id + strategy_version) to strategy_id-only when versions drift.
             trade_rows = await fetch(
                 """
@@ -475,10 +487,7 @@ async def trendpulse_series(user_id: int = Depends(get_user_id)) -> dict[str, An
                 WHERE user_id = $1
                   AND strategy_id = $2
                   AND strategy_version = $3
-                  AND (
-                    ((opened_at AT TIME ZONE 'UTC') AT TIME ZONE 'Asia/Kolkata')::date = $4::date
-                    OR opened_at::date = $4::date
-                  )
+                  AND ((opened_at AT TIME ZONE 'UTC') AT TIME ZONE 'Asia/Kolkata')::date = $4::date
                 ORDER BY opened_at ASC
                 LIMIT 250
                 """,
@@ -494,10 +503,7 @@ async def trendpulse_series(user_id: int = Depends(get_user_id)) -> dict[str, An
                     FROM s004_live_trades
                     WHERE user_id = $1
                       AND strategy_id = $2
-                      AND (
-                        ((opened_at AT TIME ZONE 'UTC') AT TIME ZONE 'Asia/Kolkata')::date = $3::date
-                        OR opened_at::date = $3::date
-                      )
+                      AND ((opened_at AT TIME ZONE 'UTC') AT TIME ZONE 'Asia/Kolkata')::date = $3::date
                     ORDER BY opened_at ASC
                     LIMIT 250
                     """,
@@ -651,6 +657,7 @@ async def sentiment_history(
     points = []
     for r in tail:
         s = r.get("sentiment") or {}
+        oi = s.get("optionsIntel") if isinstance(s.get("optionsIntel"), dict) else {}
         points.append(
             {
                 "timestamp": r.get("timestamp"),
@@ -659,6 +666,8 @@ async def sentiment_history(
                 "directionLabel": str(s.get("directionLabel") or "NEUTRAL"),
                 "sentimentLabel": str(s.get("sentimentLabel") or "Balanced"),
                 "regime": str(s.get("regime") or "RANGE_CHOP"),
+                "modelOptionTilt": str(oi.get("modelOptionTilt") or "NEUTRAL"),
+                "ceStrengthPct": int(oi.get("ceStrengthPct") or 50),
             }
         )
     return {

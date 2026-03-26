@@ -170,7 +170,7 @@ async def ensure_user_strategy_settings(user_id: int, strategy_id: str, strategy
         float(def_val("target_points", 10)),
         float(def_val("trailing_sl_points", 20)),
         str(def_val("timeframe", "3-min")),
-        time(9, 20, 0),
+        time(9, 15, 0),
         time(15, 0, 0),
         ["NIFTY"],
         int(def_val("auto_pause_after_losses", 3)),

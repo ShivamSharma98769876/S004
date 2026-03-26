@@ -9,12 +9,13 @@ import { ADMIN_NAV_ITEMS, DESIGN_TOKENS, REPORTS_NAV_ITEMS, USER_NAV_ITEMS } fro
 import RiskStatusBanner from "@/components/RiskStatusBanner";
 
 type AppFrameProps = {
-  title: string;
-  subtitle: string;
+  title?: string;
+  subtitle?: string;
   children: ReactNode;
 };
 
 export default function AppFrame({ title, subtitle, children }: AppFrameProps) {
+  const showPageHeader = Boolean((title && title.trim()) || (subtitle && subtitle.trim()));
   const pathname = usePathname();
   const router = useRouter();
   const [lightTheme, setLightTheme] = useState(false);
@@ -166,10 +167,12 @@ export default function AppFrame({ title, subtitle, children }: AppFrameProps) {
           </div>
         </header>
 
-        <section className="page-header">
-          <h1>{title}</h1>
-          <p>{subtitle}</p>
-        </section>
+        {showPageHeader ? (
+          <section className="page-header">
+            {title?.trim() ? <h1>{title}</h1> : null}
+            {subtitle?.trim() ? <p>{subtitle}</p> : null}
+          </section>
+        ) : null}
 
         <RiskStatusBanner />
 

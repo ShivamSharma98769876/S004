@@ -107,7 +107,7 @@ CREATE TABLE IF NOT EXISTS s004_user_strategy_settings (
     target_points NUMERIC(10,2) NOT NULL DEFAULT 10,
     trailing_sl_points NUMERIC(10,2) NOT NULL DEFAULT 20,
     timeframe VARCHAR(16) NOT NULL DEFAULT '3-min',
-    trade_start TIME NOT NULL DEFAULT '09:20',
+    trade_start TIME NOT NULL DEFAULT '09:15',
     trade_end TIME NOT NULL DEFAULT '15:00',
     enabled_indices TEXT[] NOT NULL DEFAULT ARRAY['NIFTY'],
     auto_pause_after_losses INTEGER NOT NULL DEFAULT 3,
@@ -298,6 +298,9 @@ ALTER TABLE IF EXISTS s004_trade_recommendations
     ADD COLUMN IF NOT EXISTS strategy_version VARCHAR(32) NOT NULL DEFAULT '1.0.0',
     ADD COLUMN IF NOT EXISTS rank_value INTEGER NOT NULL DEFAULT 9999,
     ADD COLUMN IF NOT EXISTS score INTEGER;
+
+ALTER TABLE IF EXISTS s004_trade_recommendations
+    ADD COLUMN IF NOT EXISTS details_json JSONB;
 
 ALTER TABLE IF EXISTS s004_live_trades
     ADD COLUMN IF NOT EXISTS order_ref VARCHAR(64),

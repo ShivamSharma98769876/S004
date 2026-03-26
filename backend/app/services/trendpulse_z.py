@@ -251,6 +251,33 @@ def _display_day_indices(
     return [], today
 
 
+def _candle_instant_utc_naive(time_raw: Any, exchange_tz: ZoneInfo) -> datetime | None:
+    """Interpret Kite candle ``time`` as exchange-local when naive; return UTC wall as naive datetime."""
+    if isinstance(time_raw, datetime):
+        d = time_raw
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=exchange_tz)
+        return d.astimezone(timezone.utc).replace(tzinfo=None)
+    if isinstance(time_raw, str) and time_raw.strip():
+        s = time_raw.strip().replace("Z", "+00:00")
+        try:
+            d = datetime.fromisoformat(s)
+        except ValueError:
+            return None
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=exchange_tz)
+        return d.astimezone(timezone.utc).replace(tzinfo=None)
+    return None
+
+
+def _candle_time_to_utc_z_str(time_raw: Any, exchange_tz: ZoneInfo) -> str:
+    """API/chart timestamps as UTC ISO8601 with Z (matches DB trades + frontend parseBackendUtcNaive)."""
+    u = _candle_instant_utc_naive(time_raw, exchange_tz)
+    if u is None:
+        return str(time_raw or "")
+    return u.isoformat() + "Z"
+
+
 def build_trendpulse_chart_series(
     st_candles: list[dict[str, Any]],
     *,
@@ -317,12 +344,12 @@ def build_trendpulse_chart_series(
             ),
         }
 
-    times: list[str | None] = []
+    times: list[str] = []
     pz: list[float] = []
     vz: list[float] = []
     t0 = display_idx[0]
     for i in display_idx:
-        times.append(str(st_candles[i].get("time") or ""))
+        times.append(_candle_time_to_utc_z_str(st_candles[i].get("time"), tz))
         pz.append(round(float(ps_z[i]), 6))
         vz.append(round(float(vs_z[i]), 6))
     return {
@@ -340,23 +367,6 @@ def build_trendpulse_chart_series(
     }
 
 
-def _to_utc_naive(dt_like: Any) -> datetime | None:
-    if isinstance(dt_like, datetime):
-        if dt_like.tzinfo is not None:
-            return dt_like.astimezone(timezone.utc).replace(tzinfo=None)
-        return dt_like
-    if isinstance(dt_like, str) and dt_like:
-        s = dt_like.replace("Z", "+00:00")
-        try:
-            d = datetime.fromisoformat(s)
-            if d.tzinfo is not None:
-                return d.astimezone(timezone.utc).replace(tzinfo=None)
-            return d
-        except ValueError:
-            return None
-    return None
-
-
 def build_trendpulse_entry_events(
     st_candles: list[dict[str, Any]],
     htf_candles: list[dict[str, Any]],
@@ -368,11 +378,17 @@ def build_trendpulse_entry_events(
     htf_ema_fast: int,
     htf_ema_slow: int,
     tail_start_index: int,
+    exchange_timezone: str = "Asia/Kolkata",
 ) -> list[dict[str, Any]]:
     """Entry events where TrendPulse Z conditions are satisfied on each ST close."""
     n = len(st_candles)
     if n < 3:
         return []
+
+    try:
+        etz = ZoneInfo(exchange_timezone)
+    except Exception:
+        etz = ZoneInfo("Asia/Kolkata")
 
     closes = [float(c.get("close") or 0.0) for c in st_candles]
     vols = [_bar_volume_proxy(c) for c in st_candles]
@@ -385,7 +401,7 @@ def build_trendpulse_entry_events(
     htf_ts: list[datetime] = []
     htf_closes: list[float] = []
     for c in htf_candles:
-        t = _to_utc_naive(c.get("time"))
+        t = _candle_instant_utc_naive(c.get("time"), etz)
         cl = float(c.get("close") or 0.0)
         if t is None or cl <= 0:
             continue
@@ -399,7 +415,7 @@ def build_trendpulse_entry_events(
     for i in range(max(1, need), n):
         if i < tail_start_index:
             continue
-        st_time = _to_utc_naive(st_candles[i].get("time"))
+        st_time = _candle_instant_utc_naive(st_candles[i].get("time"), etz)
         if st_time is None:
             continue
         while h_idx + 1 < len(htf_ts) and htf_ts[h_idx + 1] <= st_time:
@@ -419,7 +435,7 @@ def build_trendpulse_entry_events(
         events.append(
             {
                 "tailIndex": i - tail_start_index,
-                "time": st_time.isoformat(),
+                "time": st_time.isoformat() + "Z",
                 "cross": cross,
                 "htfBias": bias,
                 "psZ": round(float(ps_z[i]), 4),

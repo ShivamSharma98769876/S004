@@ -10,7 +10,8 @@ from app.db_client import fetchrow
 from app.services.option_chain_zerodha import (
     fetch_indices_spot_sync,
     fetch_option_chain_sync,
-    get_expiries_for_instrument,
+    get_expiries_for_analytics,
+    verify_kite_session_sync,
 )
 
 router = APIRouter(prefix="/analytics", tags=["analytics"])
@@ -73,7 +74,39 @@ async def get_expiries(
     user_id: int = Depends(require_admin),
 ) -> dict:
     inst = instrument.strip().upper()
-    return {"instrument": inst, "expiries": get_expiries_for_instrument(inst)}
+    kite = await _get_kite_client_or_none(user_id)
+    session_ok = await asyncio.to_thread(verify_kite_session_sync, kite)
+    # Invalid/expired token: do not use broker expiry list (would mislead); use estimated fallback.
+    kite_for_list = kite if session_ok else None
+    expiries, source = get_expiries_for_analytics(kite_for_list, inst)
+    creds_present = bool(kite)
+    return {
+        "instrument": inst,
+        "expiries": expiries,
+        "expiry_source": source,
+        "broker_session_ok": session_ok,
+        "credentials_present": creds_present,
+    }
+
+
+@router.get("/broker-status")
+async def get_broker_status(user_id: int = Depends(require_admin)) -> dict:
+    """Lightweight session check for Option Chain UI (token valid vs missing/expired)."""
+    kite = await _get_kite_client_or_none(user_id)
+    session_ok = await asyncio.to_thread(verify_kite_session_sync, kite)
+    return {
+        "credentials_present": bool(kite),
+        "broker_session_ok": session_ok,
+        "message": (
+            "Zerodha session is active."
+            if session_ok
+            else (
+                "API credentials or access token missing. Add them in Settings."
+                if not kite
+                else "Access token invalid or expired. Reconnect Zerodha in Settings."
+            )
+        ),
+    }
 
 
 @router.get("/indices")
@@ -110,6 +143,14 @@ async def get_option_chain(
         raise HTTPException(status_code=400, detail="Invalid instrument.")
     try:
         kite = await _get_kite_client_or_none(user_id)
+        if kite and not await asyncio.to_thread(verify_kite_session_sync, kite):
+            live_required = os.getenv("OPTION_CHAIN_REQUIRE_LIVE", "1").strip().lower() not in {"0", "false", "no"}
+            if live_required:
+                raise HTTPException(
+                    status_code=401,
+                    detail="Zerodha access token is missing, invalid, or expired. Open Settings and reconnect Kite, then refresh.",
+                )
+            kite = None
         return await asyncio.to_thread(fetch_option_chain_sync, kite, inst, expiry, strikes_up, strikes_down)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

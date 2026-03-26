@@ -1,9 +1,18 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, field_serializer
+
+
+def _utc_wall_iso_z(dt: datetime | None) -> str | None:
+    """DB trade timestamps are UTC wall in ``TIMESTAMP WITHOUT TIME ZONE``; JSON must use ``Z`` so browsers parse as UTC."""
+    if dt is None:
+        return None
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt.isoformat() + "Z"
 
 
 class StrategyItemOut(BaseModel):
@@ -72,6 +81,7 @@ class RecommendationOut(BaseModel):
     ema9: float | None = None
     ema21: float | None = None
     rsi: float | None = None
+    ivr: float | None = None
     volume: float | None = None
     avg_volume: float | None = None
     volume_spike_ratio: float | None = None
@@ -91,6 +101,13 @@ class RecommendationOut(BaseModel):
     refresh_interval_sec: int | None = None
     status: str
     created_at: datetime
+    strategy_id: str | None = None
+    strategy_version: str | None = None
+    trendpulse: dict[str, Any] | None = None
+    option_type: str | None = None
+    delta: float | None = None
+    gamma: float | None = None
+    oi: int | None = None
 
 
 def _format_exit_reason(reason_code: str | None) -> str:
@@ -129,6 +146,10 @@ class TradeOut(BaseModel):
     score: float | int | None = None
     confidence_score: float | None = None
     strategy_name: str | None = None
+
+    @field_serializer("opened_at", "closed_at", "updated_at", when_used="json")
+    def _serialize_trade_timestamps(self, v: datetime | None) -> str | None:
+        return _utc_wall_iso_z(v)
 
 
 class SettingsPayload(BaseModel):

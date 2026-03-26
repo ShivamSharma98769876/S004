@@ -22,7 +22,7 @@ def test_build_heatmap_from_rows_merges_cells():
 
 def test_build_analysis_csv_contains_sections():
     payload = {
-        "overview": {"reportDate": "2026-03-23", "market": {"nifty": {"spot": 1}, "pcr": 1.1}},
+        "overview": {"reportDate": "2026-03-24", "market": {"nifty": {"spot": 1}, "pcr": 1.1}},
         "strategies_outcome": [{"display_name": "X", "recommendations": {"generated": 1}}],
         "decision_log": [{"username": "u1", "occurred_at": "t", "gate_reason": None, "cycle_summary": "OK", "evaluations": []}],
         "open_trades": [{"trade_ref": "tr1", "symbol": "SYM", "reason_code": "R", "score_at_entry": 5, "username": "u1"}],

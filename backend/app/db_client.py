@@ -78,22 +78,37 @@ def _normalize_args(args: tuple[Any, ...]) -> tuple[Any, ...]:
 async def fetch(query: str, *args: Any) -> list[asyncpg.Record]:
     pool = _require_pool()
     db_args = _normalize_args(args)
-    async with pool.acquire() as conn:
-        return await conn.fetch(query, *db_args)
+    try:
+        async with pool.acquire() as conn:
+            return await conn.fetch(query, *db_args)
+    except asyncpg.exceptions.InterfaceError as exc:
+        if "closing" in str(exc).lower() or "closed" in str(exc).lower():
+            _logger.warning("fetch skipped: DB pool shutting down (%s)", exc)
+        raise
 
 
 async def fetchrow(query: str, *args: Any) -> asyncpg.Record | None:
     pool = _require_pool()
     db_args = _normalize_args(args)
-    async with pool.acquire() as conn:
-        return await conn.fetchrow(query, *db_args)
+    try:
+        async with pool.acquire() as conn:
+            return await conn.fetchrow(query, *db_args)
+    except asyncpg.exceptions.InterfaceError as exc:
+        if "closing" in str(exc).lower() or "closed" in str(exc).lower():
+            _logger.warning("fetchrow skipped: DB pool shutting down (%s)", exc)
+        raise
 
 
 async def execute(query: str, *args: Any) -> str:
     pool = _require_pool()
     db_args = _normalize_args(args)
-    async with pool.acquire() as conn:
-        return await conn.execute(query, *db_args)
+    try:
+        async with pool.acquire() as conn:
+            return await conn.execute(query, *db_args)
+    except asyncpg.exceptions.InterfaceError as exc:
+        if "closing" in str(exc).lower() or "closed" in str(exc).lower():
+            _logger.warning("execute skipped: DB pool shutting down (%s)", exc)
+        raise
 
 
 async def ensure_user(user_id: int) -> None:

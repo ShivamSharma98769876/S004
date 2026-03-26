@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import AppFrame from "@/components/AppFrame";
 import { apiJson, isAdmin } from "@/lib/api_client";
-import { formatDateYmdIST, formatTimeIST, toYmdIST } from "@/lib/datetime_ist";
+import { backendInstantMs, formatDateYmdIST, formatTimeIST, toYmdIST } from "@/lib/datetime_ist";
 
 type ReportTrade = {
   trade_ref: string;
@@ -56,7 +56,7 @@ function buildReportsQuery(params: {
 }
 
 function formatTime(iso: string | null | undefined): string {
-  return formatTimeIST(iso, { seconds: true, fallback: "--:--:--" });
+  return formatTimeIST(iso, { seconds: true, fallback: "--:--:--", appendIstLabel: true });
 }
 
 function formatDate(iso: string | null | undefined): string {
@@ -161,11 +161,11 @@ export default function ReportsPage() {
         av = Number(a.realized_pnl ?? 0);
         bv = Number(b.realized_pnl ?? 0);
       } else if (sortCol === "opened_at" || sortCol === "closed_at" || sortCol === "trade_date") {
-        av = new Date(av ?? 0).getTime();
-        bv = new Date(bv ?? 0).getTime();
+        av = backendInstantMs(String(av ?? ""));
+        bv = backendInstantMs(String(bv ?? ""));
         if (sortCol === "trade_date") {
-          av = new Date(a.opened_at ?? 0).getTime();
-          bv = new Date(b.opened_at ?? 0).getTime();
+          av = backendInstantMs(a.closed_at ?? a.opened_at);
+          bv = backendInstantMs(b.closed_at ?? b.opened_at);
         }
       } else if (sortCol === "manual_execute") {
         av = a.manual_execute === false ? 0 : a.manual_execute === true ? 1 : -1;
@@ -198,8 +198,8 @@ export default function ReportsPage() {
       const takenBy = t.manual_execute === false ? "Auto" : t.manual_execute === true ? "Manual" : "—";
       const pnl = Number(t.realized_pnl ?? 0);
       const cells = admin
-        ? [t.trade_ref, formatDate(t.opened_at), String(t.username ?? "—"), t.symbol, String(t.strategy_name ?? "—"), optType, t.mode || "PAPER", takenBy, formatTime(t.opened_at), Number(t.entry_price).toFixed(2), formatTime(t.closed_at), Number(t.current_price).toFixed(2), String(t.qty ?? t.quantity ?? 0), (pnl >= 0 ? "+" : "") + pnl.toFixed(2), t.reason || "Manual"]
-        : [t.trade_ref, formatDate(t.opened_at), t.symbol, String(t.strategy_name ?? "—"), optType, t.mode || "PAPER", takenBy, formatTime(t.opened_at), Number(t.entry_price).toFixed(2), formatTime(t.closed_at), Number(t.current_price).toFixed(2), String(t.qty ?? t.quantity ?? 0), (pnl >= 0 ? "+" : "") + pnl.toFixed(2), t.reason || "Manual"];
+        ? [t.trade_ref, formatDate(t.closed_at ?? t.opened_at), String(t.username ?? "—"), t.symbol, String(t.strategy_name ?? "—"), optType, t.mode || "PAPER", takenBy, formatTime(t.opened_at), Number(t.entry_price).toFixed(2), formatTime(t.closed_at), Number(t.current_price).toFixed(2), String(t.qty ?? t.quantity ?? 0), (pnl >= 0 ? "+" : "") + pnl.toFixed(2), t.reason || "Manual"]
+        : [t.trade_ref, formatDate(t.closed_at ?? t.opened_at), t.symbol, String(t.strategy_name ?? "—"), optType, t.mode || "PAPER", takenBy, formatTime(t.opened_at), Number(t.entry_price).toFixed(2), formatTime(t.closed_at), Number(t.current_price).toFixed(2), String(t.qty ?? t.quantity ?? 0), (pnl >= 0 ? "+" : "") + pnl.toFixed(2), t.reason || "Manual"];
       return cells.map(escapeCsv).join(",");
     });
     const csv = [headers.join(","), ...rows].join("\n");
@@ -389,16 +389,16 @@ export default function ReportsPage() {
             <thead>
               <tr>
                 <th className="sortable-th" onClick={() => handleSort("trade_ref")}>TRADE ID {sortCol === "trade_ref" && (sortDir === "asc" ? "↑" : "↓")}</th>
-                <th className="sortable-th" onClick={() => handleSort("trade_date")}>TRADE DATE {sortCol === "trade_date" && (sortDir === "asc" ? "↑" : "↓")}</th>
+                <th className="sortable-th" onClick={() => handleSort("trade_date")}>TRADE DATE (IST) {sortCol === "trade_date" && (sortDir === "asc" ? "↑" : "↓")}</th>
                 {admin && <th className="sortable-th" onClick={() => handleSort("username")}>USER {sortCol === "username" && (sortDir === "asc" ? "↑" : "↓")}</th>}
                 <th className="sortable-th" onClick={() => handleSort("symbol")}>SYMBOL {sortCol === "symbol" && (sortDir === "asc" ? "↑" : "↓")}</th>
                 <th>STRATEGY</th>
                 <th>TYPE</th>
                 <th className="sortable-th" onClick={() => handleSort("mode")}>MODE {sortCol === "mode" && (sortDir === "asc" ? "↑" : "↓")}</th>
                 <th className="sortable-th" onClick={() => handleSort("manual_execute")}>TAKEN BY {sortCol === "manual_execute" && (sortDir === "asc" ? "↑" : "↓")}</th>
-                <th className="sortable-th" onClick={() => handleSort("opened_at")}>BUY TIME {sortCol === "opened_at" && (sortDir === "asc" ? "↑" : "↓")}</th>
+                <th className="sortable-th" onClick={() => handleSort("opened_at")}>BUY TIME (IST) {sortCol === "opened_at" && (sortDir === "asc" ? "↑" : "↓")}</th>
                 <th className="sortable-th" onClick={() => handleSort("entry_price")}>ENTRY {sortCol === "entry_price" && (sortDir === "asc" ? "↑" : "↓")}</th>
-                <th className="sortable-th" onClick={() => handleSort("closed_at")}>SELL TIME {sortCol === "closed_at" && (sortDir === "asc" ? "↑" : "↓")}</th>
+                <th className="sortable-th" onClick={() => handleSort("closed_at")}>SELL TIME (IST) {sortCol === "closed_at" && (sortDir === "asc" ? "↑" : "↓")}</th>
                 <th className="sortable-th" onClick={() => handleSort("current_price")}>EXIT {sortCol === "current_price" && (sortDir === "asc" ? "↑" : "↓")}</th>
                 <th className="sortable-th" onClick={() => handleSort("qty")}>QTY {sortCol === "qty" && (sortDir === "asc" ? "↑" : "↓")}</th>
                 <th className="sortable-th" onClick={() => handleSort("realized_pnl")}>P&L {sortCol === "realized_pnl" && (sortDir === "asc" ? "↑" : "↓")}</th>
@@ -421,7 +421,7 @@ export default function ReportsPage() {
                   return (
                     <tr key={`${t.trade_ref}-${i}`}>
                       <td className="cell-trade-id">{t.trade_ref}</td>
-                      <td>{formatDate(t.opened_at)}</td>
+                      <td>{formatDate(t.closed_at ?? t.opened_at)}</td>
                       {admin && <td>{t.username ?? "—"}</td>}
                       <td className="cell-symbol-full">{t.symbol}</td>
                       <td className="summary-label">{t.strategy_name || "—"}</td>

@@ -37,28 +37,29 @@ SELECT
     '{"win_rate_30d": 61.2, "pnl_30d": 12450.25}'::jsonb,
     '{
       "displayName": "TrendSnap Momentum",
-      "description": "Momentum crossover option strategy. Enters when short-term momentum confirms direction with price-action continuation and risk checks; exits use SL, target, and breakeven rules from Settings.",
+      "description": "Simple four-factor option read on the latest candle: close above VWAP (required gate), EMA9 above EMA21, RSI 50-75, volume above 1.1x average. Signal when at least three of four factors pass. Exits use SL, target, and breakeven from Settings.",
+      "includeEmaCrossoverInScore": false,
+      "strictBullishComparisons": true,
       "indicators": {
-        "adx": {"period": 14, "minThreshold": 20, "description": "ADX > 20 = strong trend. No signals when ADX < 20 (weak/choppy market)."},
-        "ema": {"fast": 9, "slow": 21, "description": "EMA9 > EMA21 = bullish momentum (short-term above long-term)"},
-        "emaCrossover": {"bonus": 1, "maxCandlesSinceCross": 10, "description": "Bullish crossover within last 10 candles"},
-        "ivr": {"bonus": 1, "maxThreshold": 25, "description": "IVR < 25 = low IV (cheap options) = +1 score bonus. IVR from Option Analytics per strike."},
-        "rsi": {"period": 14, "min": 45, "max": 75, "description": "RSI in 45-75 = not overbought, bullish zone"},
-        "vwap": {"description": "Price above VWAP = bullish intraday bias"},
-        "volumeSpike": {"minRatio": 1.15, "description": "Current volume > 1.15x average = confirmation (relaxed)"}
+        "ema": {"fast": 9, "slow": 21, "description": "EMA9 strictly above EMA21 adds one point."},
+        "emaCrossover": {"bonus": 0, "maxCandlesSinceCross": 10, "description": "Not counted in score; metadata only."},
+        "ivr": {"bonus": 0, "maxThreshold": 20, "description": "IVR for reference on the chain; no score bonus."},
+        "rsi": {"period": 14, "min": 50, "max": 75, "description": "RSI between 50 and 75 adds one point."},
+        "vwap": {"description": "Latest candle close strictly above VWAP is the primary gate and first point."},
+        "volumeSpike": {"minRatio": 1.1, "description": "Volume strictly above 1.1x recent average adds one point."}
       },
       "strikeSelection": {
-        "minOi": 10000,
-        "minVolume": 500,
+        "minOi": 5000,
+        "minVolume": 300,
         "maxOtmSteps": 3,
         "deltaPreferredCE": 0.45,
         "deltaPreferredPE": -0.45,
-        "description": "Liquidity: min OI 10k, min volume 500. Max 3 steps OTM to reduce theta decay. Best strike: delta ~0.45 CE / -0.45 PE. Rank by score, volume spike, OI change, delta fit, ATM distance."
+        "description": "Liquidity: min OI 5k, min volume 300. Max 3 steps OTM. Prefer delta near 0.45 CE / -0.45 PE; rank by score and fit."
       },
-      "scoreThreshold": 4,
-      "scoreMax": 6,
-      "autoTradeScoreThreshold": 5,
-      "scoreDescription": "Score 0-6: Primary(VWAP) + EMA + RSI + Volume + EMA crossover bonus + IVR bonus (when IVR<25). Crossover freshness: cross within 10 candles. ADX filter: no signals when ADX<20. Strike selection: liquidity (min OI/vol), rank by score, volume spike, OI change, delta fit. Signal when score >= 4. Auto-trade when score >= 5."
+      "scoreThreshold": 3,
+      "scoreMax": 4,
+      "autoTradeScoreThreshold": 4,
+      "scoreDescription": "Primary: latest option close must be above VWAP (otherwise no signal). Score 0-4: +1 VWAP pass, +1 EMA9 above EMA21, +1 RSI 50-75, +1 volume above 1.1x average. No crossover or IVR points. Eligible BUY CE/PE when score is at least 3."
     }'::jsonb,
     u.id
 FROM s004_users u
@@ -182,7 +183,7 @@ INSERT INTO s004_strategy_catalog (
 )
 SELECT
     'strat-trendpulse-z',
-    '1.0.0',
+    '1.1.0',
     'TrendPulse Z (Balanced)',
     'NIFTY long options when z-scored price momentum crosses volume momentum on 5m and 15m HTF bias agrees. ADX gate on ST; chain IVR cap per strike. See docs/strategies/TRENDPULSE_Z_IMPLEMENTATION_PLAN.md.',
     'MEDIUM',
@@ -208,6 +209,11 @@ SELECT
         "htfEmaSlow": 34,
         "ivRankMaxPercentile": 70,
         "candleDaysBack": 5,
+        "minDteCalendarDays": 2,
+        "niftyWeeklyExpiryWeekday": "TUE",
+        "maxOptionPremiumInr": 80,
+        "selectStrikeByMaxGamma": true,
+        "maxStrikeRecommendations": 1,
         "session": { "enabled": false, "blockFirstMinutes": 15, "blockLastMinutes": 25 },
         "breadth": { "enabled": false, "requireSpotAligned": true, "minAbsSpotChgPct": 0.05, "requirePcrAligned": false }
       },
@@ -239,7 +245,7 @@ SET display_name = EXCLUDED.display_name,
     strategy_details_json = COALESCE(EXCLUDED.strategy_details_json, s004_strategy_catalog.strategy_details_json),
     updated_at = NOW();
 
--- NIFTY naked short premium: high chain IVR + spot trend; bullish -> short PE, bearish -> short CE
+-- NIFTY naked short premium: chain IVR + strike-leg regime (ema_cross_vwap); bullish -> short PE, bearish -> short CE
 INSERT INTO s004_strategy_catalog (
     strategy_id,
     version,
@@ -256,9 +262,9 @@ INSERT INTO s004_strategy_catalog (
 )
 SELECT
     'strat-nifty-ivr-trend-short',
-    '1.0.0',
+    '1.1.0',
     'Nifty IVR Trend Short',
-    'NIFTY-only naked short options when implied-vol rank (within chain) is elevated and NIFTY spot trend aligns: sell put in uptrend, sell call in downtrend. |Delta| 0.29-0.35. Requires margin; not suitable for small accounts.',
+    'NIFTY naked short premium: per-strike leg regime (EMA9/21 cross + LTP vs leg VWAP), chain IVR band, |delta| 0.29–0.35. High risk; margin required.',
     'HIGH',
     'ADMIN',
     'PUBLISHED',
@@ -266,32 +272,38 @@ SELECT
     ARRAY['NIFTY'],
     '{"win_rate_30d": 0, "pnl_30d": 0}'::jsonb,
     '{
+      "strategyType": "rule-based",
       "positionIntent": "short_premium",
       "displayName": "Nifty IVR Trend Short",
-      "description": "NIFTY spot + chain only. Sells naked PE when spot trend is bullish and naked CE when bearish. Requires elevated chain IVR (IV rank proxy). Strikes limited to |delta| 0.29-0.35. Lot size, target points, and stop loss from Settings apply on execution.",
+      "description": "NIFTY short premium. Regime is per strike on each option leg (not index spot): on that leg LTP series, fresh EMA9 cross above EMA21 within emaCrossover.maxCandlesSinceCross (default 5) and last close < leg VWAP → eligible sell PE. Fresh EMA9 cross below EMA21 and last close < leg VWAP → eligible sell CE. If both legs qualify at the same strike, the more recent cross wins. Chain IVR must lie between min and max leg thresholds. No ADX. Option-leg score excludes volume spike. No min OI/volume when both are 0.",
+      "spotRegimeMode": "ema_cross_vwap",
+      "spotRegimeSatisfiedScore": 5,
+      "includeVolumeInLegScore": false,
       "indicators": {
-        "adx": {"period": 14, "minThreshold": 20, "description": "ADX > 20 on NIFTY spot: skip signals in weak/choppy markets."},
-        "ema": {"fast": 9, "slow": 21, "description": "NIFTY spot EMA alignment defines bullish vs bearish regime."},
-        "emaCrossover": {"bonus": 0, "maxCandlesSinceCross": 10, "description": "Fresh bullish/bearish EMA cross within last 10 spot candles contributes to score."},
-        "ivr": {"minThreshold": 55, "description": "Per-strike IVR (percentile within same expiry chain) must be >= 55 — elevated IV vs that chain."},
-        "rsi": {"period": 14, "min": 45, "max": 75, "description": "Bullish spot RSI band for uptrend score; bearish score uses mirrored lower band."},
-        "vwap": {"description": "NIFTY spot vs VWAP for trend direction."},
-        "volumeSpike": {"minRatio": 1.15, "description": "Spot volume vs recent average on NIFTY."}
+        "ema": {"fast": 9, "slow": 21, "description": "EMA9 vs EMA21 on each option leg LTP series; regime uses a fresh crossover on that leg."},
+        "emaCrossover": {"bonus": 0, "maxCandlesSinceCross": 5, "description": "Fresh cross within this many candles on the leg LTP series (default 5 if unset)."},
+        "ivr": {"minThreshold": 30, "maxLegThreshold": 55, "description": "Per-strike chain IVR must be between minThreshold and maxLegThreshold (inclusive)."},
+        "rsi": {"period": 14, "min": 45, "max": 85, "description": "RSI band for option-leg premium scoring; bearish leg uses mirrored lower band."},
+        "vwap": {"description": "Leg last close vs leg VWAP: required LTP close < VWAP for both sell-PE and sell-CE regime paths (spotRegimeMode ema_cross_vwap)."}
       },
       "strikeSelection": {
-        "minOi": 10000,
-        "minVolume": 500,
+        "minOi": 0,
+        "minVolume": 0,
         "maxOtmSteps": 4,
         "deltaPreferredCE": 0.32,
         "deltaPreferredPE": -0.32,
         "deltaMinAbs": 0.29,
         "deltaMaxAbs": 0.35,
-        "description": "Liquid strikes; short leg absolute delta between 0.29 and 0.35."
+        "minDteCalendarDays": 2,
+        "niftyWeeklyExpiryWeekday": "TUE",
+        "selectStrikeByMinGamma": true,
+        "maxStrikeRecommendations": 1,
+        "description": "|delta| 0.29–0.35; DTE >= 2; Tuesday weekly preference. Lowest BS gamma in band. No minimum OI/volume."
       },
-      "scoreThreshold": 4,
-      "scoreMax": 5,
+      "scoreThreshold": 3,
+      "scoreMax": 4,
       "autoTradeScoreThreshold": 4,
-      "scoreDescription": "Spot trend score 0-5 on NIFTY (VWAP, EMA, crossover, RSI band, volume). Bullish regime: sell PE only. Bearish regime: sell CE only. Leg must have chain IVR >= minThreshold and |delta| in band. Signal when spot score >= 4."
+      "scoreDescription": "Strike-leg regime via regimeSellPe / regimeSellCe (EMA9/21 cross + LTP < leg VWAP on that leg; tie-break if both). No NIFTY spot trend score for this mode. Option leg score up to 4 (VWAP/EMA/cross/RSI; volume spike off). Leg IVR in [minThreshold, maxLegThreshold]. Auto-trade at autoTradeScoreThreshold."
     }'::jsonb,
     u.id
 FROM s004_users u
@@ -351,7 +363,7 @@ INSERT INTO s004_strategy_config_versions (
 )
 SELECT
     'strat-nifty-ivr-trend-short',
-    '1.0.0',
+    '1.1.0',
     1,
     '{
       "timeframe": "3-min",
@@ -364,6 +376,38 @@ SELECT
     TRUE,
     u.id,
     'NIFTY short premium template'
+FROM s004_users u
+WHERE u.username = 'admin'
+ON CONFLICT (strategy_id, strategy_version, config_version) DO UPDATE
+SET config_json = EXCLUDED.config_json,
+    active = EXCLUDED.active,
+    changed_by = EXCLUDED.changed_by,
+    changed_reason = EXCLUDED.changed_reason;
+
+INSERT INTO s004_strategy_config_versions (
+    strategy_id,
+    strategy_version,
+    config_version,
+    config_json,
+    active,
+    changed_by,
+    changed_reason
+)
+SELECT
+    'strat-trendpulse-z',
+    '1.1.0',
+    1,
+    '{
+      "timeframe": "3-min",
+      "min_entry_strength_pct": 0,
+      "max_strike_distance_atm": 5,
+      "target_points": 10,
+      "sl_points": 15,
+      "trailing_sl_points": 20
+    }'::jsonb,
+    TRUE,
+    u.id,
+    'TrendPulse Z execution template'
 FROM s004_users u
 WHERE u.username = 'admin'
 ON CONFLICT (strategy_id, strategy_version, config_version) DO UPDATE
@@ -470,7 +514,7 @@ SELECT
     10,
     20,
     '3-min',
-    '09:20',
+    '09:15',
     '15:00',
     ARRAY['NIFTY'],
     3

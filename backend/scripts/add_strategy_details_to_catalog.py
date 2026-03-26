@@ -13,32 +13,33 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 DEFAULT_DETAILS = {
     "displayName": "TrendSnap Momentum",
-    "description": "Momentum crossover option strategy. Enters when short-term momentum confirms direction with price-action continuation and risk checks; exits use SL, target, and breakeven rules from Settings.",
+    "description": "Simple four-factor option read: close above VWAP (gate), EMA9 above EMA21, RSI 50-75, volume above 1.1x average. Signal when at least three of four pass.",
+    "includeEmaCrossoverInScore": False,
+    "strictBullishComparisons": True,
     "indicators": {
-        "ema": {"fast": 9, "slow": 21, "description": "EMA9 > EMA21 = bullish momentum (short-term above long-term)"},
+        "ema": {"fast": 9, "slow": 21, "description": "EMA9 strictly above EMA21 adds one point."},
         "emaCrossover": {
-            "bonus": 1,
+            "bonus": 0,
             "maxCandlesSinceCross": 3,
-            "description": "Fast EMA crossed above slow EMA from lower to upper = +1 score bonus (bullish crossover). Freshness: cross within last 3 candles.",
+            "description": "Not counted in score; metadata only.",
         },
-        "rsi": {"period": 14, "min": 50, "max": 75, "description": "RSI in 50-75 = not overbought, bullish zone"},
-        "vwap": {"description": "Price above VWAP = bullish intraday bias"},
-        "volumeSpike": {"minRatio": 1.5, "description": "Current volume > 1.5x average = confirmation"},
-        "ivr": {"maxThreshold": 20, "bonus": 1, "description": "IVR < 20 = low IV (cheap options) = +1 score bonus. IVR from Option Analytics per strike."},
-        "adx": {"period": 14, "minThreshold": 25, "description": "ADX > 25 = strong trend. No signals when ADX < 25 (weak/choppy market)."},
+        "rsi": {"period": 14, "min": 50, "max": 75, "description": "RSI between 50 and 75 adds one point."},
+        "vwap": {"description": "Latest candle close strictly above VWAP is the primary gate and first point."},
+        "volumeSpike": {"minRatio": 1.1, "description": "Volume strictly above 1.1x recent average adds one point."},
+        "ivr": {"maxThreshold": 20, "bonus": 0, "description": "IVR for reference; no score bonus."},
     },
     "strikeSelection": {
-        "minOi": 10000,
-        "minVolume": 500,
+        "minOi": 5000,
+        "minVolume": 300,
         "maxOtmSteps": 3,
         "deltaPreferredCE": 0.35,
         "deltaPreferredPE": -0.35,
-        "description": "Liquidity: min OI 10k, min volume 500. Max 3 steps OTM to reduce theta decay. Best strike: delta ~0.35 CE / -0.35 PE. Rank by score, volume spike, OI change, delta fit, ATM distance.",
+        "description": "Liquidity: min OI 5k, min volume 300. Max 3 steps OTM. Prefer delta near 0.35 CE / -0.35 PE.",
     },
     "scoreThreshold": 3,
-    "scoreMax": 6,
+    "scoreMax": 4,
     "autoTradeScoreThreshold": 4,
-    "scoreDescription": "Score 0-6: Primary(VWAP) + EMA + RSI + Volume + EMA crossover bonus + IVR bonus (when IVR<20). Crossover freshness: cross within 3 candles. ADX filter: no signals when ADX<25. Strike selection: liquidity (min OI/vol), rank by score, volume spike, OI change, delta fit. Signal when score >= 3. Auto-trade when score >= 4.",
+    "scoreDescription": "Primary: close must be above VWAP. Score 0-4: VWAP, EMA9>EMA21, RSI 50-75, volume>1.1x avg. No crossover or IVR points. BUY CE/PE when score >= 3.",
 }
 
 

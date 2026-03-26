@@ -2,7 +2,7 @@
 
 import { useId, useMemo } from "react";
 
-/** Top-right ? on a `.landing-widget-help-host`; tooltip on hover over host or focus on ? */
+/** Top-right ? on a `.landing-widget-help-host`; tooltip only when hovering or focusing the ? (see globals.css). */
 export function LandingWidgetHelp({ meaning, usage }: { meaning: string; usage: string }) {
   return (
     <div className="landing-widget-help" role="presentation">
@@ -154,7 +154,14 @@ export function RegimeBadge({ regime, loading, compact = false }: { regime: stri
   );
 }
 
-type Driver = { key: string; label: string; impact: number; direction: "bullish" | "bearish" };
+type Driver = {
+  key: string;
+  label: string;
+  impact: number;
+  direction: "bullish" | "bearish";
+  /** Raw metric context; impact is weighted contribution to direction score. */
+  reading?: string;
+};
 
 /** Cumulative bridge: each segment extends from running balance by driver impact (scaled). */
 export function CumulativeWaterfall({ drivers, dense = false }: { drivers: Driver[]; dense?: boolean }) {
@@ -230,9 +237,16 @@ export function CumulativeWaterfall({ drivers, dense = false }: { drivers: Drive
           {barRows.map((d) => (
             <li key={d.key} className="landing-wf-row">
               <span className={`landing-wf-row-dot ${d.direction === "bullish" ? "bull" : "bear"}`} title={d.label} />
-              <span className="landing-wf-row-label" title={d.label}>
-                {d.label}
-              </span>
+              <div className="landing-wf-row-meta">
+                <span className="landing-wf-row-label" title={d.reading ? `${d.label} — ${d.reading}` : d.label}>
+                  {d.label}
+                </span>
+                {d.reading ? (
+                  <span className="landing-wf-row-reading muted" title={d.reading}>
+                    {d.reading}
+                  </span>
+                ) : null}
+              </div>
               <div className="landing-wf-row-track">
                 <div className="landing-wf-row-mid" />
                 <div
@@ -240,7 +254,10 @@ export function CumulativeWaterfall({ drivers, dense = false }: { drivers: Drive
                   style={{ width: `${d.w}%`, left: d.left }}
                 />
               </div>
-              <span className={`landing-wf-row-val ${d.impact >= 0 ? "pos" : "neg"}`}>
+              <span
+                className={`landing-wf-row-val ${d.impact >= 0 ? "pos" : "neg"}`}
+                title="Weighted push on direction score (not raw PCR/OI)"
+              >
                 {d.impact > 0 ? "+" : ""}
                 {d.impact.toFixed(1)}
               </span>
@@ -272,8 +289,10 @@ export function CumulativeWaterfall({ drivers, dense = false }: { drivers: Drive
         {drivers.map((d) => (
           <li key={d.key}>
             <span className={`landing-wf-dot ${d.direction === "bullish" ? "bull" : "bear"}`} />
-            <span className="landing-wf-name">{d.label}</span>
-            <span className={d.impact >= 0 ? "pos" : "neg"}>
+            <span className="landing-wf-name" title={d.reading}>
+              {d.label}
+            </span>
+            <span className={d.impact >= 0 ? "pos" : "neg"} title={d.reading}>
               {d.impact > 0 ? "+" : ""}
               {d.impact.toFixed(1)}
             </span>
@@ -287,6 +306,64 @@ export function CumulativeWaterfall({ drivers, dense = false }: { drivers: Drive
           </span>
         </li>
       </ul>
+    </div>
+  );
+}
+
+/** CE vs PE strength split + wing label (full = playbook line; compact = bar only for Drivers). */
+export function CePeFlowArena({
+  cePct,
+  pePct,
+  wingLabel,
+  tilt,
+  playbookHeadline,
+  loading,
+  variant = "full",
+}: {
+  cePct: number;
+  pePct: number;
+  wingLabel: string;
+  tilt: string;
+  playbookHeadline: string;
+  loading: boolean;
+  variant?: "full" | "compact";
+}) {
+  const ce = loading ? 50 : Math.max(10, Math.min(90, Math.round(Number(cePct) || 50)));
+  const pe = loading ? 50 : Math.max(10, Math.min(90, Math.round(Number(pePct) || 50)));
+  const normCe = Math.round((ce / (ce + pe)) * 100);
+  const normPe = 100 - normCe;
+  const tiltKey = (tilt || "NEUTRAL").toLowerCase();
+
+  return (
+    <div className={`landing-cepe-arena${variant === "compact" ? " landing-cepe-arena--compact" : ""}`}>
+      <div className="landing-cepe-arena-top">
+        <span className={`landing-cepe-arena-wing landing-cepe-arena-wing--${tiltKey}`}>
+          {loading ? "…" : wingLabel}
+        </span>
+        {variant === "full" ? (
+          <span className="landing-cepe-arena-tilt-tag" data-tilt={tiltKey}>
+            {loading ? "—" : `Tilt: ${tilt}`}
+          </span>
+        ) : null}
+      </div>
+      <div
+        className="landing-cepe-split"
+        role="img"
+        aria-label={loading ? "Loading CE versus PE strength" : `CE strength ${normCe} percent, PE ${normPe} percent`}
+      >
+        <div className="landing-cepe-split-mid" aria-hidden />
+        <div className="landing-cepe-split-ce" style={{ flexGrow: Math.max(1, normCe) }}>
+          <span className="landing-cepe-split-k">CE</span>
+          <span className="landing-cepe-split-v">{loading ? "—" : `${normCe}%`}</span>
+        </div>
+        <div className="landing-cepe-split-pe" style={{ flexGrow: Math.max(1, normPe) }}>
+          <span className="landing-cepe-split-v">{loading ? "—" : `${normPe}%`}</span>
+          <span className="landing-cepe-split-k">PE</span>
+        </div>
+      </div>
+      {variant === "full" ? (
+        <p className="landing-cepe-playbook-head">{loading ? "…" : playbookHeadline}</p>
+      ) : null}
     </div>
   );
 }

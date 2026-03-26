@@ -16,6 +16,16 @@ def validate_strategy_details(details: dict) -> list[str]:
 
     strategy_type = str(details.get("strategyType", "rule-based")).strip().lower()
 
+    for bool_key in ("includeEmaCrossoverInScore", "strictBullishComparisons", "includeVolumeInLegScore"):
+        if bool_key in details and not isinstance(details.get(bool_key), bool):
+            errors.append(f"'{bool_key}' must be a boolean.")
+
+    if "spotRegimeMode" in details and not isinstance(details.get("spotRegimeMode"), str):
+        errors.append("'spotRegimeMode' must be a string.")
+    srs = details.get("spotRegimeSatisfiedScore")
+    if srs is not None and not isinstance(srs, (int, float)):
+        errors.append("'spotRegimeSatisfiedScore' must be a number.")
+
     if strategy_type == "trendpulse-z":
         tpz = details.get("trendPulseZ")
         if tpz is not None and not isinstance(tpz, dict):
@@ -46,6 +56,27 @@ def validate_strategy_details(details: dict) -> list[str]:
             ]:
                 if key in tpz and not isinstance(tpz.get(key), (int, float)):
                     errors.append(f"'{label}' must be a number.")
+            md = tpz.get("minDteCalendarDays")
+            if md is not None and (
+                type(md) is bool or not isinstance(md, int) or md < 0 or md > 120
+            ):
+                errors.append("'trendPulseZ.minDteCalendarDays' must be an integer 0–120.")
+            nw = tpz.get("niftyWeeklyExpiryWeekday")
+            if nw is not None and not isinstance(nw, (int, str)):
+                errors.append("'trendPulseZ.niftyWeeklyExpiryWeekday' must be an int 0–6, weekday name, or 'ANY'.")
+            mop = tpz.get("maxOptionPremiumInr")
+            if mop is not None and (
+                type(mop) is bool or not isinstance(mop, (int, float)) or float(mop) < 0
+            ):
+                errors.append("'trendPulseZ.maxOptionPremiumInr' must be a non-negative number (0 disables cap).")
+            msr = tpz.get("maxStrikeRecommendations")
+            if msr is not None and (
+                type(msr) is bool or not isinstance(msr, int) or msr < 1 or msr > 10
+            ):
+                errors.append("'trendPulseZ.maxStrikeRecommendations' must be an integer 1–10.")
+            if "selectStrikeByMaxGamma" in tpz and tpz.get("selectStrikeByMaxGamma") is not None:
+                if not isinstance(tpz.get("selectStrikeByMaxGamma"), bool):
+                    errors.append("'trendPulseZ.selectStrikeByMaxGamma' must be a boolean.")
         pi = str(details.get("positionIntent", "long_premium")).strip().lower()
         if pi and pi != "long_premium":
             errors.append("TrendPulse Z requires positionIntent 'long_premium'.")
@@ -109,6 +140,8 @@ def validate_strategy_details(details: dict) -> list[str]:
                     errors.append("'indicators.ivr.maxThreshold' must be a number.")
                 if "minThreshold" in val and not isinstance(val.get("minThreshold"), (int, float)):
                     errors.append("'indicators.ivr.minThreshold' must be a number.")
+                if "maxLegThreshold" in val and not isinstance(val.get("maxLegThreshold"), (int, float)):
+                    errors.append("'indicators.ivr.maxLegThreshold' must be a number.")
             elif isinstance(val, dict) and key == "volumeSpike":
                 if "minRatio" in val and not isinstance(val.get("minRatio"), (int, float)):
                     errors.append("'indicators.volumeSpike.minRatio' must be a number.")
@@ -132,6 +165,24 @@ def validate_strategy_details(details: dict) -> list[str]:
             errors.append("'strikeSelection.deltaMinAbs' must be a number.")
         if "deltaMaxAbs" in strike and not isinstance(strike.get("deltaMaxAbs"), (int, float)):
             errors.append("'strikeSelection.deltaMaxAbs' must be a number.")
+        md = strike.get("minDteCalendarDays")
+        if md is not None and (
+            type(md) is bool or not isinstance(md, int) or md < 0 or md > 120
+        ):
+            errors.append("'strikeSelection.minDteCalendarDays' must be an integer 0–120.")
+        nw = strike.get("niftyWeeklyExpiryWeekday")
+        if nw is not None and not isinstance(nw, (int, str)):
+            errors.append(
+                "'strikeSelection.niftyWeeklyExpiryWeekday' must be an int 0–6, weekday name, or 'ANY'."
+            )
+        if "selectStrikeByMinGamma" in strike and strike.get("selectStrikeByMinGamma") is not None:
+            if not isinstance(strike.get("selectStrikeByMinGamma"), bool):
+                errors.append("'strikeSelection.selectStrikeByMinGamma' must be a boolean.")
+        msr = strike.get("maxStrikeRecommendations")
+        if msr is not None and (
+            type(msr) is bool or not isinstance(msr, int) or msr < 1 or msr > 10
+        ):
+            errors.append("'strikeSelection.maxStrikeRecommendations' must be an integer 1–10.")
 
     # score thresholds
     for key, label in [

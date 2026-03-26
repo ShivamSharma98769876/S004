@@ -8,6 +8,7 @@ from pydantic import BaseModel
 
 from app.api.auth_context import get_user_id
 from app.db_client import ensure_user, execute, fetch, fetchrow
+from app.services.ist_time_sql import IST_TODAY, closed_at_ist_date_bare
 from app.services.platform_risk import (
     evaluate_trade_entry_allowed,
     get_platform_trading_paused,
@@ -85,29 +86,87 @@ class EnginePayload(BaseModel):
     mode: str = "PAPER"
 
 
+async def _active_strategy_for_banner(user_id: int) -> dict | None:
+    """
+    Read-only: strategy for the status strip. Always requires an ACTIVE subscription so we never
+    show a stale settings row for a strategy the user is no longer subscribed to.
+    """
+    row = await fetchrow(
+        """
+        SELECT s.strategy_id, s.strategy_version, c.display_name
+        FROM s004_user_strategy_settings s
+        JOIN s004_strategy_subscriptions sub
+            ON sub.user_id = s.user_id AND sub.strategy_id = s.strategy_id AND sub.strategy_version = s.strategy_version
+        JOIN s004_strategy_catalog c ON c.strategy_id = s.strategy_id AND c.version = s.strategy_version
+        WHERE s.user_id = $1 AND sub.status = 'ACTIVE'
+        ORDER BY s.updated_at DESC
+        LIMIT 1
+        """,
+        user_id,
+    )
+    if row:
+        sid = str(row["strategy_id"])
+        ver = str(row["strategy_version"])
+        dn = row.get("display_name")
+        return {
+            "strategyId": sid,
+            "strategyVersion": ver,
+            "displayName": str(dn).strip() if dn else sid,
+        }
+    row = await fetchrow(
+        """
+        SELECT sub.strategy_id, sub.strategy_version, c.display_name
+        FROM s004_strategy_subscriptions sub
+        JOIN s004_strategy_catalog c ON c.strategy_id = sub.strategy_id AND c.version = sub.strategy_version
+        WHERE sub.user_id = $1 AND sub.status = 'ACTIVE'
+        ORDER BY sub.updated_at DESC
+        LIMIT 1
+        """,
+        user_id,
+    )
+    if row:
+        sid = str(row["strategy_id"])
+        ver = str(row["strategy_version"])
+        dn = row.get("display_name")
+        return {
+            "strategyId": sid,
+            "strategyVersion": ver,
+            "displayName": str(dn).strip() if dn else sid,
+        }
+    return None
+
+
 @router.get("/engine")
 async def get_engine_status(user_id: int = Depends(get_user_id)) -> dict:
     await ensure_user(user_id)
-    """Return engine_running, mode, broker status, shared API, and kite source for dashboard."""
+    """Return engine_running, mode, broker status, shared API, kite source, and resolved active strategy for dashboard."""
     row = await fetchrow(
         """
         SELECT m.engine_running, m.mode, m.broker_connected, m.shared_api_connected,
-               u.role, u.approved_live
+               u.role, u.approved_live,
+               COALESCE(m.platform_api_online, TRUE) AS platform_api_online,
+               COALESCE(m.max_trades_day, 4) AS max_trades_day
         FROM s004_user_master_settings m
         LEFT JOIN s004_users u ON u.id = m.user_id
         WHERE m.user_id = $1
         """,
         user_id,
     )
+    active_strategy = await _active_strategy_for_banner(user_id)
     if not row:
-        return {
+        out: dict = {
             "engineRunning": False,
             "mode": "PAPER",
             "brokerConnected": False,
             "sharedApiConnected": True,
             "isAdmin": False,
             "kiteStatus": "shared",
+            "platformApiOnline": True,
+            "maxTradesDay": 4,
         }
+        if active_strategy:
+            out["activeStrategy"] = active_strategy
+        return out
     broker_connected = bool(row.get("broker_connected"))
     shared_api = bool(row.get("shared_api_connected", True))
     is_admin = row and str(row.get("role", "")).upper() == "ADMIN"
@@ -130,14 +189,19 @@ async def get_engine_status(user_id: int = Depends(get_user_id)) -> dict:
         kite_status = "shared"
     else:
         kite_status = "none"
-    return {
+    out = {
         "engineRunning": bool(row.get("engine_running")),
         "mode": mode,
         "brokerConnected": broker_connected,
         "sharedApiConnected": shared_api,
         "isAdmin": is_admin,
         "kiteStatus": kite_status,
+        "platformApiOnline": bool(row.get("platform_api_online", True)),
+        "maxTradesDay": int(row.get("max_trades_day") or 4),
     }
+    if active_strategy:
+        out["activeStrategy"] = active_strategy
+    return out
 
 
 @router.put("/engine")
@@ -236,7 +300,7 @@ async def get_dashboard_summary(user_id: int = Depends(get_user_id)) -> dict:
     open_trades = int(open_count["n"] or 0) if open_count else 0
 
     today_stats = await fetchrow(
-        """
+        f"""
         SELECT
             COUNT(*) AS closed_today,
             COALESCE(SUM(realized_pnl), 0) AS realized_today,
@@ -245,7 +309,7 @@ async def get_dashboard_summary(user_id: int = Depends(get_user_id)) -> dict:
         WHERE user_id = $1
           AND current_state = 'EXIT'
           AND closed_at IS NOT NULL
-          AND closed_at::date = CURRENT_DATE
+          AND {closed_at_ist_date_bare()} = {IST_TODAY}
         """,
         user_id,
         charges_per_trade,
@@ -266,7 +330,7 @@ async def get_dashboard_summary(user_id: int = Depends(get_user_id)) -> dict:
         )
         lot_size = int(lot_size_row["lot_size"] or 65) if lot_size_row else 65
         stt_row = await fetchrow(
-            """
+            f"""
             SELECT
                 COALESCE(SUM(entry_price * quantity * $2), 0) AS buy_value,
                 COALESCE(SUM(COALESCE(current_price, entry_price) * quantity * $2), 0) AS sell_value
@@ -274,7 +338,7 @@ async def get_dashboard_summary(user_id: int = Depends(get_user_id)) -> dict:
             WHERE user_id = $1
               AND current_state = 'EXIT'
               AND closed_at IS NOT NULL
-              AND closed_at::date = CURRENT_DATE
+              AND {closed_at_ist_date_bare()} = {IST_TODAY}
             """,
             user_id,
             lot_size,

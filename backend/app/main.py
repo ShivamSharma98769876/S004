@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -12,6 +13,7 @@ from app.api import (
     routes_analytics,
     routes_auth,
     routes_dashboard,
+    routes_evolution,
     routes_health,
     routes_landing,
     routes_marketplace,
@@ -49,6 +51,11 @@ async def lifespan(_: FastAPI):
                 await t
             except asyncio.CancelledError:
                 pass
+        # Let in-flight HTTP handlers release connections before closing the pool
+        # (avoids asyncpg "pool is closing" when stopping uvicorn with Ctrl+C).
+        delay = float(os.getenv("DB_POOL_CLOSE_DELAY_SEC", "1.0"))
+        if delay > 0:
+            await asyncio.sleep(delay)
         await close_db_pool()
 
 
@@ -72,6 +79,7 @@ def create_app() -> FastAPI:
     app.include_router(routes_health.router, prefix="/api")
     app.include_router(routes_auth.router, prefix="/api")
     app.include_router(routes_admin.router, prefix="/api")
+    app.include_router(routes_evolution.router, prefix="/api")
     app.include_router(routes_marketplace.router, prefix="/api")
     app.include_router(routes_analytics.router, prefix="/api")
     app.include_router(routes_settings.router, prefix="/api")

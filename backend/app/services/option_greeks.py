@@ -125,6 +125,38 @@ def time_to_expiry_years(expiry_date: date) -> float:
     return max(1e-4, delta / 365.25)
 
 
+def bs_gamma(S: float, K: float, T: float, r: float, sigma: float) -> float:
+    """Black–Scholes gamma (same for CE and PE)."""
+    if T <= 0 or sigma <= 0 or S <= 0:
+        return 0.0
+    d1 = _d1(S, K, T, r, sigma)
+    return _norm_pdf(d1) / (S * sigma * math.sqrt(T))
+
+
+def compute_gamma_from_ltp(
+    spot: float,
+    strike: float,
+    expiry_date: date,
+    ltp: float,
+    option_type: str,
+    r: float = DEFAULT_R,
+) -> float:
+    """Gamma from market LTP via implied vol (same BS pipeline as ``compute_greeks``)."""
+    if spot <= 0 or ltp <= 0:
+        return 0.0
+    ot = (option_type or "").upper().strip()
+    if ot not in ("CE", "PE"):
+        return 0.0
+    T = max(1e-4, time_to_expiry_years(expiry_date))
+    if ot == "CE":
+        iv = iv_call_bisection(spot, strike, T, r, ltp)
+    else:
+        iv = iv_put_bisection(spot, strike, T, r, ltp)
+    if iv <= 1e-9:
+        return 0.0
+    return float(bs_gamma(spot, strike, T, r, iv))
+
+
 def compute_greeks(
     spot: float,
     strike: float,
