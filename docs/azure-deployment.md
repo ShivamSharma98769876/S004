@@ -14,8 +14,8 @@ So you must set **`NEXT_PUBLIC_API_URL`** to the **public https URL of the API W
 
 ## 1. API Web App (Python)
 
-1. Create **Web App** → **Linux** → runtime **Python 3.12** (or supported 3.11+).
-2. Deploy the **`backend/`** folder contents as the app root (ZIP, GitHub Action, or VS Code Azure extension so that `app/`, `requirements.txt`, and `startup.sh` sit at the site root, e.g. `/home/site/wwwroot`).
+1. Create **Web App** → **Linux** → runtime **Python 3.12** (or supported 3.11+). **Do not use Python 3.13** for this stack: `pydantic==2.7.1` / `pydantic-core` use a Rust extension whose PyO3 version does not support 3.13, and Oryx will fail building wheels (`PyO3's maximum supported version (3.12)`). The repo includes **`runtime.txt`** (`python-3.12`) next to `requirements.txt` so Oryx targets 3.12 when it honors that file; you should still set the app stack to **3.12** in the portal (**Configuration → General settings** / stack) so the runtime matches.
+2. Deploy the **`backend/`** folder contents as the app root (ZIP, GitHub Action, or VS Code Azure extension so that `app/`, `requirements.txt`, `runtime.txt`, and `startup.sh` sit at the site root, e.g. `/home/site/wwwroot`).
 3. **Configuration → General settings → Startup Command**:
 
    ```bash
@@ -96,9 +96,24 @@ Provision **Azure Database for PostgreSQL** (Flexible Server). Run your schema/s
 
 ## 5. CI/CD (optional)
 
-- **GitHub Actions**: two jobs or matrix — deploy `backend/` to the API app and `frontend/` to the UI app (`azure/webapps-deploy` with `package` path).
+- **GitHub Actions**: deploy `backend/` to the API Web App and `frontend/` to the UI Web App (`Azure/webapps-deploy` with a `.zip` `package` path), or use **Deployment Center** / matrix jobs as you prefer.
 - **Deployment Center**: connect the repo twice (different Web Apps) or use monorepo build steps with different `app-path` outputs.
 - **Without Oryx**: use the sample workflow [`.github/workflows/azure-webapps-deploy-no-oryx.yml`](../.github/workflows/azure-webapps-deploy-no-oryx.yml) (`workflow_dispatch`) or the patterns in [Azure actions-workflow-samples — App Service](https://github.com/Azure/actions-workflow-samples/tree/master/AppService).
+
+### Secrets for `.github/workflows/main_s004.yml` (API deploy on push to `main`)
+
+| Secret | Value |
+|--------|--------|
+| `AZURE_WEBAPP_API_NAME` | App Service **Name** from Portal → **Overview** (exact string). |
+| `AZURE_WEBAPP_API_PUBLISH_PROFILE` | Entire contents of **Get publish profile** (`.PublishSettings` XML). Same secret name as in `azure-webapps-deploy-no-oryx.yml`. |
+
+### GitHub deploy: `ENOTFOUND` / `getaddrinfo ENOTFOUND` on `*.scm.*.azurewebsites.net`
+
+The deploy action talks to **Kudu/SCM** at **`https://<app-name>.scm.azurewebsites.net`**. If your publish profile or tooling produced a URL like **`<app>.scm.southindia-01.azurewebsites.net`**, that hostname is **not valid** for public DNS and the runner will fail with **`ENOTFOUND`**.
+
+**Fix:** In Azure Portal → your Web App → **Get publish profile** → download the `.PublishSettings` file → copy the **entire** XML into **`AZURE_WEBAPP_API_PUBLISH_PROFILE`**. In that XML, **`publishUrl`** for the MSDeploy profile should end with **`.scm.azurewebsites.net`** (no region segment such as `southindia-01` before `azurewebsites.net`).
+
+Set **`AZURE_WEBAPP_API_NAME`** to the same **name** as on the **Overview** tab. If you see **Failed to get app runtime OS**, the name or publish profile usually does not match the app; fix both as above.
 
 ---
 

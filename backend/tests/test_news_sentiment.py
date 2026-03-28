@@ -71,5 +71,5 @@ def test_compute_news_sentiment_snapshot_mocked() -> None:
         out = asyncio.run(ns.compute_news_sentiment_snapshot(force_refresh=True))
     assert out["headlineCount"] >= 1
     assert out["aggregateLabel"] in ("POSITIVE", "NEGATIVE", "NEUTRAL")
-    assert out["methodologyVersion"] == "lexicon-rss-v1"
+    assert out["methodologyVersion"] == "lexicon-rss-v2"
     assert isinstance(out["items"], list)

@@ -16,16 +16,25 @@ import httpx
 
 IST = ZoneInfo("Asia/Kolkata")
 
+# Default mix: India markets + global business/markets + commodities/energy (FII/crude/macro → India).
+# Override entirely with env NEWS_RSS_URLS (comma-separated).
 _DEFAULT_FEEDS = (
     "https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms",
     "https://www.moneycontrol.com/rss/business.xml",
     "https://feeds.bbci.co.uk/news/business/rss.xml",
+    "https://www.theguardian.com/business/rss",
+    "https://feeds.content.dowjones.io/public/rss/mw_topstories",
+    "https://feeds.a.dj.com/rss/RSSMarketsMain.xml",
+    "https://rss.nytimes.com/services/xml/rss/nyt/Business.xml",
+    "https://oilprice.com/rss/main",
+    "https://www.investing.com/rss/news_285.rss",
 )
 
 # If all primary feeds fail or return no items, try these (unless NEWS_RSS_URLS is set).
 _FALLBACK_FEEDS = (
-    "https://feeds.bbci.co.uk/news/business/rss.xml",
-    "https://www.theguardian.com/business/rss",
+    "https://www.ft.com/markets?format=rss",
+    "https://rss.nytimes.com/services/xml/rss/nyt/Economy.xml",
+    "https://feeds.bbci.co.uk/news/world/rss.xml",
 )
 
 _HTTP_HEADERS = {
@@ -71,7 +80,7 @@ def news_sentiment_failure_payload(exc: BaseException, *, ttl: float | None = No
         "feedErrors": [f"{type(exc).__name__}: {exc}"],
         "cached": False,
         "cacheTtlSec": cache_ttl,
-        "methodologyVersion": "lexicon-rss-v1",
+        "methodologyVersion": "lexicon-rss-v2",
         "updatedAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     }
 
@@ -162,9 +171,9 @@ def _cache_ttl_sec() -> float:
 
 def _max_items_total() -> int:
     try:
-        return max(4, min(40, int(os.environ.get("NEWS_SENTIMENT_MAX_ITEMS") or "14")))
+        return max(4, min(40, int(os.environ.get("NEWS_SENTIMENT_MAX_ITEMS") or "18")))
     except ValueError:
-        return 14
+        return 18
 
 
 async def _fetch_one_feed(client: httpx.AsyncClient, url: str, per_feed: int) -> list[dict[str, str]]:
@@ -259,12 +268,12 @@ async def compute_news_sentiment_snapshot(*, force_refresh: bool = False) -> dic
         "aggregateLabel": label,
         "aggregateScore": round(avg, 4),
         "headlineCount": len(scored),
-        "items": scored[:12],
+        "items": scored[:max_total],
         "feedsQueried": urls,
         "feedErrors": feed_errors[:5],
         "cached": False,
         "cacheTtlSec": int(ttl),
-        "methodologyVersion": "lexicon-rss-v1",
+        "methodologyVersion": "lexicon-rss-v2",
         "updatedAt": updated_at,
     }
 

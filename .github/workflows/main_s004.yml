@@ -1,6 +1,12 @@
 # Docs for the Azure Web Apps Deploy action: https://github.com/Azure/webapps-deploy
 # More GitHub Actions for Azure: https://github.com/Azure/actions
 # More info on Python, GitHub Actions, and Azure App Service: https://aka.ms/python-webapps-actions
+#
+# Required repo secrets (same names as azure-webapps-deploy-no-oryx.yml for the API):
+# - AZURE_WEBAPP_API_NAME — exact App Service name from Azure Portal → Overview (e.g. s004-xxxxx).
+# - AZURE_WEBAPP_API_PUBLISH_PROFILE — full .PublishSettings XML; publishUrl must be <name>.scm.azurewebsites.net
+#   (not *.scm.<region>-01.azurewebsites.net — invalid DNS, getaddrinfo ENOTFOUND).
+# If you used Azure Deployment Center before, copy the publish profile XML into AZURE_WEBAPP_API_PUBLISH_PROFILE.
 
 name: Build and deploy Python app to Azure Web App - S004
 
@@ -65,10 +71,9 @@ jobs:
           name: python-app
 
       - name: 'Deploy to Azure Web App'
-        uses: azure/webapps-deploy@v3
+        uses: Azure/webapps-deploy@v3
         id: deploy-to-webapp
         with:
-          app-name: 'S004'
-          slot-name: 'Production'
-          publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_3112C5E2E9434DA6A4CCA36755AAC929 }}
+          app-name: ${{ secrets.AZURE_WEBAPP_API_NAME }}
+          publish-profile: ${{ secrets.AZURE_WEBAPP_API_PUBLISH_PROFILE }}
           package: backend-deploy.zip
