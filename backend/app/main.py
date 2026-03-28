@@ -67,9 +67,11 @@ def create_app() -> FastAPI:
     app = FastAPI(title="S004 Backend", version="0.1.0", lifespan=lifespan)
 
     app.add_middleware(RequestLoggingMiddleware)
+    _cors_raw = os.getenv("CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000")
+    _cors_origins = [x.strip() for x in _cors_raw.split(",") if x.strip()]
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+        allow_origins=_cors_origins or ["http://localhost:3000"],
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
