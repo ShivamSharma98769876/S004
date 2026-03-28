@@ -22,6 +22,7 @@ type SentimentPayload = {
 type TrendPulsePayload = {
   trendpulseEnabled: boolean;
   htfBias?: string | null;
+  stInterval?: string;
   htfInterval?: string;
 };
 

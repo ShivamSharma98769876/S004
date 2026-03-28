@@ -323,7 +323,7 @@ export default function TrendPulseChart({
     }
 
     const out: Array<{ tailIndex: number; x: number; yIcon: number; hoverLines: string[] }> = [];
-    for (const [idx, eventsAtIdx] of grouped.entries()) {
+    grouped.forEach((eventsAtIdx, idx) => {
       const plotW = chart.plotW;
       const x = n > 1 ? (idx / (n - 1)) * plotW : plotW / 2;
       const spanY = Math.max(1e-9, chart.maxY - chart.minY);
@@ -374,7 +374,7 @@ export default function TrendPulseChart({
       }
 
       out.push({ tailIndex: idx, x, yIcon, hoverLines });
-    }
+    });
     out.sort((a, b) => a.tailIndex - b.tailIndex);
     return out;
   }, [safeTradeEvents, n, chart.plotW, chart.maxY, chart.minY, psZ, vsZ]);

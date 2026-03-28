@@ -48,6 +48,7 @@ type OpenTrade = {
   strategy_name?: string | null;
   mode: string;
   side: string;
+  qty?: number;
   quantity: number;
   entry_price: number;
   current_price: number;
@@ -135,8 +136,8 @@ export default function TradesPage() {
     const arr = [...recommendations];
     const mult = recSortDir === "asc" ? 1 : -1;
     arr.sort((a, b) => {
-      let av: string | number | boolean | undefined = (a as Record<string, unknown>)[recSortCol];
-      let bv: string | number | boolean | undefined = (b as Record<string, unknown>)[recSortCol];
+      let av: unknown = (a as Record<string, unknown>)[recSortCol];
+      let bv: unknown = (b as Record<string, unknown>)[recSortCol];
       if (recSortCol === "symbol") {
         av = String(av ?? "").toUpperCase();
         bv = String(bv ?? "").toUpperCase();

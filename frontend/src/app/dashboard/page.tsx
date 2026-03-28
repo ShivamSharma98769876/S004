@@ -6,6 +6,8 @@ import {
   DEFAULT_TRADING_SETUP,
   loadTradingSetup,
   saveTradingSetup,
+  type MasterSetup,
+  type TradeMode,
   type TradingSetup,
 } from "@/lib/trading_setup";
 import { apiJson } from "@/lib/api_client";
@@ -74,7 +76,7 @@ function chartClosedTimeLabelIST(closedAt: unknown): string {
   if (/^\d{1,2}:\d{2}/.test(s) && !/^\d{4}-\d{2}-\d{2}/.test(s)) {
     return s.slice(0, 5);
   }
-  return formatTimeIST(closedAt, { seconds: false, appendIstLabel: false });
+  return formatTimeIST(s, { seconds: false, appendIstLabel: false });
 }
 
 function IntradayPnlChart({ data, closedTradesCount }: { data: IntradayPoint[]; closedTradesCount: number }) {
@@ -201,6 +203,8 @@ type BackendTrade = {
   strategy_name?: string | null;
   mode: string;
   side: string;
+  /** Some API responses use `qty`; prefer explicit quantity when both exist. */
+  qty?: number;
   quantity: number;
   entry_price: number;
   current_price: number;
@@ -401,7 +405,7 @@ export default function DashboardPage() {
           apiJson<BackendTrade[]>("/api/trades/history", "GET", undefined, { today_only: "true" }),
           apiJson<{
             engineRunning: boolean;
-            mode: string;
+            mode: TradeMode | string;
             brokerConnected?: boolean;
             sharedApiConnected?: boolean;
             isAdmin?: boolean;
@@ -422,20 +426,24 @@ export default function DashboardPage() {
         if (engine) {
           setActiveStrategyBanner(engine.activeStrategy ?? null);
           const prev = loadTradingSetup();
-          const kiteStatus = (engine as { kiteStatus?: string }).kiteStatus;
-          const sharedApi = (engine as { sharedApiConnected?: boolean }).sharedApiConnected ?? prev.master.sharedApiConnected;
+          const ks = engine.kiteStatus;
+          const kiteStatus: MasterSetup["kiteStatus"] =
+            ks === "connected" || ks === "shared" || ks === "none" ? ks : prev.master.kiteStatus;
+          const sharedApi = engine.sharedApiConnected ?? prev.master.sharedApiConnected;
           const eng = engine as {
             platformApiOnline?: boolean;
             maxTradesDay?: number;
             activeStrategy?: { strategyId: string; strategyVersion: string; displayName: string };
           };
-          const merged = {
+          const mode: TradeMode =
+            engine.mode === "LIVE" || engine.mode === "PAPER" ? engine.mode : prev.master.mode;
+          const merged: TradingSetup = {
             ...prev,
             master: {
               ...prev.master,
               engineRunning: engine.engineRunning,
-              mode: engine.mode,
-              brokerConnected: (engine as { brokerConnected?: boolean }).brokerConnected ?? prev.master.brokerConnected,
+              mode,
+              brokerConnected: engine.brokerConnected ?? prev.master.brokerConnected,
               sharedApiConnected: sharedApi,
               kiteStatus,
               platformApiOnline: eng.platformApiOnline ?? prev.master.platformApiOnline,
