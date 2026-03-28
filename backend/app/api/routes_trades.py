@@ -18,7 +18,14 @@ from app.api.auth_context import get_user_id
 from app.services.ist_calendar import ist_today
 from app.services.ist_time_sql import IST_TODAY, closed_at_ist_date, closed_at_ist_date_bare
 from app.api.schemas import ExecuteRequest, ExecuteResponse, RecommendationOut, TradeOut
-from app.services.trades_service import ensure_recommendations, execute_recommendation, get_kite_for_quotes, get_strategy_score_params, list_recommendations_for_user
+from app.services.trades_service import (
+    ensure_recommendations,
+    execute_recommendation,
+    filter_recommendations_short_delta_band_only,
+    get_kite_for_quotes,
+    get_strategy_score_params,
+    list_recommendations_for_user,
+)
 
 router = APIRouter(prefix="/trades", tags=["trades"])
 logger = logging.getLogger(__name__)
@@ -220,6 +227,10 @@ async def get_recommendations(
     offset: int = Query(default=0, ge=0),
     eligible_only: bool = Query(default=False, description="Return only strikes eligible for auto-trade (score, signal_eligible)"),
     all_strategies: bool = Query(default=False, description="Admin only: show recommendations from all strategies (Trades screen). Omit for subscribed strategy only (STRATEGY SIGNALS on Dashboard)."),
+    short_delta_band_only: bool = Query(
+        default=True,
+        description="For short_premium strategies, keep only rows whose delta is inside the active short delta gate (VIX bands or fallback). Set false to show all stored rows.",
+    ),
 ) -> list[RecommendationOut]:
     await ensure_user(user_id)
     kite = await get_kite_for_quotes(user_id)  # Shared API for recommendations
@@ -256,6 +267,8 @@ async def get_recommendations(
             offset=offset,
             all_strategies=use_all_strategies,
         )
+    if short_delta_band_only:
+        rows = await filter_recommendations_short_delta_band_only(user_id, kite, rows)
     score_max: int | None = None
     if rows:
         sid = rows[0].get("strategy_id")
@@ -551,7 +564,7 @@ async def get_trade_history(
               AND t.closed_at IS NOT NULL
               AND {closed_at_ist_date("t")} = {IST_TODAY}
             ORDER BY t.closed_at DESC
-            LIMIT 100
+            LIMIT 500
             """,
             user_id,
         )

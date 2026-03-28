@@ -68,7 +68,16 @@ function formatTimeShort(iso: string | null | undefined): string {
 
 type IntradayPoint = { time: string; pnl: number };
 
-function IntradayPnlChart({ data }: { data: IntradayPoint[] }) {
+function chartClosedTimeLabelIST(closedAt: unknown): string {
+  if (closedAt == null || closedAt === "") return "—";
+  const s = String(closedAt).trim();
+  if (/^\d{1,2}:\d{2}/.test(s) && !/^\d{4}-\d{2}-\d{2}/.test(s)) {
+    return s.slice(0, 5);
+  }
+  return formatTimeIST(closedAt, { seconds: false, appendIstLabel: false });
+}
+
+function IntradayPnlChart({ data, closedTradesCount }: { data: IntradayPoint[]; closedTradesCount: number }) {
   const w = 620;
   const h = 230;
   const padLeft = 58;
@@ -154,7 +163,7 @@ function IntradayPnlChart({ data }: { data: IntradayPoint[] }) {
       </svg>
       {/* Summary footer */}
       <div className="dash-chart-footer">
-        <span>{data.length - 1} closed trades</span>
+        <span>{closedTradesCount} closed trades</span>
         <span className={highPnl >= 0 ? "metric-positive" : "chip-risk-high"}>
           High: {highPnl >= 0 ? "+" : ""}₹{highPnl.toLocaleString("en-IN", { minimumFractionDigits: 2 })}
         </span>
@@ -208,40 +217,61 @@ type BackendTrade = {
   confidence_score?: number | null;
 };
 
-/** Dashboard STRATEGY SIGNALS blurb — must not hardcode TrendPulse Z for all strategies. */
-function strategySignalsSubtitle(strategyKey: string | undefined): string {
-  const k = (strategyKey || "").toLowerCase();
-  if (k.includes("trendpulse") || k.includes("strat-trendpulse")) {
-    return "TrendPulse Z: Tier 1 = index (cross + HTF + ADX); Tier 2 = strike (δ band, extrinsic %, liquidity).";
+/** Panel copy is strategy-agnostic; active plan name lives in the dashboard status strip. */
+const STRATEGY_SIGNALS_SUBTITLE =
+  "Ranked eligible strikes from the live chain — scores, key levels, and filters. Refreshes with recommendations.";
+
+const STRATEGY_SIGNALS_EMPTY =
+  "No eligible strikes right now. When the engine marks a strike as eligible, it appears here. Auto-execute also uses this feed.";
+
+function formatSignalExecuteError(raw: string): string {
+  if (/recommendation\s+not\s+found/i.test(raw)) {
+    return "That signal expired or was replaced. Wait for the next refresh or tap ↻ when enabled.";
   }
-  if (
-    k.includes("ivr-trend-short") ||
-    k.includes("nifty-ivr") ||
-    k.includes("nifty ivr trend") ||
-    k.includes("ivr trend short")
-  ) {
-    return "Nifty IVR Trend Short: NIFTY spot trend score + chain IVR + |δ| 0.29–0.35; roll to next weekly if calendar DTE < 3; lowest gamma among eligible strikes.";
-  }
-  if (k.includes("trendsnap") || k.includes("momentum")) {
-    return "TrendSnap Momentum: rule-based chain scores, indicators, and strike filters.";
-  }
-  return "Eligible strikes (score + filters) appear here when conditions align.";
+  return raw;
 }
 
-function strategySignalsEmptyMessage(strategyKey: string | undefined): string {
-  const k = (strategyKey || "").toLowerCase();
-  if (
-    k.includes("ivr-trend-short") ||
-    k.includes("nifty-ivr") ||
-    k.includes("nifty ivr trend") ||
-    k.includes("ivr trend short")
-  ) {
-    return "No eligible short strikes yet (Eligible=Yes). Needs spot regime, leg IVR, δ band, liquidity, and min calendar DTE. Auto-execute opens when score meets threshold.";
-  }
-  if (k.includes("trendpulse") || k.includes("strat-trendpulse")) {
-    return "No eligible strikes (Eligible=Yes). Auto-execute will open trades when score meets threshold.";
-  }
-  return "No eligible recommendations (Eligible=Yes). Auto-execute will open trades when score meets threshold.";
+function IconPaperSignal() {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      width={18}
+      height={18}
+      fill="none"
+      xmlns="http://www.w3.org/2000/svg"
+      aria-hidden
+    >
+      <path
+        d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8l-6-6Z"
+        stroke="currentColor"
+        strokeWidth="1.75"
+        strokeLinejoin="round"
+      />
+      <path d="M14 2v6h6" stroke="currentColor" strokeWidth="1.75" strokeLinejoin="round" />
+      <path d="M8 13h8M8 17h6" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+function IconLiveSignal() {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      width={18}
+      height={18}
+      fill="none"
+      xmlns="http://www.w3.org/2000/svg"
+      aria-hidden
+    >
+      <path
+        d="M13 2 3 14h9l-1 8 10-12h-9l1-8Z"
+        stroke="currentColor"
+        strokeWidth="1.75"
+        strokeLinejoin="round"
+        strokeLinecap="round"
+      />
+    </svg>
+  );
 }
 
 type SignalRecommendation = {
@@ -305,14 +335,6 @@ export default function DashboardPage() {
     displayName: string;
   } | null>(null);
 
-  const strategyKeyForSignals = useMemo(
-    () =>
-      activeStrategyBanner
-        ? `${activeStrategyBanner.strategyId} ${activeStrategyBanner.displayName}`
-        : setup.strategy.strategyName || (setup.strategy.details as { displayName?: string } | undefined)?.displayName,
-    [activeStrategyBanner, setup.strategy.strategyName, setup.strategy.details]
-  );
-
   const refreshSignalsAndOpen = useCallback(async () => {
     setSignalExecuteError(null);
     try {
@@ -338,7 +360,7 @@ export default function DashboardPage() {
   const executeSignal = useCallback(
     async (recommendationId: string, mode: "PAPER" | "LIVE", symbol: string) => {
       setSignalExecuteError(null);
-      setSignalExecuteLoading(recommendationId);
+      setSignalExecuteLoading(`${recommendationId}|${mode}`);
       try {
         await apiJson("/api/trades/execute", "POST", {
           recommendation_id: recommendationId,
@@ -348,7 +370,8 @@ export default function DashboardPage() {
         setOptimisticOpenKeys((prev) => new Set(prev).add(`${symbol}|${mode}`));
         await refreshSignalsAndOpen();
       } catch (e) {
-        setSignalExecuteError(e instanceof Error ? e.message : "Failed to execute");
+        const raw = e instanceof Error ? e.message : "Failed to execute";
+        setSignalExecuteError(formatSignalExecuteError(raw));
       } finally {
         setSignalExecuteLoading(null);
       }
@@ -395,7 +418,7 @@ export default function DashboardPage() {
         setSummary(s);
         setFunds(f);
         setOpenTradesRows(o);
-        setClosedTradesRows((c || []).slice(0, 20));
+        setClosedTradesRows(c || []);
         if (engine) {
           setActiveStrategyBanner(engine.activeStrategy ?? null);
           const prev = loadTradingSetup();
@@ -481,31 +504,31 @@ export default function DashboardPage() {
       : [];
     const points: IntradayPoint[] = [];
     points.push({ time: "09:15", pnl: 0 });
-    let cumulative = 0;
+    let cumulativeGross = 0;
     for (const t of trades) {
       const pnl = Number((t as any).realized_pnl ?? (t as any).pnl ?? 0);
-      cumulative += pnl;
+      cumulativeGross += pnl;
       const closedAt = (t as any).closed_at ?? (t as any).sellTime;
-      let timeStr = "00:00";
-      if (typeof closedAt === "string") {
-        if (closedAt.includes("T")) {
-          const timePart = closedAt.split("T")[1] || "";
-          timeStr = timePart.slice(0, 5);
-        } else if (/^\d{1,2}:\d{2}/.test(closedAt)) {
-          timeStr = closedAt.slice(0, 5);
-        } else {
-          timeStr = formatTimeShort(closedAt);
-        }
-      } else {
-        timeStr = formatTimeShort(closedAt);
-      }
-      points.push({ time: timeStr, pnl: cumulative });
+      points.push({ time: chartClosedTimeLabelIST(closedAt), pnl: cumulativeGross });
+    }
+    const nSummary = summary?.closed_trades;
+    const grossFromSummary = summary != null ? Number(summary.realized_pnl) : NaN;
+    const tradeRowsMatchDay =
+      summary != null &&
+      trades.length > 0 &&
+      ((typeof nSummary === "number" && trades.length === nSummary) ||
+        Math.abs(cumulativeGross - grossFromSummary) < 0.05);
+    if (trades.length > 0 && tradeRowsMatchDay && Math.abs(netPnl - cumulativeGross) > 0.01) {
+      const nowLabel = formatTimeIST(Date.now(), { seconds: false, appendIstLabel: false });
+      points.push({ time: nowLabel, pnl: netPnl });
+    } else if (trades.length > 0 && tradeRowsMatchDay && points.length > 1) {
+      points[points.length - 1] = { ...points[points.length - 1], pnl: netPnl };
     }
     if (points.length === 1) {
       points.push({ time: "—", pnl: 0 });
     }
     return points;
-  }, [closedTradesRows]);
+  }, [closedTradesRows, summary, netPnl]);
 
   const sortedOpenTrades = useMemo(() => {
     if (!openSortCol) return openTradesRows;
@@ -796,36 +819,34 @@ export default function DashboardPage() {
             </div>
           </div>
           <div className="dash-chart-wrap">
-            <IntradayPnlChart data={intradayPnlData} />
+            <IntradayPnlChart data={intradayPnlData} closedTradesCount={closedTrades} />
           </div>
         </div>
         <div className="table-card panel-accent-signals">
           <div className="dash-signals-head">
-            <div>
-              <div className="panel-title">STRATEGY SIGNALS</div>
-              <div className="dash-signals-sub muted" style={{ fontSize: 11, marginTop: 4 }}>
-                {strategySignalsSubtitle(strategyKeyForSignals)}
-              </div>
+            <div className="dash-signals-head-text">
+              <div className="panel-title">SIGNALS</div>
+              <p className="dash-signals-sub muted">{STRATEGY_SIGNALS_SUBTITLE}</p>
             </div>
-            <button className="dash-signal-refresh" title="Auto-refresh enabled" aria-label="Auto refresh enabled">
+            <button type="button" className="dash-signal-refresh" title="Auto-refresh enabled" aria-label="Auto refresh enabled">
               ↻
             </button>
           </div>
           <div className="dash-signals">
             {signalExecuteError && (
-              <div className="notice error" style={{ marginBottom: 8 }}>
+              <div className="notice error dash-signals-notice" role="alert">
                 {signalExecuteError}
               </div>
             )}
             {!setup.master.engineRunning ? (
-              <div className="dash-signal-empty">Engine not running - click Start Trading</div>
+              <div className="dash-signal-empty">Engine not running — click Start Trading.</div>
             ) : signals.length === 0 ? (
-              <div className="dash-signal-empty">
-                {strategySignalsEmptyMessage(strategyKeyForSignals)}
-              </div>
+              <div className="dash-signal-empty">{STRATEGY_SIGNALS_EMPTY}</div>
             ) : (
               signals.map((s) => {
-                const isExecuting = signalExecuteLoading === s.recommendation_id;
+                const busyPaper = signalExecuteLoading === `${s.recommendation_id}|PAPER`;
+                const busyLive = signalExecuteLoading === `${s.recommendation_id}|LIVE`;
+                const busyAny = busyPaper || busyLive;
                 const hasOpenPaper =
                   openTradesRows.some(
                     (t) => t.symbol === s.symbol && String(t.mode || "").toUpperCase() === "PAPER"
@@ -837,54 +858,62 @@ export default function DashboardPage() {
                 return (
                   <div key={s.recommendation_id} className="dash-signal-card">
                     <div className="dash-signal-row-top">
-                      <div>
+                      <div className="dash-signal-symbol-block">
                         <div className="dash-signal-symbol">{s.symbol}</div>
-                        {s.strategy_name && (
-                          <div className="dash-signal-strategy" title={s.strategy_name}>{s.strategy_name}</div>
-                        )}
+                        <div className="dash-signal-strategy-line">
+                          <span className="dash-signal-strategy-label">Strategy</span>
+                          <span
+                            className="dash-signal-strategy-name"
+                            title={s.strategy_name || s.strategy_id || undefined}
+                          >
+                            {(s.strategy_name && s.strategy_name.trim()) || s.strategy_id || "—"}
+                          </span>
+                        </div>
                       </div>
-                      <div style={{ display: "flex", gap: 6 }}>
+                      <div className="dash-signal-mode-btns">
                         <button
-                          className="action-button"
-                          style={{ fontSize: 11, padding: "4px 10px" }}
+                          type="button"
+                          className="action-button dash-signal-mode-icon-btn"
                           onClick={() => executeSignal(s.recommendation_id, "PAPER", s.symbol)}
-                          disabled={isExecuting || hasOpenPaper}
+                          disabled={busyAny || hasOpenPaper}
                           title={hasOpenPaper ? "Paper trade already open for this strike" : "Open Paper trade"}
+                          aria-label={hasOpenPaper ? "Paper: position already open" : "Open Paper trade"}
                         >
-                          {isExecuting ? "…" : "Paper"}
+                          {busyPaper ? <span className="dash-signal-mode-busy">…</span> : <IconPaperSignal />}
                         </button>
                         <button
-                          className="action-button resume"
-                          style={{ fontSize: 11, padding: "4px 10px" }}
+                          type="button"
+                          className="action-button resume dash-signal-mode-icon-btn"
                           onClick={() => executeSignal(s.recommendation_id, "LIVE", s.symbol)}
-                          disabled={isExecuting || hasOpenLive}
+                          disabled={busyAny || hasOpenLive}
                           title={hasOpenLive ? "Live trade already open for this strike" : "Open Live trade"}
+                          aria-label={hasOpenLive ? "Live: position already open" : "Open Live trade"}
                         >
-                          {isExecuting ? "…" : "Live"}
+                          {busyLive ? <span className="dash-signal-mode-busy">…</span> : <IconLiveSignal />}
                         </button>
                       </div>
                     </div>
-                    <div className="dash-signal-row">
-                      <span className="dash-signal-key">LTP:</span>
+                    <div className="dash-signal-row dash-signal-row--grid3">
+                      <span className="dash-signal-key">LTP</span>
                       <span className="dash-signal-val signal-ltp">{s.entry_price?.toFixed(2) ?? "—"}</span>
-                      <span className="dash-signal-key">E9:</span>
+                      <span className="dash-signal-key">E9</span>
                       <span className="dash-signal-val">{s.ema9?.toFixed(2) ?? "—"}</span>
-                      <span className="dash-signal-key">E21:</span>
+                      <span className="dash-signal-key">E21</span>
                       <span className="dash-signal-val">{s.ema21?.toFixed(2) ?? "—"}</span>
                     </div>
                     {s.trendpulse?.tier1 ? (
-                      <div className="dash-signal-row">
-                        <span className="dash-signal-key">Tier 1:</span>
-                        <span className="dash-signal-val" title="Index signal">
+                      <div className="dash-signal-row dash-signal-row--full">
+                        <span className="dash-signal-key">Tier 1</span>
+                        <span className="dash-signal-val dash-signal-val--wrap" title="Index signal">
                           {s.trendpulse.tier1.cross ?? s.trendpulse.cross ?? "—"} · HTF {s.trendpulse.tier1.htf_bias ?? s.trendpulse.htf_bias ?? "—"}
                           {s.trendpulse.tier1.adx != null ? ` · ADX ${Number(s.trendpulse.tier1.adx).toFixed(1)}` : ""}
                         </span>
                       </div>
                     ) : null}
                     {s.trendpulse?.tier2 ? (
-                      <div className="dash-signal-row">
-                        <span className="dash-signal-key">Tier 2:</span>
-                        <span className="dash-signal-val" title="Strike filters">
+                      <div className="dash-signal-row dash-signal-row--full">
+                        <span className="dash-signal-key">Tier 2</span>
+                        <span className="dash-signal-val dash-signal-val--wrap" title="Strike filters">
                           Δ {s.trendpulse.tier2.delta != null ? s.trendpulse.tier2.delta.toFixed(2) : s.delta != null ? s.delta.toFixed(2) : "—"}
                           {s.trendpulse.tier2.extrinsic_share != null
                             ? ` · TV ${(s.trendpulse.tier2.extrinsic_share * 100).toFixed(0)}%`
@@ -894,10 +923,10 @@ export default function DashboardPage() {
                         </span>
                       </div>
                     ) : null}
-                    <div className="dash-signal-row">
-                      <span className="dash-signal-key">Score:</span>
+                    <div className="dash-signal-row dash-signal-row--grid2">
+                      <span className="dash-signal-key">Score</span>
                       <span className="dash-signal-val">{s.score != null ? (s.score_max != null ? `${s.score}/${s.score_max}` : String(s.score)) : "—"}</span>
-                      <span className="dash-signal-key">Confidence:</span>
+                      <span className="dash-signal-key">Conf.</span>
                       <span className="dash-signal-val">
                         {s.confidence_score != null ? (
                           <span className="chip chip-status-active">{Number(s.confidence_score).toFixed(2)}</span>
@@ -906,12 +935,12 @@ export default function DashboardPage() {
                         )}
                       </span>
                     </div>
-                    <div className="dash-signal-row">
-                      <span className="dash-signal-key">RSI:</span>
+                    <div className="dash-signal-row dash-signal-row--grid3">
+                      <span className="dash-signal-key">RSI</span>
                       <span className="dash-signal-val">{s.rsi?.toFixed(2) ?? "—"}</span>
-                      <span className="dash-signal-key">VWAP:</span>
+                      <span className="dash-signal-key">VWAP</span>
                       <span className="dash-signal-val">{s.vwap?.toFixed(2) ?? "—"}</span>
-                      <span className="dash-signal-key">IVR:</span>
+                      <span className="dash-signal-key">IVR</span>
                       <span
                         className="dash-signal-val"
                         title="IV rank proxy within this expiry chain (0–100; higher vs other strikes)"

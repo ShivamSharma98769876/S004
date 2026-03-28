@@ -16,7 +16,13 @@ def validate_strategy_details(details: dict) -> list[str]:
 
     strategy_type = str(details.get("strategyType", "rule-based")).strip().lower()
 
-    for bool_key in ("includeEmaCrossoverInScore", "strictBullishComparisons", "includeVolumeInLegScore"):
+    for bool_key in (
+        "includeEmaCrossoverInScore",
+        "strictBullishComparisons",
+        "includeVolumeInLegScore",
+        "requireRsiForEligible",
+        "longPremiumSpotAlign",
+    ):
         if bool_key in details and not isinstance(details.get(bool_key), bool):
             errors.append(f"'{bool_key}' must be a boolean.")
 
@@ -183,6 +189,87 @@ def validate_strategy_details(details: dict) -> list[str]:
             type(msr) is bool or not isinstance(msr, int) or msr < 1 or msr > 10
         ):
             errors.append("'strikeSelection.maxStrikeRecommendations' must be an integer 1–10.")
+        mves = strike.get("minVolumeEarlySession")
+        if mves is not None and (
+            type(mves) is bool or not isinstance(mves, int) or mves < 0 or mves > 1_000_000
+        ):
+            errors.append(
+                "'strikeSelection.minVolumeEarlySession' must be an integer 0–1000000 (optional)."
+            )
+        esh = strike.get("earlySessionEndHourIST")
+        if esh is not None and (
+            type(esh) is bool or not isinstance(esh, int) or esh < 0 or esh > 23
+        ):
+            errors.append("'strikeSelection.earlySessionEndHourIST' must be an integer hour 0–23 (IST).")
+        if "shortPremiumAsymmetricDatm" in strike and strike.get("shortPremiumAsymmetricDatm") is not None:
+            if not isinstance(strike.get("shortPremiumAsymmetricDatm"), bool):
+                errors.append("'strikeSelection.shortPremiumAsymmetricDatm' must be a boolean.")
+        if "shortPremiumDeltaOnlyStrikes" in strike and strike.get("shortPremiumDeltaOnlyStrikes") is not None:
+            if not isinstance(strike.get("shortPremiumDeltaOnlyStrikes"), bool):
+                errors.append("'strikeSelection.shortPremiumDeltaOnlyStrikes' must be a boolean.")
+        if "shortPremiumRsiDirectBand" in strike and strike.get("shortPremiumRsiDirectBand") is not None:
+            if not isinstance(strike.get("shortPremiumRsiDirectBand"), bool):
+                errors.append("'strikeSelection.shortPremiumRsiDirectBand' must be a boolean.")
+        for sp_key in (
+            "shortPremiumCeMinSteps",
+            "shortPremiumCeMaxSteps",
+            "shortPremiumPeMinSteps",
+            "shortPremiumPeMaxSteps",
+        ):
+            v = strike.get(sp_key)
+            if v is not None and (type(v) is bool or not isinstance(v, int) or abs(int(v)) > 30):
+                errors.append(f"'strikeSelection.{sp_key}' must be an integer with |value| ≤ 30.")
+        spv = strike.get("shortPremiumDeltaVixBands")
+        if spv is not None:
+            if not isinstance(spv, dict):
+                errors.append("'strikeSelection.shortPremiumDeltaVixBands' must be an object.")
+            else:
+                thr = spv.get("threshold")
+                if not isinstance(thr, (int, float)) or isinstance(thr, bool):
+                    errors.append(
+                        "'strikeSelection.shortPremiumDeltaVixBands.threshold' must be a number (e.g. 17)."
+                    )
+                above = spv.get("vixAbove") if isinstance(spv.get("vixAbove"), dict) else spv.get("aboveThreshold")
+                below = (
+                    spv.get("vixAtOrBelow")
+                    if isinstance(spv.get("vixAtOrBelow"), dict)
+                    else spv.get("belowThreshold")
+                )
+                if not isinstance(above, dict) or not isinstance(below, dict):
+                    errors.append(
+                        "'strikeSelection.shortPremiumDeltaVixBands' must include vixAbove and vixAtOrBelow "
+                        "(or aboveThreshold / belowThreshold objects with deltaMinCE/MaxCE/MinPE/MaxPE)."
+                    )
+                else:
+                    for label, br in (("vixAbove", above), ("vixAtOrBelow", below)):
+                        for fk in ("deltaMinCE", "deltaMaxCE", "deltaMinPE", "deltaMaxPE"):
+                            fv = br.get(fk)
+                            if fv is None or isinstance(fv, bool) or not isinstance(fv, (int, float)):
+                                errors.append(
+                                    f"'strikeSelection.shortPremiumDeltaVixBands.{label}.{fk}' must be a number."
+                                )
+        _slm = strike.get("shortPremiumLegScoreMode")
+        if _slm is not None and str(_slm).strip():
+            allowed_modes = {"legacy", "three_factor"}
+            if str(_slm).strip().lower() not in allowed_modes:
+                errors.append(
+                    "'strikeSelection.shortPremiumLegScoreMode' must be 'legacy' or 'three_factor' when set."
+                )
+        for _nk, _lbl in (
+            ("shortPremiumRsiBelow", "shortPremiumRsiBelow"),
+            ("shortPremiumIvrSkewMin", "shortPremiumIvrSkewMin"),
+            ("shortPremiumPcrChainEpsilon", "shortPremiumPcrChainEpsilon"),
+            ("shortPremiumPcrMinForSellCe", "shortPremiumPcrMinForSellCe"),
+            ("shortPremiumPcrMaxForSellPe", "shortPremiumPcrMaxForSellPe"),
+        ):
+            _nv = strike.get(_nk)
+            if _nv is not None and (
+                isinstance(_nv, bool) or not isinstance(_nv, (int, float))
+            ):
+                errors.append(f"'strikeSelection.{_lbl}' must be a number when set.")
+        _pvc = strike.get("shortPremiumPcrBonusVsChain")
+        if _pvc is not None and not isinstance(_pvc, (bool, str)):
+            errors.append("'strikeSelection.shortPremiumPcrBonusVsChain' must be a boolean.")
 
     # score thresholds
     for key, label in [

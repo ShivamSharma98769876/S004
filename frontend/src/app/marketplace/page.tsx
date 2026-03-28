@@ -26,7 +26,7 @@ const DEFAULT_STRATEGY_DETAILS = {
     emaCrossover: { bonus: 1, description: "Fast EMA crossed above slow EMA from lower to upper = +1 score bonus" },
     rsi: { period: 14, min: 50, max: 75, description: "" },
     vwap: { description: "" },
-    volumeSpike: { minRatio: 1.1, description: "" },
+    volumeSpike: { minRatio: 1.02, description: "" },
     ivr: { maxThreshold: 20, bonus: 1, description: "IVR < 20 = low IV (cheap options) = +1 score bonus" },
   },
   scoreThreshold: 3,

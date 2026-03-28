@@ -72,6 +72,7 @@ def _put_leg(**kw: object) -> dict:
 
 
 def _chain_payload(*, put_regime: bool, call_regime: bool) -> dict:
+    # dATM +2 from ATM 22000 → short-premium CE window [+2,+4] and PE window [-4,+2] both include +2.
     return {
         "spot": 22000.0,
         "spotRegime": None,
@@ -79,9 +80,15 @@ def _chain_payload(*, put_regime: bool, call_regime: bool) -> dict:
         "spotBearishScore": 0,
         "chain": [
             {
-                "strike": 22000,
-                "call": _call_leg(regimeSellCe=call_regime),
-                "put": _put_leg(regimeSellPe=put_regime),
+                "strike": 22100,
+                "call": _call_leg(
+                    regimeSellCe=call_regime,
+                    tradingsymbol="NIFTY26MAR22100CE",
+                ),
+                "put": _put_leg(
+                    regimeSellPe=put_regime,
+                    tradingsymbol="NIFTY26MAR22100PE",
+                ),
             }
         ],
     }
@@ -112,7 +119,7 @@ def test_ema_cross_vwap_respects_strike_leg_flags(
     mock_chain, put_regime, call_regime, expect_pe, expect_ce
 ):
     mock_chain.return_value = _chain_payload(put_regime=put_regime, call_regime=call_regime)
-    gen, _scan = _run(
+    gen, _scan, _meta = _run(
         ts._get_live_candidates(
             None,
             10,
@@ -135,7 +142,7 @@ def test_ema_cross_vwap_respects_strike_leg_flags(
 def test_legacy_short_premium_skips_when_spot_regime_unset(mock_chain):
     """Without ema_cross_vwap, missing spotRegime skips legs even if strike flags are true."""
     mock_chain.return_value = _chain_payload(put_regime=True, call_regime=True)
-    gen, _scan = _run(
+    gen, _scan, _meta = _run(
         ts._get_live_candidates(
             None,
             10,

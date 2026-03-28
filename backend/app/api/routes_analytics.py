@@ -50,11 +50,9 @@ async def get_analytics_config(user_id: int = Depends(require_admin)) -> dict:
     refresh = int(os.getenv("OPTION_CHAIN_REFRESH_SECONDS", "15"))
     refresh = max(5, min(300, refresh))
     live_required = os.getenv("OPTION_CHAIN_REQUIRE_LIVE", "1").strip().lower() not in {"0", "false", "no"}
-    try:
-        recent_window = int(os.getenv("OPTION_CHAIN_RECENT_WINDOW", "10"))
-    except ValueError:
-        recent_window = 10
-    recent_window = max(5, min(10, recent_window))
+    from app.services.option_chain_zerodha import _window_size
+
+    recent_window = _window_size()
     return {
         "option_chain_refresh_seconds": refresh,
         "require_live_broker": live_required,

@@ -561,7 +561,7 @@ export default function LandingPage() {
           <div className="landing-bento-drivers landing-bento-cell panel-accent-chain landing-widget-help-host">
             <LandingWidgetHelp
               meaning="Breakdown of what pushed the direction score (spot, PCR, momentum, etc.)."
-              usage="The number on the right is each driver’s weighted impact on the direction score, not raw PCR. PCR ≈ 1.0 and balanced OI produce ~0 impact even when data is present. The smaller line under each name shows the live reading (ratios, OI counts). Several drivers aligned is stronger than one dominant driver."
+              usage="The number on the right is each driver’s weighted impact on the direction score, not raw PCR. PCR ≈ 1.0 and balanced OI produce ~0 impact even when data is present (neutral contribution); the line under each name is the live reading. In the bridge and sliders, constructive (call-side) pulls left and cautious (put-side) pulls right. Several drivers aligned is stronger than one dominant driver."
             />
             <header className="landing-bento-head">
               <div>

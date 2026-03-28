@@ -13,7 +13,9 @@ from app.api.auth_context import require_admin
 from app.db_client import execute, fetchrow
 from app.services.evolution_service import (
     fetch_daily_metrics_series,
+    fetch_evaluation_workbench,
     fetch_strategy_evaluation_summary,
+    fetch_strategy_repository_meta,
     generate_rule_based_recommendations,
     list_catalog_strategy_ids,
     list_catalog_versions,
@@ -67,6 +69,40 @@ async def evolution_evaluation_summary(
 ) -> dict[str, Any]:
     """Daily rollups + aggregates for finetuning thresholds (uses s004_strategy_daily_metrics)."""
     return await fetch_strategy_evaluation_summary(strategy_id, strategy_version, days=days)
+
+
+@router.get("/strategy-repository")
+async def evolution_strategy_repository(_admin_id: int = Depends(require_admin)) -> dict[str, Any]:
+    """Latest catalog row per strategy — filter/search on client for Evaluation repository strip."""
+    rows = await fetch_strategy_repository_meta()
+    return {"strategies": rows}
+
+
+@router.get("/evaluation-workbench")
+async def evolution_evaluation_workbench(
+    strategy_id: str = Query(...),
+    strategy_version: str | None = Query(default=None),
+    days: int = Query(default=30, ge=1, le=365),
+    _admin_id: int = Depends(require_admin),
+) -> dict[str, Any]:
+    """
+    Bundled payload for Strategy Evaluation UI: summary, equity/DD analytics, catalog meta,
+    regime/fit hints, recent optimization recommendations (single round-trip).
+    """
+    data = await fetch_evaluation_workbench(
+        strategy_id,
+        strategy_version,
+        days=days,
+        recommendation_limit=12,
+    )
+    for r in data.get("recent_recommendations") or []:
+        if r.get("created_at"):
+            r["created_at"] = r["created_at"].isoformat()
+        if r.get("updated_at"):
+            r["updated_at"] = r["updated_at"].isoformat()
+        if r.get("approved_at"):
+            r["approved_at"] = r["approved_at"].isoformat()
+    return data
 
 
 @router.get("/daily-metrics")

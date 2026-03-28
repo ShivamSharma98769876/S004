@@ -4,8 +4,10 @@ from datetime import date
 
 from app.services.option_chain_zerodha import (
     first_expiry_meeting_min_calendar_dte,
+    resolve_expiry_min_dte_weekday_with_fallback,
     select_expiry_min_dte_and_weekday,
 )
+from app.services.trades_service import _short_premium_datm_allows_leg
 
 
 def test_min_dte_3_skips_short_dte():
@@ -41,7 +43,26 @@ def test_weekday_none_earliest_min_dte():
 
 
 def test_weekday_strict_none_if_no_matching_day():
-    """Qualified by DTE but no expiry on requested weekday."""
+    """Low-level selector: qualified by DTE but no expiry on requested weekday → None."""
     today = date(2026, 3, 24)
-    # Only Thursday 26 Mar meets min_dte>=2; no Tuesday in list
     assert select_expiry_min_dte_and_weekday(["26MAR2026"], today, min_dte_days=2, weekday=1) is None
+
+
+def test_short_premium_asymmetric_datm_windows():
+    ce_lo, ce_hi, pe_lo, pe_hi = 2, 4, -4, 2
+    assert _short_premium_datm_allows_leg("CE", 3, ce_min=ce_lo, ce_max=ce_hi, pe_min=pe_lo, pe_max=pe_hi)
+    assert not _short_premium_datm_allows_leg("CE", 1, ce_min=ce_lo, ce_max=ce_hi, pe_min=pe_lo, pe_max=pe_hi)
+    assert _short_premium_datm_allows_leg("PE", -3, ce_min=ce_lo, ce_max=ce_hi, pe_min=pe_lo, pe_max=pe_hi)
+    assert _short_premium_datm_allows_leg("PE", 2, ce_min=ce_lo, ce_max=ce_hi, pe_min=pe_lo, pe_max=pe_hi)
+    assert not _short_premium_datm_allows_leg("PE", 3, ce_min=ce_lo, ce_max=ce_hi, pe_min=pe_lo, pe_max=pe_hi)
+
+
+def test_resolve_weekday_fallback_when_min_dte_ok_but_wrong_weekday():
+    """Trading helper: still return earliest min-DTE expiry so option chain can load strikes."""
+    today = date(2026, 3, 24)
+    assert (
+        resolve_expiry_min_dte_weekday_with_fallback(
+            ["26MAR2026"], today, min_dte_days=2, weekday=1
+        )
+        == "26MAR2026"
+    )

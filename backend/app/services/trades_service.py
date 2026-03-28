@@ -34,6 +34,7 @@ from app.services.heuristic_enhancements import (
 )
 from app.services.option_greeks import compute_gamma_from_ltp
 from app.services.option_chain_zerodha import (
+    _vix_from_quote,
     fetch_index_candles_sync,
     fetch_option_chain_sync,
     pick_expiry_with_min_calendar_dte,
@@ -66,6 +67,7 @@ def _slim_candidate_for_evaluation_log(r: dict[str, Any]) -> dict[str, Any]:
         "side": r.get("side"),
         "option_type": r.get("option_type"),
         "distance_to_atm": r.get("distance_to_atm"),
+        "strike": r.get("strike"),
         "signal_eligible": r.get("signal_eligible"),
         "score": r.get("score"),
         "confidence_score": r.get("confidence_score"),
@@ -95,6 +97,7 @@ def _emit_evaluation_snapshot(
     error: str | None,
     generated_rows: list[dict[str, Any]],
     scanned_candidates: list[dict[str, Any]] | None = None,
+    chain_snapshot: dict[str, Any] | None = None,
 ) -> None:
     """Optional human-readable .log under S004_EVALUATION_LOG_DIR — see evaluation_log module."""
     rows = generated_rows or []
@@ -139,6 +142,7 @@ def _emit_evaluation_snapshot(
         "failed_conditions_sample": fc_samples,
         "candidates": slim_scan,
         "candidates_truncated": truncated,
+        "chain_snapshot": chain_snapshot or {},
     }
     uids: list[int] = sorted({int(trigger_user_id), *[int(x) for x in subscribed_user_ids]})
     append_evaluation_event(event, user_ids=uids)
@@ -284,16 +288,402 @@ def _failed_conditions_short_leg(
     *,
     rsi_min: float = 50,
     rsi_max: float = 75,
+    leg_score_mode: str = "",
+    rsi_below_for_weak: float = 50.0,
+    rsi_direct_band: bool = False,
 ) -> str:
-    """Bearish-style checks on option LTP series (short premium): LTP below VWAP, EMA9 below EMA21, mirrored RSI band."""
+    """Bearish-style checks on option LTP series (short premium): LTP below VWAP, EMA9 below EMA21, RSI rule per leg score mode."""
     failed: list[str] = []
     if not primary_ok:
         failed.append("LTP not below VWAP (want premium weakness)")
     if not ema_ok:
         failed.append("EMA9 not below EMA21 (want premium weakness)")
     if not rsi_ok:
-        failed.append(f"RSI not in bearish mirror band vs spot {rsi_min:.0f}-{rsi_max:.0f}")
+        if rsi_direct_band:
+            failed.append(f"RSI not in {rsi_min:.0f}-{rsi_max:.0f} (direct leg band)")
+        elif (leg_score_mode or "").strip().lower() == "three_factor":
+            rb = float(rsi_below_for_weak)
+            failed.append(f"RSI not below {rb:.0f} (three_factor leg score)")
+        else:
+            failed.append(f"RSI not in bearish mirror band vs spot {rsi_min:.0f}-{rsi_max:.0f}")
     return "PASS" if not failed else "; ".join(failed)
+
+
+def _effective_strike_min_volume(
+    base_min_vol: int,
+    *,
+    early_session_vol: int | None,
+    early_session_end_hour_ist: int,
+) -> int:
+    """Before early_session_end_hour_ist (IST), use min(base, early_session_vol) when early_session_vol is set."""
+    bv = max(0, int(base_min_vol))
+    if early_session_vol is None or int(early_session_end_hour_ist or 0) <= 0:
+        return bv
+    try:
+        ev = int(early_session_vol)
+    except (TypeError, ValueError):
+        return bv
+    if ev <= 0:
+        return bv
+    if datetime.now(_EVAL_IST).hour >= int(early_session_end_hour_ist):
+        return bv
+    return min(bv, ev)
+
+
+def _deep_merge_strategy_details(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
+    """Recursively merge overlay onto base (overlay wins). Used so user Settings JSON overrides catalog defaults."""
+    out: dict[str, Any] = dict(base)
+    for k, v in overlay.items():
+        if k in out and isinstance(out[k], dict) and isinstance(v, dict):
+            out[k] = _deep_merge_strategy_details(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def _short_premium_datm_allows_leg(
+    opt_type: str,
+    distance_to_atm: int,
+    *,
+    ce_min: int,
+    ce_max: int,
+    pe_min: int,
+    pe_max: int,
+) -> bool:
+    """Short premium: CE and PE use separate dATM (strike − ATM) step windows."""
+    if opt_type == "CE":
+        return ce_min <= distance_to_atm <= ce_max
+    return pe_min <= distance_to_atm <= pe_max
+
+
+def _short_premium_quad_from_side(d: dict[str, Any]) -> dict[str, float] | None:
+    """Parse one branch of shortPremiumDeltaVixBands (camelCase keys). Returns ce_min/ce_max/pe_min/pe_max."""
+
+    def _num(keys: tuple[str, ...]) -> float | None:
+        for k in keys:
+            v = d.get(k)
+            if isinstance(v, bool) or v is None:
+                continue
+            if isinstance(v, (int, float)):
+                return float(v)
+        return None
+
+    ce_lo = _num(("deltaMinCE", "ceMin"))
+    ce_hi = _num(("deltaMaxCE", "ceMax"))
+    pe_lo = _num(("deltaMinPE", "peMin"))
+    pe_hi = _num(("deltaMaxPE", "peMax"))
+    if ce_lo is None or ce_hi is None or pe_lo is None or pe_hi is None:
+        return None
+    if ce_lo > ce_hi or pe_lo > pe_hi:
+        return None
+    if ce_lo <= 0 or ce_hi <= 0:
+        return None
+    if pe_lo >= 0 or pe_hi >= 0:
+        return None
+    return {"ce_min": ce_lo, "ce_max": ce_hi, "pe_min": pe_lo, "pe_max": pe_hi}
+
+
+def _normalize_short_premium_delta_vix_bands(strike_cfg: dict[str, Any]) -> dict[str, Any] | None:
+    """Validate strikeSelection.shortPremiumDeltaVixBands; None if absent or invalid."""
+    raw = strike_cfg.get("shortPremiumDeltaVixBands")
+    if not isinstance(raw, dict) or not raw:
+        return None
+    thr = raw.get("threshold")
+    if isinstance(thr, bool) or not isinstance(thr, (int, float)):
+        return None
+    above_raw = raw.get("vixAbove") or raw.get("aboveThreshold")
+    below_raw = raw.get("vixAtOrBelow") or raw.get("belowThreshold")
+    if not isinstance(above_raw, dict) or not isinstance(below_raw, dict):
+        return None
+    qa = _short_premium_quad_from_side(above_raw)
+    qb = _short_premium_quad_from_side(below_raw)
+    if qa is None or qb is None:
+        return None
+    return {"threshold": float(thr), "vix_above": qa, "vix_at_or_below": qb}
+
+
+def _resolve_short_premium_delta_corners(
+    *,
+    strike_delta_min_abs: float,
+    strike_delta_max_abs: float,
+    short_premium_delta_vix_bands: dict[str, Any] | None,
+    vix: Any,
+) -> tuple[float, float, float, float, str]:
+    """
+    Short-premium delta gates: CE in [ce_lo, ce_hi], PE in [pe_lo, pe_hi] (PE negative).
+    Without VIX bands: CE [deltaMinAbs, deltaMaxAbs], PE [-deltaMaxAbs, -deltaMinAbs].
+    With VIX bands: VIX > threshold → vixAbove; VIX <= threshold → vixAtOrBelow; missing VIX → fallback to deltaMin/MaxAbs.
+    """
+    d_lo = float(strike_delta_min_abs)
+    d_hi = float(strike_delta_max_abs)
+    fb = f"CE [{d_lo:.2f},{d_hi:.2f}] PE [{-d_hi:.2f},{-d_lo:.2f}] (deltaMinAbs/deltaMaxAbs)"
+    bands = short_premium_delta_vix_bands
+    if not isinstance(bands, dict) or not bands:
+        return d_lo, d_hi, -d_hi, -d_lo, fb
+    thr = float(bands["threshold"])
+    above = bands["vix_above"]
+    below = bands["vix_at_or_below"]
+    vx_f: float | None
+    try:
+        vx_f = float(vix) if vix is not None else None
+    except (TypeError, ValueError):
+        vx_f = None
+    if vx_f is None:
+        return d_lo, d_hi, -d_hi, -d_lo, f"{fb}; VIX unavailable — fallback"
+    side = above if vx_f > thr else below
+    ce_lo = float(side["ce_min"])
+    ce_hi = float(side["ce_max"])
+    pe_lo = float(side["pe_min"])
+    pe_hi = float(side["pe_max"])
+    rel = ">" if vx_f > thr else "<="
+    note = (
+        f"VIX={vx_f:.2f} {rel} {thr:g} → CE [{ce_lo:.2f},{ce_hi:.2f}] PE [{pe_lo:.2f},{pe_hi:.2f}]"
+    )
+    return ce_lo, ce_hi, pe_lo, pe_hi, note
+
+
+def _short_premium_signed_delta_ok(
+    delta: float,
+    opt_type: str,
+    *,
+    ce_lo: float,
+    ce_hi: float,
+    pe_lo: float,
+    pe_hi: float,
+) -> bool:
+    if opt_type == "CE":
+        return ce_lo - 1e-9 <= delta <= ce_hi + 1e-9
+    return pe_lo - 1e-9 <= delta <= pe_hi + 1e-9
+
+
+def _short_premium_delta_blocker(
+    delta: float,
+    opt_type: str,
+    *,
+    ce_lo: float,
+    ce_hi: float,
+    pe_lo: float,
+    pe_hi: float,
+) -> str:
+    if opt_type == "CE":
+        return f"delta={delta:.4f} not in CE [{ce_lo:.2f},{ce_hi:.2f}]"
+    return f"delta={delta:.4f} not in PE [{pe_lo:.2f},{pe_hi:.2f}]"
+
+
+def _chain_eval_meta(
+    *,
+    expiry_str: str | None,
+    expiry_date: date | None,
+    chain_len: int,
+    reason: str | None = None,
+    short_leg_diagnostics: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    today_ist = datetime.now(_EVAL_IST).date()
+    dte = (expiry_date - today_ist).days if (expiry_str and expiry_date is not None) else None
+    m: dict[str, Any] = {
+        "option_expiry": expiry_str,
+        "chain_rows": chain_len,
+        "calendar_dte_ist": dte,
+    }
+    if reason:
+        m["reason"] = reason
+    if short_leg_diagnostics:
+        m["short_leg_diagnostics"] = short_leg_diagnostics
+    return m
+
+
+def _build_short_leg_diagnostics(
+    chain: list[dict[str, Any]],
+    *,
+    spot: float,
+    strike_max_otm_steps: int,
+    short_premium_delta_only_strikes: bool,
+    short_premium_asymmetric_datm: bool,
+    short_premium_ce_datm_min: int,
+    short_premium_ce_datm_max: int,
+    short_premium_pe_datm_min: int,
+    short_premium_pe_datm_max: int,
+    strike_regime_mode: str,
+    spot_regime: Any,
+    spot_bull: int,
+    spot_bear: int,
+    score_threshold: int | float,
+    ivr_min_threshold: float,
+    ivr_leg_max_threshold: float,
+    short_ce_delta_min: float,
+    short_ce_delta_max: float,
+    short_pe_delta_min: float,
+    short_pe_delta_max: float,
+    rsi_min: float,
+    rsi_max: float,
+    strike_min_oi: int,
+    strike_min_volume: int,
+    instrument: str,
+    expiry_str: str,
+    short_premium_leg_score_mode: str = "",
+    short_premium_rsi_below: float = 50.0,
+    short_premium_rsi_direct_band: bool = False,
+    max_rows: int = 48,
+) -> list[dict[str, Any]]:
+    """
+    One row per option leg: OTM-step window unless short_premium_delta_only_strikes (then delta band only).
+    """
+    step = 50
+    atm = round(spot / step) * step
+    st_int = int(score_threshold)
+    out: list[dict[str, Any]] = []
+    srm = str(strike_regime_mode or "").strip().lower()
+    skip_otm_geometry = bool(short_premium_delta_only_strikes)
+    diag_include_oob_delta = os.getenv("S004_SHORT_DIAGNOSTICS_INCLUDE_OOB_DELTA", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+    for row in chain:
+        if len(out) >= max(1, int(max_rows)):
+            break
+        strike = int(float(row.get("strike", 0)))
+        distance_to_atm = int((strike - atm) / step)
+        if not skip_otm_geometry:
+            if not short_premium_asymmetric_datm:
+                if abs(distance_to_atm) > strike_max_otm_steps:
+                    continue
+        for leg_key, opt_type in (("call", "CE"), ("put", "PE")):
+            if len(out) >= max(1, int(max_rows)):
+                break
+            if short_premium_asymmetric_datm and not skip_otm_geometry:
+                if not _short_premium_datm_allows_leg(
+                    opt_type,
+                    distance_to_atm,
+                    ce_min=short_premium_ce_datm_min,
+                    ce_max=short_premium_ce_datm_max,
+                    pe_min=short_premium_pe_datm_min,
+                    pe_max=short_premium_pe_datm_max,
+                ):
+                    continue
+            leg = row.get(leg_key) or {}
+            oi = int(float(leg.get("oi") or 0))
+            volume = int(float(leg.get("volume") or 0))
+            ltp = float(leg.get("ltp") or 0.0)
+            delta = float(leg.get("delta") or 0.0)
+            delta_abs = abs(delta)
+            # By default only legs inside the active CE/PE delta band (VIX-resolved). See env below for full chain.
+            if not diag_include_oob_delta and not _short_premium_signed_delta_ok(
+                delta,
+                opt_type,
+                ce_lo=short_ce_delta_min,
+                ce_hi=short_ce_delta_max,
+                pe_lo=short_pe_delta_min,
+                pe_hi=short_pe_delta_max,
+            ):
+                continue
+            ivr = leg.get("ivr")
+            rspe = bool(leg.get("regimeSellPe"))
+            rsce = bool(leg.get("regimeSellCe"))
+            leg_score = int(leg.get("score") or 0)
+            leg_sig = bool(leg.get("signalEligible"))
+            blockers: list[str] = []
+            if oi < strike_min_oi or volume < strike_min_volume:
+                blockers.append(
+                    f"strict_liquidity(oi<{strike_min_oi} or vol<{strike_min_volume})"
+                )
+            if srm == "ema_cross_vwap":
+                if opt_type == "PE" and not rspe:
+                    blockers.append("regimeSellPe=false")
+                if opt_type == "CE" and not rsce:
+                    blockers.append("regimeSellCe=false")
+            else:
+                if spot_regime == "bullish" and opt_type != "PE":
+                    blockers.append("spot_regime_bullish_needs_PE")
+                elif spot_regime == "bearish" and opt_type != "CE":
+                    blockers.append("spot_regime_bearish_needs_CE")
+                elif spot_regime not in ("bullish", "bearish"):
+                    blockers.append(f"spot_regime_unset_or_mixed(regime={spot_regime!r})")
+            if ivr_min_threshold > 0 or ivr_leg_max_threshold > 0:
+                if ivr is None:
+                    blockers.append("IVR=null")
+                else:
+                    try:
+                        ivf = float(ivr)
+                        if ivr_min_threshold > 0 and ivf < float(ivr_min_threshold):
+                            blockers.append(f"IVR<{ivr_min_threshold} (got {ivf:.1f})")
+                        if ivr_leg_max_threshold > 0 and ivf > float(ivr_leg_max_threshold):
+                            blockers.append(f"IVR>{ivr_leg_max_threshold} (got {ivf:.1f})")
+                    except (TypeError, ValueError):
+                        blockers.append("IVR=invalid")
+            if diag_include_oob_delta and not _short_premium_signed_delta_ok(
+                delta,
+                opt_type,
+                ce_lo=short_ce_delta_min,
+                ce_hi=short_ce_delta_max,
+                pe_lo=short_pe_delta_min,
+                pe_hi=short_pe_delta_max,
+            ):
+                blockers.append(
+                    _short_premium_delta_blocker(
+                        delta,
+                        opt_type,
+                        ce_lo=short_ce_delta_min,
+                        ce_hi=short_ce_delta_max,
+                        pe_lo=short_pe_delta_min,
+                        pe_hi=short_pe_delta_max,
+                    )
+                )
+            if srm != "ema_cross_vwap":
+                if spot_regime == "bullish" and opt_type == "PE" and spot_bull < st_int:
+                    blockers.append(f"spot_bullish_score {spot_bull} < {st_int}")
+                elif spot_regime == "bearish" and opt_type == "CE" and spot_bear < st_int:
+                    blockers.append(f"spot_bearish_score {spot_bear} < {st_int}")
+            leg_ok = leg_sig
+            if not leg_ok:
+                detail = _failed_conditions_short_leg(
+                    bool(leg.get("primaryOk")),
+                    bool(leg.get("emaOk")),
+                    bool(leg.get("rsiOk")),
+                    rsi_min=rsi_min,
+                    rsi_max=rsi_max,
+                    leg_score_mode=short_premium_leg_score_mode,
+                    rsi_below_for_weak=short_premium_rsi_below,
+                    rsi_direct_band=short_premium_rsi_direct_band,
+                )
+                if detail != "PASS":
+                    blockers.append(f"leg_conditions: {detail}")
+                else:
+                    blockers.append(
+                        f"leg_composite_score_low(leg_score={leg_score}, need>={st_int})"
+                    )
+            sym = str(leg.get("tradingsymbol") or "").strip() or _compact_option_symbol(
+                instrument, expiry_str, strike, opt_type
+            )
+            non_liq = [b for b in blockers if not b.startswith("strict_liquidity")]
+            vol_ratio = float(leg.get("volumeSpikeRatio") or 0.0)
+            out.append(
+                {
+                    "symbol": sym,
+                    "strike": strike,
+                    "option_type": opt_type,
+                    "distance_to_atm": distance_to_atm,
+                    "ltp": round(ltp, 2),
+                    "delta": round(delta, 4),
+                    "delta_abs": round(delta_abs, 4),
+                    "ivr": round(float(ivr), 2) if ivr is not None else None,
+                    "oi": oi,
+                    "volume": volume,
+                    "volume_spike_ratio": vol_ratio,
+                    "ema9": float(leg.get("ema9") or 0.0),
+                    "ema21": float(leg.get("ema21") or 0.0),
+                    "vwap": float(leg.get("vwap") or 0.0),
+                    "rsi": float(leg.get("rsi") or 0.0),
+                    "regime_sell_pe": rspe,
+                    "regime_sell_ce": rsce,
+                    "leg_score": leg_score,
+                    "leg_signal_eligible": leg_sig,
+                    "ema_crossover_ok": bool(leg.get("emaCrossoverOk")),
+                    "blockers": "; ".join(blockers) if blockers else "—",
+                    "would_pass_non_liquidity_gates": len(non_liq) == 0,
+                }
+            )
+    return out
 
 
 async def _get_live_candidates(
@@ -328,7 +718,26 @@ async def _get_live_candidates(
     spot_regime_mode: str = "",
     include_volume_in_leg_score: bool = True,
     spot_regime_satisfied_score: int = 5,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    short_premium_asymmetric_datm: bool = False,
+    short_premium_ce_datm_min: int = 2,
+    short_premium_ce_datm_max: int = 4,
+    short_premium_pe_datm_min: int = -4,
+    short_premium_pe_datm_max: int = 2,
+    short_premium_delta_vix_bands: dict[str, Any] | None = None,
+    short_premium_delta_only_strikes: bool | None = None,
+    short_premium_leg_score_mode: str = "",
+    short_premium_rsi_below: float = 50.0,
+    short_premium_rsi_direct_band: bool = False,
+    short_premium_ivr_skew_min: float = 5.0,
+    short_premium_pcr_bonus_vs_chain: bool = True,
+    short_premium_pcr_chain_epsilon: float = 0.0,
+    short_premium_pcr_min_for_sell_ce: Any = None,
+    short_premium_pcr_max_for_sell_pe: Any = None,
+    require_rsi_for_eligible: bool = False,
+    long_premium_spot_align: bool = False,
+    min_volume_early_session: int | None = None,
+    early_session_end_hour_ist: int = 0,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     instrument = "NIFTY"
     if min_dte_calendar_days > 0:
         expiry_str = pick_expiry_with_min_calendar_dte(
@@ -340,12 +749,40 @@ async def _get_live_candidates(
     else:
         expiry_str = pick_primary_expiry_str(kite, instrument)
     if not expiry_str:
-        return [], []
+        return [], [], _chain_eval_meta(expiry_str=None, expiry_date=None, chain_len=0, reason="no_expiry")
     try:
         expiry_date = datetime.strptime(expiry_str.strip().upper(), "%d%b%Y").date()
     except ValueError:
         expiry_date = date.today()
     use_short = str(position_intent).strip().lower() == "short_premium"
+    if short_premium_delta_only_strikes is None:
+        short_premium_delta_only_strikes = bool(short_premium_delta_vix_bands) if use_short else False
+    else:
+        short_premium_delta_only_strikes = bool(short_premium_delta_only_strikes)
+    if use_short and isinstance(short_premium_delta_vix_bands, dict) and short_premium_delta_vix_bands:
+        short_premium_delta_only_strikes = True
+    vix_prefetch: float | None = None
+    if use_short and kite is not None:
+        vix_prefetch = await asyncio.to_thread(_vix_from_quote, kite)
+    chain_half_width = int(max_strike_distance)
+    if use_short and short_premium_delta_only_strikes:
+        try:
+            floor = int(os.getenv("S004_SHORT_PREMIUM_DELTA_ONLY_STRIKES_EACH_SIDE", "12") or "12")
+        except ValueError:
+            floor = 12
+        chain_half_width = max(chain_half_width, max(1, min(20, floor)))
+    effective_max_otm_steps = int(strike_max_otm_steps)
+    if use_short and not short_premium_delta_only_strikes:
+        _dspan = float(strike_delta_max_abs) - float(strike_delta_min_abs)
+        if _dspan <= 0.12:
+            try:
+                widen = int(os.getenv("S004_SHORT_PREMIUM_TIGHT_DELTA_STRIKES_EACH_SIDE", "12") or "12")
+            except ValueError:
+                widen = 12
+            widen = max(1, min(20, widen))
+            chain_half_width = max(chain_half_width, widen)
+            effective_max_otm_steps = max(effective_max_otm_steps, widen)
+            effective_max_otm_steps = min(effective_max_otm_steps, 20)
     indicator_params: dict[str, Any] = {
         "rsi_min": float(rsi_min),
         "rsi_max": float(rsi_max),
@@ -360,34 +797,117 @@ async def _get_live_candidates(
         indicator_params["spotRegimeSatisfiedScore"] = int(spot_regime_satisfied_score)
     if use_short:
         indicator_params["positionIntent"] = "short_premium"
+        indicator_params["scoreMaxLeg"] = int(max(3, min(10, score_max)))
+        _lm = str(short_premium_leg_score_mode or "").strip().lower()
+        if _lm:
+            indicator_params["shortPremiumLegScoreMode"] = _lm
+        indicator_params["shortPremiumRsiBelow"] = float(short_premium_rsi_below)
+        if short_premium_rsi_direct_band:
+            indicator_params["shortPremiumRsiDirectBand"] = True
+        indicator_params["shortPremiumIvrSkewMin"] = float(short_premium_ivr_skew_min)
+        indicator_params["shortPremiumPcrBonusVsChain"] = bool(short_premium_pcr_bonus_vs_chain)
+        indicator_params["shortPremiumPcrChainEpsilon"] = float(short_premium_pcr_chain_epsilon)
+        if short_premium_pcr_min_for_sell_ce is not None:
+            indicator_params["shortPremiumPcrMinForSellCe"] = short_premium_pcr_min_for_sell_ce
+        if short_premium_pcr_max_for_sell_pe is not None:
+            indicator_params["shortPremiumPcrMaxForSellPe"] = short_premium_pcr_max_for_sell_pe
     if ema_crossover_max_candles is not None:
         indicator_params["max_candles_since_cross"] = ema_crossover_max_candles
     if adx_min_threshold is not None:
         indicator_params["adx_period"] = adx_period
         indicator_params["adx_min_threshold"] = float(adx_min_threshold)
+    if require_rsi_for_eligible:
+        indicator_params["requireRsiForEligible"] = True
+    if long_premium_spot_align and not use_short:
+        indicator_params["longPremiumSpotAlign"] = True
+    eff_strike_min_volume = _effective_strike_min_volume(
+        int(strike_min_volume),
+        early_session_vol=min_volume_early_session,
+        early_session_end_hour_ist=int(early_session_end_hour_ist or 0),
+    )
     chain_payload = await asyncio.to_thread(
         fetch_option_chain_sync,
         kite,
         instrument,
         expiry_str,
-        max_strike_distance,
-        max_strike_distance,
+        chain_half_width,
+        chain_half_width,
         score_threshold,
         indicator_params if indicator_params else None,
     )
     chain = chain_payload.get("chain", [])
     spot = float(chain_payload.get("spot") or 0.0)
     if not chain or spot <= 0:
-        return [], []
+        return (
+            [],
+            [],
+            _chain_eval_meta(
+                expiry_str=expiry_str,
+                expiry_date=expiry_date,
+                chain_len=len(chain or []),
+                reason="empty_chain_or_spot",
+            ),
+        )
     spot_regime = chain_payload.get("spotRegime")
     spot_bull = int(chain_payload.get("spotBullishScore") or 0)
     spot_bear = int(chain_payload.get("spotBearishScore") or 0)
     strike_regime_mode = str(spot_regime_mode or "").strip().lower()
+    ce_d_lo = ce_d_hi = pe_d_lo = pe_d_hi = 0.0
+    short_delta_gate_note = ""
+    if use_short:
+        vix_for_delta = chain_payload.get("vix")
+        if vix_for_delta is None and vix_prefetch is not None:
+            vix_for_delta = vix_prefetch
+        ce_d_lo, ce_d_hi, pe_d_lo, pe_d_hi, short_delta_gate_note = _resolve_short_premium_delta_corners(
+            strike_delta_min_abs=strike_delta_min_abs,
+            strike_delta_max_abs=strike_delta_max_abs,
+            short_premium_delta_vix_bands=short_premium_delta_vix_bands,
+            vix=vix_for_delta,
+        )
+    try:
+        diag_max = int(os.getenv("S004_EVALUATION_LOG_MAX_DIAGNOSTIC_LEGS", "48") or "48")
+    except ValueError:
+        diag_max = 48
+    diag_max = max(8, min(80, diag_max))
+    short_diag: list[dict[str, Any]] = []
+    if use_short:
+        short_diag = _build_short_leg_diagnostics(
+            chain,
+            spot=spot,
+            strike_max_otm_steps=effective_max_otm_steps,
+            short_premium_delta_only_strikes=short_premium_delta_only_strikes,
+            short_premium_asymmetric_datm=short_premium_asymmetric_datm,
+            short_premium_ce_datm_min=short_premium_ce_datm_min,
+            short_premium_ce_datm_max=short_premium_ce_datm_max,
+            short_premium_pe_datm_min=short_premium_pe_datm_min,
+            short_premium_pe_datm_max=short_premium_pe_datm_max,
+            strike_regime_mode=strike_regime_mode,
+            spot_regime=spot_regime,
+            spot_bull=spot_bull,
+            spot_bear=spot_bear,
+            score_threshold=score_threshold,
+            ivr_min_threshold=ivr_min_threshold,
+            ivr_leg_max_threshold=ivr_leg_max_threshold,
+            short_ce_delta_min=ce_d_lo,
+            short_ce_delta_max=ce_d_hi,
+            short_pe_delta_min=pe_d_lo,
+            short_pe_delta_max=pe_d_hi,
+            rsi_min=rsi_min,
+            rsi_max=rsi_max,
+            strike_min_oi=strike_min_oi,
+            strike_min_volume=strike_min_volume,
+            instrument=instrument,
+            expiry_str=expiry_str,
+            short_premium_leg_score_mode=str(short_premium_leg_score_mode or ""),
+            short_premium_rsi_below=float(short_premium_rsi_below or 50),
+            short_premium_rsi_direct_band=bool(short_premium_rsi_direct_band),
+            max_rows=diag_max,
+        )
     step = 50
     atm = round(spot / step) * step
     conf_denom = max(1, int(score_max))
-    liq_tiers: list[tuple[int, int, bool]] = [(strike_min_oi, strike_min_volume, False)]
-    if strike_min_oi > 0 or strike_min_volume > 0:
+    liq_tiers: list[tuple[int, int, bool]] = [(strike_min_oi, eff_strike_min_volume, False)]
+    if strike_min_oi > 0 or eff_strike_min_volume > 0:
         liq_tiers.append((0, 0, True))
     recs: list[dict] = []
     for min_oi, min_vol, relaxed_liq in liq_tiers:
@@ -395,45 +915,66 @@ async def _get_live_candidates(
         for row in chain:
             strike = int(float(row.get("strike", 0)))
             distance_to_atm = int((strike - atm) / step)
-            if abs(distance_to_atm) > strike_max_otm_steps:
-                continue
+            skip_otm_geometry = use_short and short_premium_delta_only_strikes
+            if not skip_otm_geometry:
+                if not use_short or not short_premium_asymmetric_datm:
+                    if abs(distance_to_atm) > effective_max_otm_steps:
+                        continue
             for leg_key, opt_type in (("call", "CE"), ("put", "PE")):
+                if use_short and short_premium_asymmetric_datm and not skip_otm_geometry:
+                    if not _short_premium_datm_allows_leg(
+                        opt_type,
+                        distance_to_atm,
+                        ce_min=short_premium_ce_datm_min,
+                        ce_max=short_premium_ce_datm_max,
+                        pe_min=short_premium_pe_datm_min,
+                        pe_max=short_premium_pe_datm_max,
+                    ):
+                        continue
                 leg = row.get(leg_key) or {}
                 oi = int(float(leg.get("oi") or 0))
                 volume = int(float(leg.get("volume") or 0))
                 if oi < min_oi or volume < min_vol:
                     continue
+                strike_regime_ok = True
                 if use_short:
                     if strike_regime_mode == "ema_cross_vwap":
-                        if opt_type == "PE" and not leg.get("regimeSellPe"):
-                            continue
-                        if opt_type == "CE" and not leg.get("regimeSellCe"):
-                            continue
+                        strike_regime_ok = (
+                            (opt_type == "PE" and bool(leg.get("regimeSellPe")))
+                            or (opt_type == "CE" and bool(leg.get("regimeSellCe")))
+                        )
+                    elif spot_regime == "bullish":
+                        strike_regime_ok = opt_type == "PE"
+                    elif spot_regime == "bearish":
+                        strike_regime_ok = opt_type == "CE"
                     else:
-                        if spot_regime == "bullish" and opt_type != "PE":
-                            continue
-                        if spot_regime == "bearish" and opt_type != "CE":
-                            continue
-                        if spot_regime not in ("bullish", "bearish"):
-                            continue
+                        strike_regime_ok = False
                 ltp = float(leg.get("ltp") or 0.0)
                 delta = float(leg.get("delta") or 0.0)
-                delta_abs = abs(delta)
                 ivr = leg.get("ivr")
+                ivr_ok = True
+                delta_ok = True
                 if use_short:
                     if ivr_min_threshold > 0 or ivr_leg_max_threshold > 0:
                         if ivr is None:
-                            continue
-                        try:
-                            ivf = float(ivr)
-                            if ivr_min_threshold > 0 and ivf < float(ivr_min_threshold):
-                                continue
-                            if ivr_leg_max_threshold > 0 and ivf > float(ivr_leg_max_threshold):
-                                continue
-                        except (TypeError, ValueError):
-                            continue
-                    if delta_abs < strike_delta_min_abs - 1e-9 or delta_abs > strike_delta_max_abs + 1e-9:
-                        continue
+                            ivr_ok = False
+                        else:
+                            try:
+                                ivf = float(ivr)
+                                if ivr_min_threshold > 0 and ivf < float(ivr_min_threshold):
+                                    ivr_ok = False
+                                if ivr_leg_max_threshold > 0 and ivf > float(ivr_leg_max_threshold):
+                                    ivr_ok = False
+                            except (TypeError, ValueError):
+                                ivr_ok = False
+                    delta_ok = _short_premium_signed_delta_ok(
+                        delta,
+                        opt_type,
+                        ce_lo=ce_d_lo,
+                        ce_hi=ce_d_hi,
+                        pe_lo=pe_d_lo,
+                        pe_hi=pe_d_hi,
+                    )
                     st_int = int(score_threshold)
                     leg_score = int(leg.get("score") or 0)
                     if strike_regime_mode == "ema_cross_vwap":
@@ -447,9 +988,46 @@ async def _get_live_candidates(
                         score = int(spot_score)
                         spot_ok = score >= st_int
                     leg_ok = bool(leg.get("signalEligible"))
-                    signal_eligible = spot_ok and leg_ok
+                    signal_eligible = (
+                        spot_ok and leg_ok and strike_regime_ok and ivr_ok and delta_ok
+                    )
                     ivr_note = float(ivr) if ivr is not None else None
                     parts: list[str] = []
+                    if not ivr_ok:
+                        if ivr is None:
+                            parts.append("IVR=null")
+                        else:
+                            try:
+                                ivf = float(ivr)
+                                if ivr_min_threshold > 0 and ivf < float(ivr_min_threshold):
+                                    parts.append(f"IVR<{ivr_min_threshold} (got {ivf:.1f})")
+                                if ivr_leg_max_threshold > 0 and ivf > float(ivr_leg_max_threshold):
+                                    parts.append(f"IVR>{ivr_leg_max_threshold} (got {ivf:.1f})")
+                            except (TypeError, ValueError):
+                                parts.append("IVR=invalid")
+                    if not delta_ok:
+                        parts.append(
+                            _short_premium_delta_blocker(
+                                delta,
+                                opt_type,
+                                ce_lo=ce_d_lo,
+                                ce_hi=ce_d_hi,
+                                pe_lo=pe_d_lo,
+                                pe_hi=pe_d_hi,
+                            )
+                        )
+                    if not strike_regime_ok:
+                        if strike_regime_mode == "ema_cross_vwap":
+                            parts.append(
+                                "regimeSellPe=false (need fresh EMA9<EMA21 cross + LTP<VWAP on PE leg)"
+                                if opt_type == "PE"
+                                else "regimeSellCe=false (need fresh EMA9<EMA21 cross + LTP<VWAP on CE leg)"
+                            )
+                        else:
+                            parts.append(
+                                f"spot_regime={spot_regime!r} requires {'PE' if spot_regime == 'bullish' else 'CE'}; "
+                                f"leg={opt_type}"
+                            )
                     if not spot_ok:
                         parts.append(
                             f"NIFTY spot trend score {score} < {st_int} (regime={spot_regime}, IVR={ivr_note})"
@@ -463,6 +1041,9 @@ async def _get_live_candidates(
                             bool(leg.get("rsiOk")),
                             rsi_min=rsi_min,
                             rsi_max=rsi_max,
+                            leg_score_mode=str(short_premium_leg_score_mode or ""),
+                            rsi_below_for_weak=float(short_premium_rsi_below or 50),
+                            rsi_direct_band=bool(short_premium_rsi_direct_band),
                         )
                         if leg_detail != "PASS":
                             parts.append(leg_detail)
@@ -487,7 +1068,14 @@ async def _get_live_candidates(
                                 score = min(score_max, score + ivr_bonus)
                         except (TypeError, ValueError):
                             pass
-                    signal_eligible = bool(leg.get("signalEligible"))
+                    leg_chain_eligible = bool(leg.get("signalEligible"))
+                    signal_eligible = leg_chain_eligible
+                    if long_premium_spot_align and leg_chain_eligible:
+                        sr_spot = spot_regime
+                        if opt_type == "CE" and sr_spot != "bullish":
+                            signal_eligible = False
+                        elif opt_type == "PE" and sr_spot != "bearish":
+                            signal_eligible = False
                     side = "BUY"
                     target_price = round(ltp * 1.08, 2)
                     stop_loss_price = round(ltp * 0.94, 2)
@@ -498,6 +1086,17 @@ async def _get_live_candidates(
                         rsi_min=rsi_min,
                         rsi_max=rsi_max,
                     )
+                    if long_premium_spot_align and leg_chain_eligible and not signal_eligible:
+                        sr_spot = spot_regime
+                        if opt_type == "CE":
+                            spot_note = (
+                                f"NIFTY spot not bullish for CE (spotRegime={sr_spot!r}; need bullish)"
+                            )
+                        else:
+                            spot_note = (
+                                f"NIFTY spot not bearish for PE (spotRegime={sr_spot!r}; need bearish)"
+                            )
+                        failed_msg = spot_note if failed_msg == "PASS" else f"{failed_msg}; {spot_note}"
                     gamma_val = 0.0
                 if relaxed_liq:
                     signal_eligible = False
@@ -548,6 +1147,7 @@ async def _get_live_candidates(
                         "timeframe": "3m",
                         "refresh_interval_sec": 30,
                         "distance_to_atm": distance_to_atm,
+                        "strike": strike,
                         "oi": oi,
                         "oi_chg_pct": oi_chg_pct,
                         "delta": delta,
@@ -558,8 +1158,28 @@ async def _get_live_candidates(
                 )
         if recs:
             break
-    # Full scan before min-gamma cap / final sort — used for evaluation JSONL.
+    # Snapshot before long eligible cap / short gamma trim — used for evaluation JSONL.
     scanned_before_rank = list(recs)
+    if not use_short and recs:
+        cap_l = max(1, int(max_strike_recommendations))
+        elig_l = [r for r in recs if r.get("signal_eligible")]
+        if len(elig_l) > cap_l:
+            elig_l.sort(
+                key=lambda x: (
+                    -int(x.get("score") or 0),
+                    -float(x.get("volume_spike_ratio") or 0.0),
+                    -float(x.get("oi_chg_pct") or 0.0),
+                    x["delta_distance"],
+                    abs(x["distance_to_atm"]),
+                )
+            )
+            keep_ids = {id(r) for r in elig_l[:cap_l]}
+            note_tail = f"eligible_cap_per_refresh(max={cap_l})"
+            for r in recs:
+                if r.get("signal_eligible") and id(r) not in keep_ids:
+                    r["signal_eligible"] = False
+                    prev = str(r.get("failed_conditions") or "PASS")
+                    r["failed_conditions"] = note_tail if prev == "PASS" else f"{prev}; {note_tail}"
     if use_short and select_strike_by_min_gamma and recs:
         eligible_recs = [r for r in recs if r.get("signal_eligible")]
         if eligible_recs:
@@ -592,7 +1212,33 @@ async def _get_live_candidates(
                 abs(x["distance_to_atm"]),
             )
         )
-    return recs, scanned_before_rank
+    snap = _chain_eval_meta(
+        expiry_str=expiry_str,
+        expiry_date=expiry_date,
+        chain_len=len(chain),
+        short_leg_diagnostics=short_diag if use_short else None,
+    )
+    if use_short:
+        snap["short_premium_delta_abs"] = short_delta_gate_note
+        snap["short_delta_ce_lo"] = ce_d_lo
+        snap["short_delta_ce_hi"] = ce_d_hi
+        snap["short_delta_pe_lo"] = pe_d_lo
+        snap["short_delta_pe_hi"] = pe_d_hi
+        snap["india_vix"] = chain_payload.get("vix")
+        if snap["india_vix"] is None and vix_prefetch is not None:
+            snap["india_vix"] = vix_prefetch
+        snap["short_premium_strike_select"] = (
+            "delta_only (VIX→delta band; maxOtmSteps/dATM off)" if short_premium_delta_only_strikes else "otm_steps"
+        )
+        snap["chain_strikes_each_side"] = chain_half_width
+        if short_premium_asymmetric_datm and not short_premium_delta_only_strikes:
+            snap["short_premium_ce_datm"] = (
+                f"{short_premium_ce_datm_min}..{short_premium_ce_datm_max}"
+            )
+            snap["short_premium_pe_datm"] = (
+                f"{short_premium_pe_datm_min}..{short_premium_pe_datm_max}"
+            )
+    return (recs, scanned_before_rank, snap)
 
 
 async def _get_live_candidates_trendpulse_z(
@@ -1090,8 +1736,18 @@ async def _get_live_candidates_heuristic(
 async def get_strategy_score_params(
     strategy_id: str, strategy_version: str, user_id: int | None = None
 ) -> dict:
-    """Get scoreThreshold, scoreMax, autoTradeScoreThreshold from strategy JSON. Marketplace catalog has higher priority; Settings as fallback when catalog has no config."""
-    details = None
+    """Load strategy JSON from catalog, then merge per-user Settings on top so UI edits (e.g. IVR bands) apply."""
+
+    def _parse_details(raw: Any) -> dict[str, Any]:
+        if raw is None:
+            return {}
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw) if raw.strip() else {}
+            except json.JSONDecodeError:
+                return {}
+        return raw if isinstance(raw, dict) else {}
+
     catalog_row = await fetchrow(
         """
         SELECT strategy_details_json FROM s004_strategy_catalog
@@ -1100,9 +1756,8 @@ async def get_strategy_score_params(
         strategy_id,
         strategy_version,
     )
-    if catalog_row:
-        details = catalog_row.get("strategy_details_json")
-    if details is None and user_id is not None:
+    details = _parse_details(catalog_row.get("strategy_details_json") if catalog_row else None)
+    if user_id is not None:
         user_row = await fetchrow(
             """
             SELECT strategy_details_json FROM s004_user_strategy_settings
@@ -1113,14 +1768,9 @@ async def get_strategy_score_params(
             strategy_version,
         )
         if user_row:
-            details = user_row.get("strategy_details_json")
-    if isinstance(details, str):
-        try:
-            details = json.loads(details) if details else {}
-        except json.JSONDecodeError:
-            details = {}
-    if not isinstance(details, dict):
-        details = {}
+            user_details = _parse_details(user_row.get("strategy_details_json"))
+            if user_details:
+                details = _deep_merge_strategy_details(details, user_details)
     indicators = details.get("indicators") or {}
     if not isinstance(indicators, dict):
         indicators = {}
@@ -1256,7 +1906,7 @@ async def get_strategy_score_params(
             strategy_version,
         )
 
-    return {
+    result: dict[str, Any] = {
         "strategy_type": strategy_type,
         "position_intent": position_intent,
         "ivr_min_threshold": ivr_min_threshold,
@@ -1296,6 +1946,62 @@ async def get_strategy_score_params(
         "include_volume_in_leg_score": bool(details.get("includeVolumeInLegScore", True)),
         "spot_regime_satisfied_score": _num_int(details.get("spotRegimeSatisfiedScore", 5), 5),
     }
+    if position_intent == "short_premium":
+        _asym_raw = strike_cfg.get("shortPremiumAsymmetricDatm")
+        result["short_premium_asymmetric_datm"] = (
+            bool(_asym_raw) if isinstance(_asym_raw, bool) else str(_asym_raw).strip().lower() in {"1", "true", "yes"}
+        )
+        _sce_lo = _num_int(strike_cfg.get("shortPremiumCeMinSteps"), 2)
+        _sce_hi = _num_int(strike_cfg.get("shortPremiumCeMaxSteps"), 4)
+        _spe_lo = _num_int(strike_cfg.get("shortPremiumPeMinSteps"), -4)
+        _spe_hi = _num_int(strike_cfg.get("shortPremiumPeMaxSteps"), 2)
+        if _sce_lo > _sce_hi:
+            _sce_lo, _sce_hi = _sce_hi, _sce_lo
+        if _spe_lo > _spe_hi:
+            _spe_lo, _spe_hi = _spe_hi, _spe_lo
+        result["short_premium_ce_datm_min"] = _sce_lo
+        result["short_premium_ce_datm_max"] = _sce_hi
+        result["short_premium_pe_datm_min"] = _spe_lo
+        result["short_premium_pe_datm_max"] = _spe_hi
+        bands = _normalize_short_premium_delta_vix_bands(strike_cfg)
+        result["short_premium_delta_vix_bands"] = bands
+        _pdo = strike_cfg.get("shortPremiumDeltaOnlyStrikes")
+        # VIX delta bands imply strike selection by delta; otm_steps + narrow ±strikes often yields zero in-band legs.
+        if bands is not None:
+            result["short_premium_delta_only_strikes"] = True
+        elif isinstance(_pdo, bool):
+            result["short_premium_delta_only_strikes"] = _pdo
+        else:
+            result["short_premium_delta_only_strikes"] = False
+        _slm = strike_cfg.get("shortPremiumLegScoreMode")
+        result["short_premium_leg_score_mode"] = (
+            str(_slm).strip().lower() if _slm is not None and str(_slm).strip() else ""
+        )
+        result["short_premium_rsi_below"] = _num_float(strike_cfg.get("shortPremiumRsiBelow"), 50.0)
+        _srdb = strike_cfg.get("shortPremiumRsiDirectBand")
+        result["short_premium_rsi_direct_band"] = (
+            bool(_srdb) if isinstance(_srdb, bool) else str(_srdb or "").strip().lower() in {"1", "true", "yes"}
+        )
+        result["short_premium_ivr_skew_min"] = _num_float(strike_cfg.get("shortPremiumIvrSkewMin"), 5.0)
+        _pvc = strike_cfg.get("shortPremiumPcrBonusVsChain", True)
+        if isinstance(_pvc, str):
+            result["short_premium_pcr_bonus_vs_chain"] = _pvc.strip().lower() in {"1", "true", "yes"}
+        else:
+            result["short_premium_pcr_bonus_vs_chain"] = bool(_pvc)
+        result["short_premium_pcr_chain_epsilon"] = _num_float(strike_cfg.get("shortPremiumPcrChainEpsilon"), 0.0)
+        result["short_premium_pcr_min_for_sell_ce"] = strike_cfg.get("shortPremiumPcrMinForSellCe")
+        result["short_premium_pcr_max_for_sell_pe"] = strike_cfg.get("shortPremiumPcrMaxForSellPe")
+    result["require_rsi_for_eligible"] = bool(details.get("requireRsiForEligible", False))
+    result["long_premium_spot_align"] = bool(details.get("longPremiumSpotAlign", False))
+    _mve = strike_cfg.get("minVolumeEarlySession")
+    try:
+        result["min_volume_early_session"] = (
+            int(_mve) if _mve is not None and not isinstance(_mve, bool) else None
+        )
+    except (TypeError, ValueError):
+        result["min_volume_early_session"] = None
+    result["early_session_end_hour_ist"] = _num_int(strike_cfg.get("earlySessionEndHourIST"), 0)
+    return result
 
 
 async def _get_user_strategy(user_id: int) -> tuple[str, str]:
@@ -1458,9 +2164,14 @@ async def ensure_recommendations(user_id: int, kite: KiteConnect | None = None) 
         spot_regime_mode = str(score_params.get("spot_regime_mode", "")).strip()
         include_volume_in_leg_score = bool(score_params.get("include_volume_in_leg_score", True))
         spot_regime_satisfied_score = int(score_params.get("spot_regime_satisfied_score", 5))
+        require_rsi_for_eligible = bool(score_params.get("require_rsi_for_eligible", False))
+        long_premium_spot_align = bool(score_params.get("long_premium_spot_align", False))
+        min_volume_early_session = score_params.get("min_volume_early_session")
+        early_session_end_hour_ist = int(score_params.get("early_session_end_hour_ist", 0) or 0)
 
         generated_rows: list[dict] = []
         scanned_for_log: list[dict] | None = None
+        chain_meta: dict[str, Any] = {}
         fetch_failed = False
         fetch_error: str | None = None
         try:
@@ -1509,7 +2220,7 @@ async def ensure_recommendations(user_id: int, kite: KiteConnect | None = None) 
                     enhancement_cfg=enhancement_cfg,
                 )
             else:
-                generated_rows, scanned_for_log = await _get_live_candidates(
+                generated_rows, scanned_for_log, chain_meta = await _get_live_candidates(
                     kite,
                     max_strike_distance,
                     score_threshold=int(score_threshold),
@@ -1541,11 +2252,55 @@ async def ensure_recommendations(user_id: int, kite: KiteConnect | None = None) 
                     spot_regime_mode=spot_regime_mode,
                     include_volume_in_leg_score=include_volume_in_leg_score,
                     spot_regime_satisfied_score=spot_regime_satisfied_score,
+                    short_premium_asymmetric_datm=bool(
+                        score_params.get("short_premium_asymmetric_datm", False)
+                    ),
+                    short_premium_ce_datm_min=int(
+                        score_params.get("short_premium_ce_datm_min", 2)
+                    ),
+                    short_premium_ce_datm_max=int(
+                        score_params.get("short_premium_ce_datm_max", 4)
+                    ),
+                    short_premium_pe_datm_min=int(
+                        score_params.get("short_premium_pe_datm_min", -4)
+                    ),
+                    short_premium_pe_datm_max=int(
+                        score_params.get("short_premium_pe_datm_max", 2)
+                    ),
+                    short_premium_delta_vix_bands=score_params.get("short_premium_delta_vix_bands"),
+                    short_premium_delta_only_strikes=score_params.get("short_premium_delta_only_strikes"),
+                    short_premium_leg_score_mode=str(
+                        score_params.get("short_premium_leg_score_mode") or ""
+                    ),
+                    short_premium_rsi_below=float(score_params.get("short_premium_rsi_below", 50)),
+                    short_premium_rsi_direct_band=bool(
+                        score_params.get("short_premium_rsi_direct_band", False)
+                    ),
+                    short_premium_ivr_skew_min=float(score_params.get("short_premium_ivr_skew_min", 5)),
+                    short_premium_pcr_bonus_vs_chain=bool(
+                        score_params.get("short_premium_pcr_bonus_vs_chain", True)
+                    ),
+                    short_premium_pcr_chain_epsilon=float(
+                        score_params.get("short_premium_pcr_chain_epsilon", 0)
+                    ),
+                    short_premium_pcr_min_for_sell_ce=score_params.get(
+                        "short_premium_pcr_min_for_sell_ce"
+                    ),
+                    short_premium_pcr_max_for_sell_pe=score_params.get(
+                        "short_premium_pcr_max_for_sell_pe"
+                    ),
+                    require_rsi_for_eligible=require_rsi_for_eligible,
+                    long_premium_spot_align=long_premium_spot_align,
+                    min_volume_early_session=min_volume_early_session
+                    if type(min_volume_early_session) is int
+                    else None,
+                    early_session_end_hour_ist=early_session_end_hour_ist,
                 )
         except Exception as exc:
             fetch_failed = True
             generated_rows = []
             scanned_for_log = None
+            chain_meta = {}
             fetch_error = str(exc)
             _logger.warning(
                 "ensure_recommendations failed strategy=%s version=%s: %s",
@@ -1565,6 +2320,7 @@ async def ensure_recommendations(user_id: int, kite: KiteConnect | None = None) 
             error=fetch_error,
             generated_rows=generated_rows,
             scanned_candidates=scanned_for_log,
+            chain_snapshot=chain_meta,
         )
 
         if fetch_failed:
@@ -2375,6 +3131,88 @@ async def get_auto_execute_eligible_recommendations(
             r["mode"] = mode
             eligible.append(r)
     return eligible
+
+
+def _infer_option_type_recommendation_row(r: dict[str, Any]) -> str:
+    ot = str(r.get("option_type") or "").strip().upper()
+    if ot in ("CE", "PE"):
+        return ot
+    sym = str(r.get("symbol") or "").strip().upper()
+    if sym.endswith("PE"):
+        return "PE"
+    if sym.endswith("CE"):
+        return "CE"
+    return ""
+
+
+async def filter_recommendations_short_delta_band_only(
+    user_id: int,
+    kite: KiteConnect | None,
+    rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """
+    Keep only short_premium rows whose persisted delta sits in the active CE/PE band
+    (VIX-resolved shortPremiumDeltaVixBands, else deltaMinAbs/deltaMaxAbs). Other rows unchanged.
+    """
+    if not rows:
+        return rows
+    vix: Any = None
+    if kite is not None:
+        try:
+            vix = await asyncio.to_thread(_vix_from_quote, kite)
+        except Exception:
+            vix = None
+    params_cache: dict[tuple[str, str], dict[str, Any]] = {}
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        sid = str(r.get("strategy_id") or "").strip()
+        ver = str(r.get("strategy_version") or "").strip()
+        if not sid or not ver:
+            out.append(r)
+            continue
+        key = (sid, ver)
+        if key not in params_cache:
+            try:
+                params_cache[key] = await get_strategy_score_params(sid, ver, user_id)
+            except Exception:
+                _logger.exception(
+                    "filter_recommendations_short_delta_band_only: get_strategy_score_params failed sid=%s ver=%s",
+                    sid,
+                    ver,
+                )
+                params_cache[key] = {}
+        sp = params_cache[key]
+        if str(sp.get("position_intent", "")).strip().lower() != "short_premium":
+            out.append(r)
+            continue
+        d_lo_abs = float(sp.get("strike_delta_min_abs", 0.29))
+        d_hi_abs = float(sp.get("strike_delta_max_abs", 0.35))
+        bands = sp.get("short_premium_delta_vix_bands")
+        ce_lo, ce_hi, pe_lo, pe_hi, _note = _resolve_short_premium_delta_corners(
+            strike_delta_min_abs=d_lo_abs,
+            strike_delta_max_abs=d_hi_abs,
+            short_premium_delta_vix_bands=bands if isinstance(bands, dict) and bands else None,
+            vix=vix,
+        )
+        opt = _infer_option_type_recommendation_row(r)
+        if not opt:
+            continue
+        delta_raw = r.get("delta")
+        try:
+            delta = float(delta_raw) if delta_raw is not None else float("nan")
+        except (TypeError, ValueError):
+            delta = float("nan")
+        if delta != delta or not _short_premium_signed_delta_ok(
+            delta,
+            opt,
+            ce_lo=ce_lo,
+            ce_hi=ce_hi,
+            pe_lo=pe_lo,
+            pe_hi=pe_hi,
+        ):
+            continue
+        out.append(r)
+    return out
 
 
 async def list_recommendations_for_user(

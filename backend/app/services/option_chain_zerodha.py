@@ -253,8 +253,21 @@ def _indicator_pack_from_series_bearish(
     volume_min_ratio: float = 1.5,
     *,
     include_volume_in_score: bool = True,
+    include_ema_crossover_in_score: bool = True,
+    leg_score_mode: str = "legacy",
+    rsi_below_for_weak: float = 50.0,
+    rsi_direct_band: bool = False,
 ) -> dict[str, Any]:
-    """Bearish mirror of _indicator_pack_from_series: price below VWAP, EMA9 < EMA21, RSI in lower band."""
+    """Bearish mirror of _indicator_pack_from_series: price below VWAP, EMA9 < EMA21, RSI on option LTP.
+
+    ``leg_score_mode``:
+    - ``legacy``: RSI in mirror band vs ``rsi_min``/``rsi_max``, crossover + optional volume in score.
+    - ``three_factor``: +1 LTP<VWAP, +1 EMA9<EMA21, +1 RSI<``rsi_below_for_weak``; no crossover/volume in score.
+      Skew/PCR bonuses are applied later in ``_apply_short_premium_skew_pcr_leg_scores``.
+
+    ``rsi_direct_band``: when True (short premium), ``rsi_ok`` = ``rsi_min`` <= RSI <= ``rsi_max`` on the leg
+    (e.g. overbought 65–100); applies to both ``legacy`` and ``three_factor`` RSI checks.
+    """
     if not ltps:
         return {
             "ema9": 0.0,
@@ -264,6 +277,7 @@ def _indicator_pack_from_series_bearish(
             "avgVolume": 0.0,
             "volumeSpikeRatio": 0.0,
             "score": 0,
+            "technicalScore": 0,
             "primaryOk": False,
             "emaOk": False,
             "emaCrossoverOk": False,
@@ -271,6 +285,8 @@ def _indicator_pack_from_series_bearish(
             "volumeOk": False,
             "signalEligible": False,
         }
+    mode = (leg_score_mode or "legacy").strip().lower()
+    three_factor = mode == "three_factor"
     rsi_bear_lo = max(0.0, 100.0 - float(rsi_max))
     rsi_bear_hi = min(100.0, 100.0 - float(rsi_min))
     if rsi_bear_lo > rsi_bear_hi:
@@ -301,17 +317,36 @@ def _indicator_pack_from_series_bearish(
     vol_ratio = (vol_now / avg_vol) if avg_vol > 0 else 0.0
     primary_ok = close_now < vwap
     ema_ok = ema9 < ema21
-    rsi_ok = rsi_bear_lo <= rsi <= rsi_bear_hi
     raw_vol_ok = vol_ratio > volume_min_ratio
-    volume_ok = raw_vol_ok if include_volume_in_score else True
-    vol_pts = (1 if raw_vol_ok else 0) if include_volume_in_score else 0
-    score = (
-        (1 if primary_ok else 0)
-        + (1 if ema_ok else 0)
-        + (1 if ema_crossover else 0)
-        + (1 if rsi_ok else 0)
-        + vol_pts
-    )
+    if three_factor:
+        include_ema_crossover_in_score = False
+        include_volume_in_score = False
+        if rsi_direct_band:
+            rlo, rhi = float(rsi_min), float(rsi_max)
+            if rlo > rhi:
+                rlo, rhi = rhi, rlo
+            rsi_ok = rlo - 1e-9 <= rsi <= rhi + 1e-9
+        else:
+            thr = float(rsi_below_for_weak)
+            rsi_ok = rsi < thr
+        cross_pts = 0
+        vol_pts = 0
+        technical = (1 if primary_ok else 0) + (1 if ema_ok else 0) + (1 if rsi_ok else 0)
+        score = technical
+        volume_ok = True
+    else:
+        if rsi_direct_band:
+            rlo, rhi = float(rsi_min), float(rsi_max)
+            if rlo > rhi:
+                rlo, rhi = rhi, rlo
+            rsi_ok = rlo - 1e-9 <= rsi <= rhi + 1e-9
+        else:
+            rsi_ok = rsi_bear_lo <= rsi <= rsi_bear_hi
+        volume_ok = raw_vol_ok if include_volume_in_score else True
+        vol_pts = (1 if raw_vol_ok else 0) if include_volume_in_score else 0
+        cross_pts = (1 if ema_crossover else 0) if include_ema_crossover_in_score else 0
+        technical = (1 if primary_ok else 0) + (1 if ema_ok else 0) + cross_pts + (1 if rsi_ok else 0) + vol_pts
+        score = technical
     return {
         "ema9": round(ema9, 2),
         "ema21": round(ema21, 2),
@@ -320,6 +355,7 @@ def _indicator_pack_from_series_bearish(
         "avgVolume": float(round(avg_vol, 2)),
         "volumeSpikeRatio": round(vol_ratio, 2),
         "score": score,
+        "technicalScore": score,
         "primaryOk": primary_ok,
         "emaOk": ema_ok,
         "emaCrossoverOk": ema_crossover,
@@ -338,13 +374,17 @@ def _max_candles_since_cross_int(raw: Any, default: int = 5) -> int:
         return max(1, default)
 
 
+# Must match _bars_since_bullish_cross / _bars_since_bearish_cross (slow_period + 2).
+_REGIME_LTP_MIN_LEN = max(9, 21) + 2
+
+
 def _strike_leg_regime_sell_pe(
     ltps: list[float],
     vols: list[float],
     max_cross_i: int,
 ) -> tuple[bool, int | None]:
-    """Sell PE: fresh EMA9 cross above EMA21 on this leg LTP series; last LTP < leg VWAP."""
-    if len(ltps) < 22:
+    """Sell PE: same regime geometry as sell CE — fresh EMA9 cross below EMA21; last LTP < leg VWAP."""
+    if len(ltps) < _REGIME_LTP_MIN_LEN:
         return False, None
     n = min(len(ltps), len(vols))
     t = ltps[-n:]
@@ -353,7 +393,7 @@ def _strike_leg_regime_sell_pe(
     vwap = sum(p * max(0.0, vol) for p, vol in zip(t, v)) / v_sum if v_sum > 0 else statistics.mean(t)
     if not (t[-1] < vwap):
         return False, None
-    bb = _bars_since_bullish_cross(t, 9, 21)
+    bb = _bars_since_bearish_cross(t, 9, 21)
     if bb is None or bb > max_cross_i:
         return False, bb
     return True, bb
@@ -365,7 +405,7 @@ def _strike_leg_regime_sell_ce(
     max_cross_i: int,
 ) -> tuple[bool, int | None]:
     """Sell CE: fresh EMA9 cross below EMA21 on this leg LTP series; last LTP < leg VWAP."""
-    if len(ltps) < 22:
+    if len(ltps) < _REGIME_LTP_MIN_LEN:
         return False, None
     n = min(len(ltps), len(vols))
     t = ltps[-n:]
@@ -439,8 +479,25 @@ def _spot_trend_payload_from_candles(
         include_ema_crossover_in_score=inc_cross,
         strict_bullish_comparisons=strict_bull,
     )
+    leg_mode_spot = str(ip.get("shortPremiumLegScoreMode") or "").strip().lower()
+    rsi_below_spot = float(ip.get("shortPremiumRsiBelow", 50) or 50)
+    inc_cross_bear_spot = bool(ip.get("include_ema_crossover_in_score", True))
+    inc_vol_bear_spot = bool(ip.get("include_volume_in_leg_score", True))
+    if leg_mode_spot == "three_factor":
+        inc_cross_bear_spot = False
+        inc_vol_bear_spot = False
     bear = _indicator_pack_from_series_bearish(
-        closes, vols, score_threshold, max_cross, rsi_min, rsi_max, vol_min
+        closes,
+        vols,
+        score_threshold,
+        max_cross,
+        rsi_min,
+        rsi_max,
+        vol_min,
+        include_volume_in_score=inc_vol_bear_spot,
+        include_ema_crossover_in_score=inc_cross_bear_spot,
+        leg_score_mode=leg_mode_spot or "legacy",
+        rsi_below_for_weak=rsi_below_spot,
     )
     bs = int(bull["score"])
     be = int(bear["score"])
@@ -466,6 +523,7 @@ def _indicator_pack_from_series(
     include_ema_crossover_in_score: bool = True,
     strict_bullish_comparisons: bool = False,
     include_volume_in_score: bool = True,
+    require_rsi_for_eligible: bool = False,
 ) -> dict[str, Any]:
     if not ltps:
         return {
@@ -538,7 +596,9 @@ def _indicator_pack_from_series(
         "emaCrossoverOk": ema_crossover,
         "rsiOk": rsi_ok,
         "volumeOk": volume_ok,
-        "signalEligible": primary_ok and score >= score_threshold,
+        "signalEligible": primary_ok
+        and score >= score_threshold
+        and (rsi_ok if require_rsi_for_eligible else True),
     }
 
 
@@ -555,6 +615,7 @@ def _indicator_pack_from_quote_fallback(
     include_ema_crossover_in_score: bool = True,
     strict_bullish_comparisons: bool = False,
     include_volume_in_score: bool = True,
+    require_rsi_for_eligible: bool = False,
 ) -> dict[str, Any]:
     ohlc = quote.get("ohlc") or {}
     o = float(ohlc.get("open") or last_price or 0.0)
@@ -576,6 +637,7 @@ def _indicator_pack_from_quote_fallback(
         include_ema_crossover_in_score=include_ema_crossover_in_score,
         strict_bullish_comparisons=strict_bullish_comparisons,
         include_volume_in_score=include_volume_in_score,
+        require_rsi_for_eligible=require_rsi_for_eligible,
     )
 
 
@@ -590,6 +652,10 @@ def _indicator_pack_from_quote_fallback_bearish(
     volume_min_ratio: float = 1.5,
     *,
     include_volume_in_score: bool = True,
+    include_ema_crossover_in_score: bool = True,
+    leg_score_mode: str = "legacy",
+    rsi_below_for_weak: float = 50.0,
+    rsi_direct_band: bool = False,
 ) -> dict[str, Any]:
     """Same synthetic OHLC path as bullish fallback, but bearish pack (premium weakness on option LTP)."""
     ohlc = quote.get("ohlc") or {}
@@ -610,6 +676,10 @@ def _indicator_pack_from_quote_fallback_bearish(
         rsi_max,
         volume_min_ratio,
         include_volume_in_score=include_volume_in_score,
+        include_ema_crossover_in_score=include_ema_crossover_in_score,
+        leg_score_mode=leg_score_mode,
+        rsi_below_for_weak=rsi_below_for_weak,
+        rsi_direct_band=rsi_direct_band,
     )
 
 
@@ -664,7 +734,7 @@ def list_expiries_from_nfo_sync(kite: KiteConnect, instrument: str, max_expiries
     if inst not in {"NIFTY", "BANKNIFTY", "FINNIFTY"}:
         return []
     rows = _load_option_instruments(kite, inst)
-    today = date.today()
+    today = _calendar_today_ist()
     seen: set[date] = set()
     for row in rows:
         exp = _expiry_as_date(row.get("expiry"))
@@ -749,6 +819,28 @@ def first_expiry_meeting_min_calendar_dte(
     )
 
 
+def resolve_expiry_min_dte_weekday_with_fallback(
+    expiries: list[str],
+    today: date,
+    *,
+    min_dte_days: int,
+    weekday: int | None,
+) -> str | None:
+    """
+    Prefer ``weekday`` when set; if no listed expiry matches that day while meeting min DTE,
+    fall back to the earliest expiry that still satisfies min calendar DTE (same as weekday=None).
+    Ensures chain fetch can proceed when the broker list has no qualifying weekly on the nominal day.
+    """
+    picked = select_expiry_min_dte_and_weekday(
+        expiries, today, min_dte_days=min_dte_days, weekday=weekday
+    )
+    if picked is not None or weekday is None:
+        return picked
+    return select_expiry_min_dte_and_weekday(
+        expiries, today, min_dte_days=min_dte_days, weekday=None
+    )
+
+
 def pick_expiry_with_min_calendar_dte(
     kite: KiteConnect | None,
     instrument: str = "NIFTY",
@@ -759,14 +851,15 @@ def pick_expiry_with_min_calendar_dte(
     """
     Listed weekly expiry: calendar DTE (IST) >= min_dte_days, optionally matching NIFTY weekly expiry weekday.
     ``weekday`` None = ignore weekday (earliest qualifying). Default weekday 1 = Tuesday (typical NIFTY weekly).
-    Returns None when no expiry qualifies.
+    If no expiry matches ``weekday`` but some meet min DTE, falls back to earliest min-DTE expiry (any weekday).
+    Returns None when no expiry qualifies min DTE.
     """
     inst = instrument.strip().upper()
     expiries, _ = get_expiries_for_analytics(kite, inst)
     if not expiries:
         return None
     today = _calendar_today_ist()
-    return select_expiry_min_dte_and_weekday(
+    return resolve_expiry_min_dte_weekday_with_fallback(
         expiries, today, min_dte_days=min_dte_days, weekday=weekday
     )
 
@@ -1013,11 +1106,16 @@ def _step_for_instrument(instrument: str) -> int:
 
 
 def _window_size() -> int:
+    """
+    Snapshots kept per (instrument, expiry) for option-leg LTP/volume series.
+    EMA21 + fresh-cross detection needs ~23+ points (_bars_since_* uses slow_period+2).
+    Default 30 so short-premium ``ema_cross_vwap`` regime can become true after warm-up.
+    """
     try:
-        value = int(os.getenv("OPTION_CHAIN_RECENT_WINDOW", "10"))
+        value = int(os.getenv("OPTION_CHAIN_RECENT_WINDOW", "30"))
     except ValueError:
-        value = 10
-    return max(5, min(10, value))
+        value = 30
+    return max(10, min(60, value))
 
 
 def _expiry_as_date(raw: Any) -> date | None:
@@ -1142,6 +1240,10 @@ def _build_live_chain(
     ip_global = indicator_params or {}
     short_premium_legs = str(ip_global.get("positionIntent", "")).lower() == "short_premium"
     reg_srm = str(ip_global.get("spotRegimeMode") or ip_global.get("spot_regime_mode") or "").strip().lower()
+    leg_mode_short = str(ip_global.get("shortPremiumLegScoreMode") or "").strip().lower()
+    req_rsi_eligible = bool(ip_global.get("requireRsiForEligible"))
+    rsi_below_short = float(ip_global.get("shortPremiumRsiBelow", 50) or 50)
+    rsi_direct_short = bool(ip_global.get("shortPremiumRsiDirectBand"))
 
     for strike in strikes:
         call_q = quote_data.get(f"NFO:{by_key[(strike, 'CE')]['tradingsymbol']}") if (strike, "CE") in by_key else {}
@@ -1190,6 +1292,11 @@ def _build_live_chain(
         inc_cross = bool(ip_global.get("include_ema_crossover_in_score", True))
         strict_bull = bool(ip_global.get("strict_bullish_comparisons", False))
         inc_vol_score = bool(ip_global.get("include_volume_in_leg_score", True))
+        inc_cross_bear = inc_cross
+        inc_vol_bear = inc_vol_score
+        if short_premium_legs and leg_mode_short == "three_factor":
+            inc_cross_bear = False
+            inc_vol_bear = False
         if short_premium_legs:
             call_ind = _indicator_pack_from_series_bearish(
                 call_ltp_series,
@@ -1199,7 +1306,11 @@ def _build_live_chain(
                 rsi_min,
                 rsi_max,
                 vol_min,
-                include_volume_in_score=inc_vol_score,
+                include_volume_in_score=inc_vol_bear,
+                include_ema_crossover_in_score=inc_cross_bear,
+                leg_score_mode=leg_mode_short or "legacy",
+                rsi_below_for_weak=rsi_below_short,
+                rsi_direct_band=rsi_direct_short,
             )
             put_ind = _indicator_pack_from_series_bearish(
                 put_ltp_series,
@@ -1209,7 +1320,11 @@ def _build_live_chain(
                 rsi_min,
                 rsi_max,
                 vol_min,
-                include_volume_in_score=inc_vol_score,
+                include_volume_in_score=inc_vol_bear,
+                include_ema_crossover_in_score=inc_cross_bear,
+                leg_score_mode=leg_mode_short or "legacy",
+                rsi_below_for_weak=rsi_below_short,
+                rsi_direct_band=rsi_direct_short,
             )
         else:
             call_ind = _indicator_pack_from_series(
@@ -1223,6 +1338,7 @@ def _build_live_chain(
                 include_ema_crossover_in_score=inc_cross,
                 strict_bullish_comparisons=strict_bull,
                 include_volume_in_score=inc_vol_score,
+                require_rsi_for_eligible=req_rsi_eligible,
             )
             put_ind = _indicator_pack_from_series(
                 put_ltp_series,
@@ -1235,6 +1351,7 @@ def _build_live_chain(
                 include_ema_crossover_in_score=inc_cross,
                 strict_bullish_comparisons=strict_bull,
                 include_volume_in_score=inc_vol_score,
+                require_rsi_for_eligible=req_rsi_eligible,
             )
         # Fallback when history is thin or indicators collapsed to zeros — not when EMA≈VWAP on a flat premium (that is valid).
         c_z = (
@@ -1253,7 +1370,11 @@ def _build_live_chain(
                     rsi_min,
                     rsi_max,
                     vol_min,
-                    include_volume_in_score=inc_vol_score,
+                    include_volume_in_score=inc_vol_bear,
+                    include_ema_crossover_in_score=inc_cross_bear,
+                    leg_score_mode=leg_mode_short or "legacy",
+                    rsi_below_for_weak=rsi_below_short,
+                    rsi_direct_band=rsi_direct_short,
                 )
             else:
                 call_ind = _indicator_pack_from_quote_fallback(
@@ -1268,6 +1389,7 @@ def _build_live_chain(
                     include_ema_crossover_in_score=inc_cross,
                     strict_bullish_comparisons=strict_bull,
                     include_volume_in_score=inc_vol_score,
+                    require_rsi_for_eligible=req_rsi_eligible,
                 )
         p_z = (
             float(put_ind.get("ema9") or 0) == 0.0
@@ -1285,7 +1407,11 @@ def _build_live_chain(
                     rsi_min,
                     rsi_max,
                     vol_min,
-                    include_volume_in_score=inc_vol_score,
+                    include_volume_in_score=inc_vol_bear,
+                    include_ema_crossover_in_score=inc_cross_bear,
+                    leg_score_mode=leg_mode_short or "legacy",
+                    rsi_below_for_weak=rsi_below_short,
+                    rsi_direct_band=rsi_direct_short,
                 )
             else:
                 put_ind = _indicator_pack_from_quote_fallback(
@@ -1300,6 +1426,7 @@ def _build_live_chain(
                     include_ema_crossover_in_score=inc_cross,
                     strict_bullish_comparisons=strict_bull,
                     include_volume_in_score=inc_vol_score,
+                    require_rsi_for_eligible=req_rsi_eligible,
                 )
 
         regime_sell_pe = False
@@ -1333,6 +1460,9 @@ def _build_live_chain(
 
         call_inst = by_key.get((strike, "CE"), {})
         put_inst = by_key.get((strike, "PE"), {})
+        strike_pcr_row = round((put_oi / call_oi), 2) if call_oi else 0.0
+        call_tech = int(call_ind.get("technicalScore", call_ind["score"]))
+        put_tech = int(put_ind.get("technicalScore", put_ind["score"]))
         chain.append(
             {
                 "strike": strike,
@@ -1354,7 +1484,11 @@ def _build_live_chain(
                     "vwap": call_ind["vwap"],
                     "avgVolume": call_ind["avgVolume"],
                     "volumeSpikeRatio": call_ind["volumeSpikeRatio"],
+                    "technicalScore": call_tech,
+                    "scoreBonusSkew": 0,
+                    "scoreBonusPcr": 0,
                     "score": call_ind["score"],
+                    "strikePcr": strike_pcr_row,
                     "primaryOk": call_ind["primaryOk"],
                     "emaOk": call_ind["emaOk"],
                     "emaCrossoverOk": call_ind["emaCrossoverOk"],
@@ -1365,7 +1499,7 @@ def _build_live_chain(
                 },
                 "put": {
                     "tradingsymbol": str(put_inst.get("tradingsymbol", "")),
-                    "pcr": round((put_oi / call_oi), 2) if call_oi else 0.0,
+                    "pcr": strike_pcr_row,
                     "ltp": round(put_ltp, 2),
                     "ltpChg": _ltp_change_pct(put_ltp, put_prev_close),
                     "oi": str(int(put_oi)),
@@ -1382,7 +1516,11 @@ def _build_live_chain(
                     "vwap": put_ind["vwap"],
                     "avgVolume": put_ind["avgVolume"],
                     "volumeSpikeRatio": put_ind["volumeSpikeRatio"],
+                    "technicalScore": put_tech,
+                    "scoreBonusSkew": 0,
+                    "scoreBonusPcr": 0,
                     "score": put_ind["score"],
+                    "strikePcr": strike_pcr_row,
                     "primaryOk": put_ind["primaryOk"],
                     "emaOk": put_ind["emaOk"],
                     "emaCrossoverOk": put_ind["emaCrossoverOk"],
@@ -1427,6 +1565,95 @@ def _add_ivr_to_chain(chain: list[dict[str, Any]]) -> None:
                 leg["ivr"] = ivr
 
 
+def _apply_short_premium_skew_pcr_leg_scores(chain: list[dict[str, Any]], ip: dict[str, Any]) -> None:
+    """For ``shortPremiumLegScoreMode`` = ``three_factor``: add skew (CE vs PE IVR) and strike PCR bonuses to leg scores."""
+    mode = str(ip.get("shortPremiumLegScoreMode") or "").strip().lower()
+    if mode != "three_factor":
+        return
+    try:
+        leg_cap = int(ip.get("scoreMaxLeg") or 5)
+    except (TypeError, ValueError):
+        leg_cap = 5
+    leg_cap = max(3, min(10, leg_cap))
+    try:
+        skew_min = float(ip.get("shortPremiumIvrSkewMin", 5) or 0)
+    except (TypeError, ValueError):
+        skew_min = 5.0
+    vs_raw = ip.get("shortPremiumPcrBonusVsChain", True)
+    if isinstance(vs_raw, str):
+        vs_chain = vs_raw.strip().lower() in {"1", "true", "yes"}
+    else:
+        vs_chain = bool(vs_raw)
+    try:
+        eps = float(ip.get("shortPremiumPcrChainEpsilon", 0) or 0)
+    except (TypeError, ValueError):
+        eps = 0.0
+    pcr_min_ce = ip.get("shortPremiumPcrMinForSellCe")
+    pcr_max_pe = ip.get("shortPremiumPcrMaxForSellPe")
+
+    def _oi_f(leg: dict[str, Any]) -> float:
+        raw = leg.get("oi")
+        try:
+            return float(raw) if raw is not None else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+
+    total_call_oi = sum(_oi_f(x.get("call") or {}) for x in chain)
+    total_put_oi = sum(_oi_f(x.get("put") or {}) for x in chain)
+    chain_pcr = (total_put_oi / total_call_oi) if total_call_oi > 0 else 0.0
+
+    for row in chain:
+        call = row.get("call") or {}
+        put = row.get("put") or {}
+        if not call or not put:
+            continue
+        coi = _oi_f(call)
+        poi = _oi_f(put)
+        strike_pcr = (poi / coi) if coi > 0 else None
+        if strike_pcr is not None:
+            sp = round(strike_pcr, 2)
+            call["strikePcr"] = sp
+            put["strikePcr"] = sp
+
+        ce_ivr = float(call.get("ivr") or 0)
+        pe_ivr = float(put.get("ivr") or 0)
+        skew_ce = 1 if (ce_ivr - pe_ivr) >= skew_min else 0
+        skew_pe = 1 if (pe_ivr - ce_ivr) >= skew_min else 0
+
+        pcr_ce = 0
+        pcr_pe = 0
+        if vs_chain and strike_pcr is not None and coi > 0:
+            pcr_ce = 1 if strike_pcr > chain_pcr + eps else 0
+            pcr_pe = 1 if strike_pcr < chain_pcr - eps else 0
+        elif strike_pcr is not None and coi > 0:
+            if pcr_min_ce is not None:
+                try:
+                    pcr_ce = 1 if strike_pcr >= float(pcr_min_ce) else 0
+                except (TypeError, ValueError):
+                    pcr_ce = 0
+            if pcr_max_pe is not None:
+                try:
+                    pcr_pe = 1 if strike_pcr <= float(pcr_max_pe) else 0
+                except (TypeError, ValueError):
+                    pcr_pe = 0
+            if pcr_min_ce is None and pcr_max_pe is None:
+                pcr_ce = 1 if strike_pcr > chain_pcr + eps else 0
+                pcr_pe = 1 if strike_pcr < chain_pcr - eps else 0
+
+        for leg_key, skew_b, pcr_b in (("call", skew_ce, pcr_ce), ("put", skew_pe, pcr_pe)):
+            leg = row.get(leg_key) or {}
+            if not leg:
+                continue
+            try:
+                tech = int(leg.get("technicalScore", leg.get("score", 0)))
+            except (TypeError, ValueError):
+                tech = 0
+            leg["technicalScore"] = tech
+            leg["scoreBonusSkew"] = skew_b
+            leg["scoreBonusPcr"] = pcr_b
+            leg["score"] = min(leg_cap, tech + skew_b + pcr_b)
+
+
 def fetch_option_chain_sync(
     kite: KiteConnect | None,
     instrument: str,
@@ -1447,11 +1674,13 @@ def fetch_option_chain_sync(
     ip.setdefault("spotScoreThreshold", score_threshold)
     short_pm = str(ip.get("positionIntent", "")).lower() == "short_premium"
     reg_mode_spot = str(ip.get("spotRegimeMode") or ip.get("spot_regime_mode") or "").strip().lower()
+    long_spot_align = bool(ip.get("longPremiumSpotAlign"))
 
     spot_candles: list[dict[str, Any]] = []
     if kite and (
         (short_pm and reg_mode_spot != "ema_cross_vwap")
         or (ip.get("adx_min_threshold") is not None and float(ip.get("adx_min_threshold") or 0) > 0)
+        or (long_spot_align and not short_pm)
     ):
         spot_candles = _fetch_spot_candles(kite, instrument)
 
@@ -1463,6 +1692,8 @@ def fetch_option_chain_sync(
             score_threshold, ip,
         )
     _add_ivr_to_chain(chain)
+    if short_pm:
+        _apply_short_premium_skew_pcr_leg_scores(chain, ip)
 
     adx_val: float | None = None
     adx_min = ip.get("adx_min_threshold")
@@ -1478,6 +1709,8 @@ def fetch_option_chain_sync(
 
     spot_trend: dict[str, Any] = {"spotBullishScore": 0, "spotBearishScore": 0, "spotRegime": None}
     if spot_candles and short_pm and reg_mode_spot != "ema_cross_vwap":
+        spot_trend = _spot_trend_payload_from_candles(spot_candles, ip, int(score_threshold))
+    elif spot_candles and long_spot_align and not short_pm:
         spot_trend = _spot_trend_payload_from_candles(spot_candles, ip, int(score_threshold))
 
     total_call_oi = sum(float(x["call"]["oi"]) for x in chain)

@@ -5,7 +5,8 @@ from __future__ import annotations
 import json
 import re
 from datetime import date, datetime, timedelta
-from statistics import mean
+from math import sqrt
+from statistics import StatisticsError, mean, pstdev
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -115,6 +116,259 @@ async def recompute_daily_metrics(
 
 def _today_ist() -> date:
     return datetime.now(ZoneInfo("Asia/Kolkata")).date()
+
+
+def strategy_family_from_details(details: dict[str, Any]) -> str:
+    """Coarse bucket for regime-fit hints (catalog strategy_details_json)."""
+    raw = json.dumps(details).lower()
+    st = str(details.get("strategy_type") or details.get("strategyType") or "").lower()
+    if "trendpulse" in raw or "trend" in st or "momentum" in st:
+        return "trend"
+    if "mean" in st and "revers" in st:
+        return "mean_reversion"
+    if "break" in st:
+        return "breakout"
+    if "option" in st or "premium" in raw:
+        return "option_buyer"
+    return "unknown"
+
+
+def evaluation_analytics_from_daily(daily: list[dict[str, Any]]) -> dict[str, Any]:
+    """
+    Equity / drawdown from daily realized PnL; Sharpe-style ratio on daily PnL changes (same-scale proxy).
+    Downsamples long series for chart payloads (UI performance).
+    """
+    pnls = [float(d.get("realized_pnl") or 0) for d in daily]
+    n = len(pnls)
+    equity: list[float] = []
+    run = 0.0
+    for p in pnls:
+        run += p
+        equity.append(round(run, 4))
+    peak = 0.0
+    dd_series: list[float] = []
+    max_dd = 0.0
+    for e in equity:
+        if e > peak:
+            peak = e
+        dd = e - peak
+        dd_series.append(round(dd, 4))
+        if dd < max_dd:
+            max_dd = dd
+    peak_abs = max(abs(peak), 1e-9)
+    max_dd_pct = round(100.0 * abs(max_dd) / peak_abs, 2) if peak > 0 else round(abs(max_dd), 2)
+
+    sharpe: float | None = None
+    if n >= 5:
+        try:
+            sd = pstdev(pnls)
+            if sd > 1e-12:
+                sharpe = round((mean(pnls) / sd) * sqrt(252), 4)
+        except (StatisticsError, ValueError, ZeroDivisionError):
+            sharpe = None
+
+    def _downsample(xs: list[Any], ys: list[Any], max_pts: int) -> tuple[list[Any], list[Any]]:
+        if len(xs) <= max_pts:
+            return xs, ys
+        step = max(1, len(xs) // max_pts)
+        return xs[::step], ys[::step]
+
+    labels = [
+        d["trade_date_ist"] if isinstance(d.get("trade_date_ist"), str) else str(d.get("trade_date_ist") or "")
+        for d in daily
+    ]
+    eq_x, eq_y = _downsample(labels, equity, 90)
+    dd_x, dd_y = _downsample(labels, dd_series, 90)
+
+    closed_trades = sum(int(d.get("closed_trades") or 0) for d in daily)
+    return {
+        "equity_dates": eq_x,
+        "equity_values": eq_y,
+        "drawdown_dates": dd_x,
+        "drawdown_values": dd_y,
+        "max_drawdown_abs": round(float(max_dd), 4),
+        "max_drawdown_pct": max_dd_pct,
+        "sharpe_daily_pnl_proxy": sharpe,
+        "data_quality": {
+            "calendar_days": n,
+            "days_with_any_row": n,
+            "closed_trades_window": closed_trades,
+            "sharpe_reliable": sharpe is not None and closed_trades >= 15,
+        },
+    }
+
+
+def regime_and_fit_from_daily(
+    daily: list[dict[str, Any]],
+    strategy_family: str,
+) -> dict[str, Any]:
+    """Lightweight regime labels + strategy fit (rules, not ML)."""
+    pnls = [float(d.get("realized_pnl") or 0) for d in daily]
+    nz = [p for p in pnls if p != 0]
+    closed = sum(int(d.get("closed_trades") or 0) for d in daily)
+    if len(nz) < 4 or closed < 8:
+        return {
+            "regime_label": "INSUFFICIENT_DATA",
+            "volatility_bucket": "unknown",
+            "pnl_tone": "unknown",
+            "strategy_fit": "unknown",
+            "hint": "Need more closed trades in the window for regime/fit read.",
+        }
+
+    try:
+        vol = pstdev(nz)
+    except (StatisticsError, ValueError):
+        vol = 0.0
+    mean_abs = mean([abs(x) for x in nz])
+    elevated = vol > max(mean_abs * 1.15, 1e-8)
+    vol_bucket = "high" if elevated else "normal"
+    net = sum(pnls)
+    if net > 0:
+        tone = "constructive"
+    elif net < 0:
+        tone = "pressured"
+    else:
+        tone = "flat"
+
+    if elevated and abs(net) < vol * 0.5:
+        regime = "CHOPPY_VOLATILE"
+    elif net > 0 and not elevated:
+        regime = "TRENDING_UP"
+    elif net < 0 and not elevated:
+        regime = "TRENDING_DOWN"
+    else:
+        regime = "MIXED"
+
+    fam = (strategy_family or "unknown").lower()
+    fit = "review"
+    if fam == "trend":
+        fit = "aligned" if regime in ("TRENDING_UP", "TRENDING_DOWN") and not elevated else "caution"
+    elif fam == "mean_reversion":
+        fit = "aligned" if regime in ("CHOPPY_VOLATILE", "MIXED") or elevated else "caution"
+    elif fam == "option_buyer":
+        fit = "caution" if elevated else "neutral"
+    elif fam == "breakout":
+        fit = "aligned" if elevated or regime != "TRENDING_DOWN" else "caution"
+    else:
+        fit = "neutral"
+
+    hints = {
+        "aligned": "Tape and strategy style look compatible for this window — still validate on fresh data.",
+        "neutral": "No strong mismatch signal — use performance metrics and optimization output.",
+        "caution": "Regime may fight this strategy family — favor smaller size, hedges, or parameter review.",
+        "review": "Not enough evidence — widen window or wait for more exits.",
+    }
+    return {
+        "regime_label": regime,
+        "volatility_bucket": vol_bucket,
+        "pnl_tone": tone,
+        "strategy_fit": fit,
+        "hint": hints.get(fit, hints["neutral"]),
+    }
+
+
+async def fetch_catalog_meta_for_evaluation(strategy_id: str, strategy_version: str | None) -> dict[str, Any]:
+    if strategy_version:
+        row = await fetchrow(
+            """
+            SELECT strategy_id, version, display_name, description, risk_profile, publish_status,
+                   strategy_details_json
+            FROM s004_strategy_catalog
+            WHERE strategy_id = $1 AND version = $2
+            LIMIT 1
+            """,
+            strategy_id,
+            strategy_version,
+        )
+    else:
+        row = await fetchrow(
+            """
+            SELECT strategy_id, version, display_name, description, risk_profile, publish_status,
+                   strategy_details_json
+            FROM s004_strategy_catalog
+            WHERE strategy_id = $1
+            ORDER BY updated_at DESC NULLS LAST, version DESC
+            LIMIT 1
+            """,
+            strategy_id,
+        )
+    if row is None:
+        return {
+            "strategy_id": strategy_id,
+            "version": strategy_version,
+            "display_name": None,
+            "description": None,
+            "risk_profile": None,
+            "publish_status": None,
+            "strategy_family": "unknown",
+        }
+    details: dict[str, Any] = {}
+    raw = row.get("strategy_details_json")
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                details = parsed
+        except json.JSONDecodeError:
+            pass
+    elif isinstance(raw, dict):
+        details = raw
+    return {
+        "strategy_id": row["strategy_id"],
+        "version": row["version"],
+        "display_name": row.get("display_name"),
+        "description": row.get("description"),
+        "risk_profile": row.get("risk_profile"),
+        "publish_status": row.get("publish_status"),
+        "strategy_family": strategy_family_from_details(details),
+    }
+
+
+async def fetch_strategy_repository_meta() -> list[dict[str, Any]]:
+    """Strategy list with latest catalog row per strategy_id (filters on client)."""
+    rows = await fetch(
+        """
+        SELECT DISTINCT ON (strategy_id)
+            strategy_id, version, display_name, description, risk_profile, publish_status, updated_at
+        FROM s004_strategy_catalog
+        ORDER BY strategy_id, updated_at DESC NULLS LAST
+        """
+    )
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        d = dict(r)
+        if d.get("updated_at"):
+            d["updated_at"] = d["updated_at"].isoformat()
+        out.append(d)
+    return out
+
+
+async def fetch_evaluation_workbench(
+    strategy_id: str,
+    strategy_version: str | None,
+    *,
+    days: int = 30,
+    recommendation_limit: int = 12,
+) -> dict[str, Any]:
+    """Single bundle for Evaluation UI: summary + analytics + catalog + regime + recent recs."""
+    summary = await fetch_strategy_evaluation_summary(strategy_id, strategy_version, days=days)
+    meta_ver = strategy_version or summary.get("strategy_version")
+    catalog = await fetch_catalog_meta_for_evaluation(strategy_id, meta_ver if isinstance(meta_ver, str) else None)
+    if catalog.get("version") and not strategy_version:
+        summary["resolved_catalog_version"] = catalog["version"]
+
+    daily = summary.get("daily") or []
+    analytics = evaluation_analytics_from_daily(daily)
+    regime = regime_and_fit_from_daily(daily, str(catalog.get("strategy_family") or "unknown"))
+    recs = await list_recommendations(strategy_id, None, recommendation_limit)
+
+    return {
+        **summary,
+        "catalog_meta": catalog,
+        "analytics": analytics,
+        "regime": regime,
+        "recent_recommendations": recs,
+    }
 
 
 async def fetch_strategy_evaluation_summary(

@@ -163,33 +163,65 @@ type Driver = {
   reading?: string;
 };
 
+type BridgeBar = {
+  left: number;
+  width: number;
+  pos: boolean;
+  im: number;
+  key: string;
+  skip: boolean;
+};
+
+/** Layout scale: constructive (positive impact) grows left of center; cautious (negative) grows right — matches CE-left / PE-right intuition. */
+function bridgeLayoutFromImpacts(impacts: number[], keys: string[]): {
+  bars: BridgeBar[];
+  endPct: number;
+  total: number;
+  maxAbs: number;
+} {
+  const total = impacts.reduce((a, b) => a + b, 0);
+  const maxAbs = Math.max(20, ...impacts.map((x) => Math.abs(x)), Math.abs(total));
+  let centerPct = 50;
+  const bars: BridgeBar[] = impacts.map((im, i) => {
+    const wRaw = (im / maxAbs) * 42;
+    const wLayout = -wRaw;
+    if (Math.abs(wLayout) < 0.08) {
+      return { left: centerPct, width: 0, pos: im >= 0, im, key: keys[i]!, skip: true };
+    }
+    const left = wLayout >= 0 ? centerPct : centerPct + wLayout;
+    const width = Math.abs(wLayout);
+    const row: BridgeBar = { left, width, pos: im >= 0, im, key: keys[i]!, skip: false };
+    centerPct += wLayout;
+    return row;
+  });
+  return { bars, endPct: centerPct, total, maxAbs };
+}
+
 /** Cumulative bridge: each segment extends from running balance by driver impact (scaled). */
 export function CumulativeWaterfall({ drivers, dense = false }: { drivers: Driver[]; dense?: boolean }) {
   const model = useMemo(() => {
     if (!drivers.length) return null;
     const impacts = drivers.map((d) => d.impact);
-    const total = impacts.reduce((a, b) => a + b, 0);
-    const maxAbs = Math.max(20, ...impacts.map((x) => Math.abs(x)), Math.abs(total));
-    let centerPct = 50;
-    const bars = impacts.map((im, i) => {
-      const wPct = (im / maxAbs) * 42;
-      const left = wPct >= 0 ? centerPct : centerPct + wPct;
-      const width = Math.abs(wPct);
-      const row = { left, width, pos: im >= 0, im, key: drivers[i]!.key };
-      centerPct += wPct;
-      return row;
-    });
-    return { bars, endPct: centerPct, total, maxAbs };
+    return bridgeLayoutFromImpacts(impacts, drivers.map((d) => d.key));
   }, [drivers]);
 
   if (!model) {
     return <p className="muted landing-waterfall-empty">No driver data</p>;
   }
 
-  const barRows = drivers.map((d) => {
-    const w = Math.min(50, Math.abs(d.impact));
-    const left = d.direction === "bullish" ? "50%" : `${50 - w}%`;
-    return { ...d, w, left };
+  type DriverRow = Driver & { w: number; left: string; neutral: boolean };
+  const barRows: DriverRow[] = drivers.map((d) => {
+    const neutral = Math.abs(d.impact) < 0.05;
+    const w = neutral ? 0 : Math.min(50, Math.abs(d.impact));
+    let left: string;
+    if (neutral) {
+      left = "50%";
+    } else if (d.direction === "bullish") {
+      left = `${50 - w}%`;
+    } else {
+      left = "50%";
+    }
+    return { ...d, w, left, neutral };
   });
 
   if (dense) {
@@ -212,19 +244,26 @@ export function CumulativeWaterfall({ drivers, dense = false }: { drivers: Drive
               strokeOpacity="0.35"
               strokeWidth="0.35"
             />
-            {model.bars.map((b, i) => (
-              <rect
-                key={b.key}
-                x={b.left}
-                y={6 + i * 5.8}
-                width={Math.max(b.width, 0.55)}
-                height="3.6"
-                rx="0.4"
-                fill={b.pos ? "rgba(43, 196, 138, 0.88)" : "rgba(255, 107, 107, 0.88)"}
-              />
-            ))}
+            {model.bars.map((b, i) =>
+              b.skip ? null : (
+                <rect
+                  key={b.key}
+                  x={b.left}
+                  y={6 + i * 5.8}
+                  width={Math.max(b.width, 0.55)}
+                  height="3.6"
+                  rx="0.4"
+                  fill={b.pos ? "rgba(43, 196, 138, 0.88)" : "rgba(255, 107, 107, 0.88)"}
+                />
+              ),
+            )}
             <circle cx={model.endPct} cy={bridgeViewH - 2.2} r="1.35" fill="var(--accent)" />
           </svg>
+          <div className="landing-waterfall-dense-axis muted" aria-hidden>
+            <span>Constructive ←</span>
+            <span className="landing-waterfall-dense-axis-mid">0</span>
+            <span>→ Cautious</span>
+          </div>
         </div>
         <div className="landing-waterfall-dense-net">
           <span className="landing-waterfall-dense-net-label">Net (drivers)</span>
@@ -236,7 +275,10 @@ export function CumulativeWaterfall({ drivers, dense = false }: { drivers: Drive
         <ul className="landing-waterfall-dense-rows" aria-label="Driver contributions">
           {barRows.map((d) => (
             <li key={d.key} className="landing-wf-row">
-              <span className={`landing-wf-row-dot ${d.direction === "bullish" ? "bull" : "bear"}`} title={d.label} />
+              <span
+                className={`landing-wf-row-dot ${d.neutral ? "flat" : d.direction === "bullish" ? "bull" : "bear"}`}
+                title={d.label}
+              />
               <div className="landing-wf-row-meta">
                 <span className="landing-wf-row-label" title={d.reading ? `${d.label} — ${d.reading}` : d.label}>
                   {d.label}
@@ -249,17 +291,26 @@ export function CumulativeWaterfall({ drivers, dense = false }: { drivers: Drive
               </div>
               <div className="landing-wf-row-track">
                 <div className="landing-wf-row-mid" />
-                <div
-                  className={`landing-wf-row-bar ${d.direction === "bullish" ? "bull" : "bear"}`}
-                  style={{ width: `${d.w}%`, left: d.left }}
-                />
+                {d.neutral ? (
+                  <div className="landing-wf-row-bar landing-wf-row-bar--neutral" title="No push on direction score — see reading for raw level" />
+                ) : (
+                  <div
+                    className={`landing-wf-row-bar ${d.direction === "bullish" ? "bull" : "bear"}`}
+                    style={{ width: `${d.w}%`, left: d.left }}
+                  />
+                )}
               </div>
               <span
-                className={`landing-wf-row-val ${d.impact >= 0 ? "pos" : "neg"}`}
-                title="Weighted push on direction score (not raw PCR/OI)"
+                className={`landing-wf-row-val ${d.neutral ? "muted" : d.impact >= 0 ? "pos" : "neg"}`}
+                title={
+                  d.neutral
+                    ? "Impact 0: balanced signal in the model (e.g. PCR≈1). Reading line shows the live ratio or OI text."
+                    : "Weighted push on direction score (not raw PCR/OI)"
+                }
               >
                 {d.impact > 0 ? "+" : ""}
                 {d.impact.toFixed(1)}
+                {d.neutral ? <span className="landing-wf-val-neutral-tag"> · neutral</span> : null}
               </span>
             </li>
           ))}
@@ -270,34 +321,57 @@ export function CumulativeWaterfall({ drivers, dense = false }: { drivers: Drive
 
   return (
     <div className="landing-waterfall-bridge">
-      <svg viewBox="0 0 100 32" className="landing-waterfall-bridge-svg" preserveAspectRatio="none" aria-label="Cumulative driver contribution">
-        <line x1="50" y1="6" x2="50" y2="26" stroke="var(--muted)" strokeOpacity="0.4" strokeWidth="0.4" />
-        {model.bars.map((b, i) => (
-          <rect
-            key={b.key}
-            x={b.left}
-            y={6 + i * 3.2}
-            width={Math.max(b.width, 0.6)}
-            height="2.4"
-            rx="0.4"
-            fill={b.pos ? "rgba(43, 196, 138, 0.85)" : "rgba(255, 107, 107, 0.85)"}
-          />
-        ))}
-        <circle cx={model.endPct} cy="28" r="1.4" fill="var(--accent)" opacity="0.9" />
-      </svg>
+      <div className="landing-waterfall-bridge-wrap">
+        <svg viewBox="0 0 100 32" className="landing-waterfall-bridge-svg" preserveAspectRatio="none" aria-label="Cumulative driver contribution">
+          <line x1="50" y1="6" x2="50" y2="26" stroke="var(--muted)" strokeOpacity="0.4" strokeWidth="0.4" />
+          {model.bars.map((b, i) =>
+            b.skip ? null : (
+              <rect
+                key={b.key}
+                x={b.left}
+                y={6 + i * 3.2}
+                width={Math.max(b.width, 0.6)}
+                height="2.4"
+                rx="0.4"
+                fill={b.pos ? "rgba(43, 196, 138, 0.85)" : "rgba(255, 107, 107, 0.85)"}
+              />
+            ),
+          )}
+          <circle cx={model.endPct} cy="28" r="1.4" fill="var(--accent)" opacity="0.9" />
+        </svg>
+        <div className="landing-waterfall-bridge-axis muted" aria-hidden>
+          <span>Constructive ←</span>
+          <span className="landing-waterfall-bridge-axis-mid">0</span>
+          <span>→ Cautious</span>
+        </div>
+      </div>
       <ul className="landing-waterfall-legend">
-        {drivers.map((d) => (
-          <li key={d.key}>
-            <span className={`landing-wf-dot ${d.direction === "bullish" ? "bull" : "bear"}`} />
-            <span className="landing-wf-name" title={d.reading}>
-              {d.label}
-            </span>
-            <span className={d.impact >= 0 ? "pos" : "neg"} title={d.reading}>
-              {d.impact > 0 ? "+" : ""}
-              {d.impact.toFixed(1)}
-            </span>
-          </li>
-        ))}
+        {drivers.map((d) => {
+          const neutral = Math.abs(d.impact) < 0.05;
+          return (
+            <li key={d.key}>
+              <span
+                className={`landing-wf-dot ${neutral ? "flat" : d.direction === "bullish" ? "bull" : "bear"}`}
+                title={neutral ? "Neutral contribution — see reading for raw level" : d.label}
+              />
+              <span className="landing-wf-name" title={d.reading ? `${d.label} — ${d.reading}` : d.label}>
+                {d.label}
+              </span>
+              <span
+                className={neutral ? "muted" : d.impact >= 0 ? "pos" : "neg"}
+                title={
+                  neutral
+                    ? "Impact 0: balanced in the model (e.g. PCR≈1). Reading shows live ratio or OI text."
+                    : d.reading
+                }
+              >
+                {d.impact > 0 ? "+" : ""}
+                {d.impact.toFixed(1)}
+                {neutral ? <span className="landing-wf-val-neutral-tag"> · neutral</span> : null}
+              </span>
+            </li>
+          );
+        })}
         <li className="landing-wf-total">
           <span className="landing-wf-name">Net (drivers)</span>
           <span className={model.total >= 0 ? "pos" : "neg"}>
