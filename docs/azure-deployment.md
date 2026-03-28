@@ -66,6 +66,12 @@ So you must set **`NEXT_PUBLIC_API_URL`** to the **public https URL of the API W
 
    Set **Working directory** if the portal offers it to the folder that contains `.next/standalone/server.js` (usually repo `frontend` root after build). If the built files are at site root, the command above is correct.
 
+   If you deploy **only** the standalone folder as the site root (see [section 6](#6-opting-out-of-oryx-optional) and `azure-webapps-deploy-no-oryx.yml`), use:
+
+   ```bash
+   node server.js
+   ```
+
    **Alternative** (simpler, no standalone): remove `output: "standalone"` from `next.config.mjs` and use:
 
    ```bash
@@ -92,16 +98,30 @@ Provision **Azure Database for PostgreSQL** (Flexible Server). Run your schema/s
 
 - **GitHub Actions**: two jobs or matrix — deploy `backend/` to the API app and `frontend/` to the UI app (`azure/webapps-deploy` with `package` path).
 - **Deployment Center**: connect the repo twice (different Web Apps) or use monorepo build steps with different `app-path` outputs.
+- **Without Oryx**: use the sample workflow [`.github/workflows/azure-webapps-deploy-no-oryx.yml`](../.github/workflows/azure-webapps-deploy-no-oryx.yml) (`workflow_dispatch`) or the patterns in [Azure actions-workflow-samples — App Service](https://github.com/Azure/actions-workflow-samples/tree/master/AppService).
 
 ---
 
-## 6. Optional: single Web App via Docker later
+## 6. Opting out of Oryx (optional)
+
+If you prefer **not** to run the Oryx build on the server during deployment:
+
+1. **Remove** the **`SCM_DO_BUILD_DURING_DEPLOYMENT`** app setting from both Web Apps (or do not add it). When it is absent or `false`, Azure will not run `pip install` / `npm install` + build on deploy.
+2. You must ship **pre-built** artifacts instead (for example from GitHub Actions on **Ubuntu**, which matches App Service Linux for native wheels):
+   - **API**: run `pip install -r requirements.txt --target .python_packages` in CI, zip the `backend/` tree including `.python_packages`. This repo’s **`startup.sh`** prepends `.python_packages` to **`PYTHONPATH`** when that folder exists.
+   - **Frontend**: run `npm ci` and `npm run build` in CI with **`NEXT_PUBLIC_API_URL`** set, then zip the **Next.js standalone** output (copy `public/` and `.next/static` into `.next/standalone` per Next’s standalone deploy docs) and deploy that zip. Startup: `node server.js` from the zip root (same as a standalone folder layout).
+
+See [Azure actions-workflow-samples — App Service](https://github.com/Azure/actions-workflow-samples/tree/master/AppService) for more deployment strategies (ZIP, slots, etc.).
+
+---
+
+## 7. Optional: single Web App via Docker later
 
 If you later want **one URL** and **one** Web App without split rewrites, you can use the repo **`Dockerfile`** (nginx + Next + API) and switch that Web App to **Container** deployment. The files under `deploy/` and `Dockerfile` are for that path only.
 
 ---
 
-## App changes already in the repo
+## 8. App changes already in the repo
 
 - **`CORS_ORIGINS`** env on the API (`backend/app/main.py`).
 - **`NEXT_PUBLIC_API_URL`** for Next rewrites (`frontend/next.config.mjs`).
