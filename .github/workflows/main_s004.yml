@@ -33,13 +33,20 @@ jobs:
           source antenv/bin/activate
           pip install -r requirements.txt
 
+      # Zip backend/ so deploy sees app/, requirements.txt, startup.sh at zip root (webapps-deploy is reliable with a .zip path).
+      - name: Zip backend for Azure
+        run: |
+          cd backend
+          zip -r ../backend-deploy.zip . \
+            -x 'antenv/*' -x 'antenv/**' \
+            -x '**/__pycache__/*' -x '**/*.pyc' \
+            -x 'tests/*' -x 'tests/**'
+
       - name: Upload artifact for deployment jobs
         uses: actions/upload-artifact@v4
         with:
           name: python-app
-          path: |
-            backend
-            !backend/antenv/
+          path: backend-deploy.zip
 
       # 🚫 Opting Out of Oryx Build
       # If you prefer to disable the Oryx build process during deployment, follow these steps:
@@ -56,7 +63,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: python-app
-      
+
       - name: 'Deploy to Azure Web App'
         uses: azure/webapps-deploy@v3
         id: deploy-to-webapp
@@ -64,4 +71,4 @@ jobs:
           app-name: 'S004'
           slot-name: 'Production'
           publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_3112C5E2E9434DA6A4CCA36755AAC929 }}
-          package: backend
+          package: backend-deploy.zip
