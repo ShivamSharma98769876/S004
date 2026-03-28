@@ -100,7 +100,7 @@ Provision **Azure Database for PostgreSQL** (Flexible Server). Run your schema/s
 - **Deployment Center**: connect the repo twice (different Web Apps) or use monorepo build steps with different `app-path` outputs.
 - **Without Oryx**: use the sample workflow [`.github/workflows/azure-webapps-deploy-no-oryx.yml`](../.github/workflows/azure-webapps-deploy-no-oryx.yml) (`workflow_dispatch`) or the patterns in [Azure actions-workflow-samples — App Service](https://github.com/Azure/actions-workflow-samples/tree/master/AppService).
 
-### Secrets for `.github/workflows/main_s004.yml` (API deploy on push to `main`)
+### Secrets for API deploy workflows (e.g. `main_s004.yml`, `main_a004.yml`)
 
 | Secret | Value |
 |--------|--------|
@@ -114,6 +114,12 @@ The deploy action talks to **Kudu/SCM** at **`https://<app-name>.scm.azurewebsit
 **Fix:** In Azure Portal → your Web App → **Get publish profile** → download the `.PublishSettings` file → copy the **entire** XML into **`AZURE_WEBAPP_API_PUBLISH_PROFILE`**. In that XML, **`publishUrl`** for the MSDeploy profile should end with **`.scm.azurewebsites.net`** (no region segment such as `southindia-01` before `azurewebsites.net`).
 
 Set **`AZURE_WEBAPP_API_NAME`** to the same **name** as on the **Overview** tab. If you see **Failed to get app runtime OS**, the name or publish profile usually does not match the app; fix both as above.
+
+### GitHub deploy: `No credentials found. Add an Azure login action`
+
+`Azure/webapps-deploy@v3` shows this when it has **no usable credentials**: almost always the **`AZURE_WEBAPP_API_PUBLISH_PROFILE`** secret is **missing, empty, or not passed to this workflow** (for example the workflow still referenced an old Deployment Center secret name after you renamed secrets). **Fix:** create or update **`AZURE_WEBAPP_API_PUBLISH_PROFILE`** with the full **Get publish profile** XML, and set **`AZURE_WEBAPP_API_NAME`** to the exact app name. You typically **do not** need **`azure/login`** if the publish profile secret is set.
+
+If you use **`azure/login`** and still see this error, check that the workflow or organization did **not** set **`AZURE_CORE_OUTPUT: none`** (that can break credential detection for Azure CLI–backed steps). See [Azure/webapps-deploy#445](https://github.com/Azure/webapps-deploy/issues/445).
 
 ---
 

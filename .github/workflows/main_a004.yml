@@ -2,8 +2,12 @@
 # More GitHub Actions for Azure: https://github.com/Azure/actions
 # More info on Python, GitHub Actions, and Azure App Service: https://aka.ms/python-webapps-actions
 #
-# Deploy: set app-name to the exact Web App name from Azure Overview (or use a secret). Publish profile must be
-# full .PublishSettings XML (publishUrl ending in .scm.azurewebsites.net).
+# Required GitHub Actions secrets (repo → Settings → Secrets and variables → Actions):
+#   AZURE_WEBAPP_API_NAME           — exact Web App name from Azure Portal → Overview (not a display label).
+#   AZURE_WEBAPP_API_PUBLISH_PROFILE — entire .PublishSettings XML from Portal → Get publish profile.
+# If either is missing/empty, Azure/webapps-deploy@v3 fails with: "No credentials found. Add an Azure login action".
+# You do NOT need azure/login when using a non-empty publish profile.
+# Org/repo env: do not set AZURE_CORE_OUTPUT: none (it breaks Azure CLI–based steps in some actions).
 
 name: Build and deploy Python app to Azure Web App - A004
 
@@ -72,7 +76,6 @@ jobs:
         uses: Azure/webapps-deploy@v3
         id: deploy-to-webapp
         with:
-          # Must match the Web App resource name in Azure Overview (change if yours is not literally A004).
-          app-name: 'A004'
-          publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_17D64B8ABDF94804AB879AEB298FFABF }}
+          app-name: ${{ secrets.AZURE_WEBAPP_API_NAME }}
+          publish-profile: ${{ secrets.AZURE_WEBAPP_API_PUBLISH_PROFILE }}
           package: backend-deploy.zip
