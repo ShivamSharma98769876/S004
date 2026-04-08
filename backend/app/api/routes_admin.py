@@ -5,7 +5,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, EmailStr
 
 from app.auth_utils import hash_password
@@ -23,6 +23,8 @@ from app.services.admin_todays_analysis import (
 )
 from app.services.platform_risk import invalidate_platform_settings_cache
 from app.services.sentiment_engine import compute_sentiment_snapshot
+from app.services import broker_accounts as broker_accounts_service
+from app.services.strategy_eod_report_service import list_strategy_eod_reports, run_eod_for_date_admin
 from app.services.trades_service import get_kite_for_quotes
 from app.api.auth_context import require_admin
 from app.api.routes_landing import _fetch_nifty_market_and_chain, _pcr_sentiment, _spot_trend_label
@@ -44,6 +46,16 @@ class UpdateApprovalPayload(BaseModel):
 class PlatformRiskPayload(BaseModel):
     trading_paused: bool
     pause_reason: str | None = None
+
+
+class PlatformBrokerSharedPayload(BaseModel):
+    """Single shared broker session for non-admin paper users without own broker connection."""
+
+    brokerCode: str = "zerodha"
+    zerodhaApiKey: str = ""
+    zerodhaAccessToken: str = ""
+    fyersClientId: str = ""
+    fyersAccessToken: str = ""
 
 
 def _parse_active_strategies(raw: object) -> list[dict]:
@@ -704,3 +716,96 @@ async def todays_analysis_export(
             headers={"Content-Disposition": 'attachment; filename="s004-todays-analysis.pdf"'},
         )
     raise HTTPException(status_code=400, detail='format must be "csv" or "pdf"')
+
+
+@router.get("/strategy-eod-reports")
+async def admin_list_strategy_eod_reports(
+    admin_id: int = Depends(require_admin),
+    report_date: date | None = Query(default=None, description="IST calendar date; omit for latest rows"),
+    strategy_id: str | None = Query(default=None),
+    limit: int = Query(default=90, ge=1, le=500),
+) -> list[dict[str, Any]]:
+    """Aggregated strategy-level EOD payloads (all users), with rule-based suggestions."""
+    return await list_strategy_eod_reports(
+        report_date=report_date,
+        strategy_id=strategy_id,
+        limit=limit,
+    )
+
+
+@router.post("/strategy-eod-reports/run")
+async def admin_run_strategy_eod_reports(
+    admin_id: int = Depends(require_admin),
+    report_date: date = Query(..., description="IST date to aggregate closed trades for"),
+) -> dict[str, Any]:
+    """Recompute and upsert EOD report rows for the given IST date."""
+    return await run_eod_for_date_admin(report_date)
+
+
+def _admin_client_ip(request: Request) -> str | None:
+    if request.client:
+        return request.client.host
+    return None
+
+
+@router.get("/platform-broker")
+async def admin_platform_broker_get(admin_id: int = Depends(require_admin)) -> dict[str, Any]:
+    _ = admin_id
+    return await broker_accounts_service.get_platform_shared_status()
+
+
+@router.put("/platform-broker")
+async def admin_platform_broker_put(
+    payload: PlatformBrokerSharedPayload,
+    request: Request,
+    admin_id: int = Depends(require_admin),
+) -> dict[str, Any]:
+    code = payload.brokerCode.strip().lower()
+    if code not in {broker_accounts_service.BROKER_ZERODHA, broker_accounts_service.BROKER_FYERS}:
+        raise HTTPException(status_code=400, detail="brokerCode must be zerodha or fyers.")
+    if not broker_accounts_service.fernet_key_configured():
+        raise HTTPException(status_code=503, detail="Set S004_CREDENTIALS_FERNET_KEY on the server.")
+
+    if code == broker_accounts_service.BROKER_ZERODHA:
+        if not payload.zerodhaApiKey.strip() or not payload.zerodhaAccessToken.strip():
+            raise HTTPException(status_code=400, detail="zerodhaApiKey and zerodhaAccessToken are required.")
+        vault = {
+            broker_accounts_service.BROKER_ZERODHA: {
+                "apiKey": payload.zerodhaApiKey.strip(),
+                "apiSecret": "",
+                "accessToken": payload.zerodhaAccessToken.strip(),
+            }
+        }
+    else:
+        if not payload.fyersClientId.strip() or not payload.fyersAccessToken.strip():
+            raise HTTPException(status_code=400, detail="fyersClientId and fyersAccessToken are required.")
+        vault = {
+            broker_accounts_service.BROKER_FYERS: {
+                "clientId": payload.fyersClientId.strip(),
+                "secretKey": "",
+                "redirectUri": "",
+                "accessToken": payload.fyersAccessToken.strip(),
+            }
+        }
+    try:
+        await broker_accounts_service.save_platform_shared_vault(
+            admin_user_id=admin_id,
+            broker_code=code,
+            vault=vault,
+            client_ip=_admin_client_ip(request),
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return {"ok": True, **(await broker_accounts_service.get_platform_shared_status())}
+
+
+@router.delete("/platform-broker")
+async def admin_platform_broker_delete(
+    request: Request,
+    admin_id: int = Depends(require_admin),
+) -> dict[str, Any]:
+    await broker_accounts_service.clear_platform_shared(
+        admin_user_id=admin_id,
+        client_ip=_admin_client_ip(request),
+    )
+    return {"ok": True}

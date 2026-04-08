@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import socket
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +12,8 @@ import asyncpg
 from dotenv import load_dotenv
 
 _pool: asyncpg.Pool | None = None
+_pool_init_lock = asyncio.Lock()
+_pool_reset_lock = asyncio.Lock()
 _logger = logging.getLogger("s004.db")
 
 
@@ -49,6 +52,12 @@ async def init_db_pool() -> None:
             )
             await asyncio.sleep(retry_delay_sec)
     assert last_error is not None
+    if isinstance(last_error, socket.gaierror):
+        _logger.error(
+            "DATABASE_URL host could not be resolved (DNS / getaddrinfo). "
+            "If the DB is remote: check internet, VPN, and that the hostname is still valid. "
+            "For local Postgres use 127.0.0.1 or localhost in DATABASE_URL."
+        )
     raise last_error
 
 
@@ -65,6 +74,60 @@ def _require_pool() -> asyncpg.Pool:
     return _pool
 
 
+async def _require_pool_async() -> asyncpg.Pool:
+    """Best-effort lazy pool init for transient startup/reload races."""
+    global _pool
+    if _pool is not None:
+        return _pool
+    async with _pool_init_lock:
+        if _pool is None:
+            await init_db_pool()
+    if _pool is None:
+        raise RuntimeError("Database pool is not initialized.")
+    return _pool
+
+
+def _is_transient_db_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    if isinstance(exc, ConnectionResetError):
+        return True
+    if isinstance(exc, OSError) and "forcibly closed" in msg:
+        return True
+    if isinstance(exc, asyncpg.exceptions.InterfaceError):
+        return any(
+            k in msg
+            for k in (
+                "connection was closed",
+                "pool is closed",
+                "closed",
+                "another operation is in progress",
+            )
+        )
+    return any(
+        k in msg
+        for k in (
+            "connection was closed",
+            "connection reset",
+            "forcibly closed",
+            "terminating connection",
+            "server closed the connection unexpectedly",
+        )
+    )
+
+
+async def _reset_pool_after_error(exc: Exception) -> None:
+    global _pool
+    async with _pool_reset_lock:
+        cur = _pool
+        _pool = None
+        if cur is not None:
+            try:
+                await cur.close()
+            except Exception:
+                pass
+        _logger.warning("DB pool reset after transient error: %s", exc)
+
+
 def _normalize_args(args: tuple[Any, ...]) -> tuple[Any, ...]:
     normalized: list[Any] = []
     for arg in args:
@@ -76,39 +139,60 @@ def _normalize_args(args: tuple[Any, ...]) -> tuple[Any, ...]:
 
 
 async def fetch(query: str, *args: Any) -> list[asyncpg.Record]:
-    pool = _require_pool()
     db_args = _normalize_args(args)
-    try:
-        async with pool.acquire() as conn:
-            return await conn.fetch(query, *db_args)
-    except asyncpg.exceptions.InterfaceError as exc:
-        if "closing" in str(exc).lower() or "closed" in str(exc).lower():
-            _logger.warning("fetch skipped: DB pool shutting down (%s)", exc)
-        raise
+    attempts = 2
+    last_exc: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        pool = await _require_pool_async()
+        try:
+            async with pool.acquire() as conn:
+                return await conn.fetch(query, *db_args)
+        except Exception as exc:
+            last_exc = exc
+            if not _is_transient_db_error(exc) or attempt >= attempts:
+                raise
+            await _reset_pool_after_error(exc)
+            await asyncio.sleep(0.1 * attempt)
+    assert last_exc is not None
+    raise last_exc
 
 
 async def fetchrow(query: str, *args: Any) -> asyncpg.Record | None:
-    pool = _require_pool()
     db_args = _normalize_args(args)
-    try:
-        async with pool.acquire() as conn:
-            return await conn.fetchrow(query, *db_args)
-    except asyncpg.exceptions.InterfaceError as exc:
-        if "closing" in str(exc).lower() or "closed" in str(exc).lower():
-            _logger.warning("fetchrow skipped: DB pool shutting down (%s)", exc)
-        raise
+    attempts = 2
+    last_exc: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        pool = await _require_pool_async()
+        try:
+            async with pool.acquire() as conn:
+                return await conn.fetchrow(query, *db_args)
+        except Exception as exc:
+            last_exc = exc
+            if not _is_transient_db_error(exc) or attempt >= attempts:
+                raise
+            await _reset_pool_after_error(exc)
+            await asyncio.sleep(0.1 * attempt)
+    assert last_exc is not None
+    raise last_exc
 
 
 async def execute(query: str, *args: Any) -> str:
-    pool = _require_pool()
     db_args = _normalize_args(args)
-    try:
-        async with pool.acquire() as conn:
-            return await conn.execute(query, *db_args)
-    except asyncpg.exceptions.InterfaceError as exc:
-        if "closing" in str(exc).lower() or "closed" in str(exc).lower():
-            _logger.warning("execute skipped: DB pool shutting down (%s)", exc)
-        raise
+    attempts = 2
+    last_exc: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        pool = await _require_pool_async()
+        try:
+            async with pool.acquire() as conn:
+                return await conn.execute(query, *db_args)
+        except Exception as exc:
+            last_exc = exc
+            if not _is_transient_db_error(exc) or attempt >= attempts:
+                raise
+            await _reset_pool_after_error(exc)
+            await asyncio.sleep(0.1 * attempt)
+    assert last_exc is not None
+    raise last_exc
 
 
 async def ensure_user(user_id: int) -> None:

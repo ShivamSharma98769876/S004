@@ -58,7 +58,7 @@ STRIKE_DESCRIPTION = (
 
 IVR_BLOCK: dict[str, Any] = {
     "minThreshold": 40,
-    "maxLegThreshold": 65,
+    "maxLegThreshold": 100,
     "description": "Per-strike chain IVR must be between minThreshold and maxLegThreshold (inclusive).",
 }
 

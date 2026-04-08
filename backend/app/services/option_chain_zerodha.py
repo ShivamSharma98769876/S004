@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import deque
 import math
 import os
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 import statistics
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -40,6 +40,9 @@ _INSTRUMENTS_CACHE_TTL_SEC = 600
 _INSTRUMENTS_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 _RECENT_FETCHES: dict[str, deque[dict[int, dict[str, float]]]] = {}
 _SPOT_TOKEN_CACHE: dict[str, tuple[float, int]] = {}
+# Option-leg OHLCV from Kite historical_data (token, interval) -> (cache_ts_utc, closes, volumes)
+_OPTION_LEG_HIST_CACHE: dict[tuple[int, str], tuple[float, list[float], list[float]]] = {}
+_OPTION_LEG_HIST_TTL_SEC = 90.0
 
 
 def _ema(values: list[float], period: int) -> float:
@@ -69,26 +72,23 @@ def _rsi(values: list[float], period: int = 14) -> float:
     return 100 - (100 / (1 + rs))
 
 
-def _adx_from_candles(candles: list[dict[str, Any]], period: int = 14) -> float:
-    """ADX from OHLC candles. Uses close-only TR when high/low unavailable. Returns 0 if insufficient data."""
-    if len(candles) < period + 2:
-        return 0.0
+def _wilder_smooth_list(vals: list[float], period: int) -> list[float]:
+    """Wilder (RMA) smoothing; first full value is SMA of first ``period`` samples."""
+    out: list[float] = []
+    for i, v in enumerate(vals):
+        if i < period - 1:
+            out.append(vals[i])
+        elif i == period - 1:
+            out.append(statistics.mean(vals[:period]))
+        else:
+            prev = out[-1]
+            out.append((prev * (period - 1) + v) / period)
+    return out
 
-    def _wilder_smooth(vals: list[float], period: int) -> list[float]:
-        out: list[float] = []
-        for i, v in enumerate(vals):
-            if i < period - 1:
-                out.append(vals[i])
-            elif i == period - 1:
-                out.append(statistics.mean(vals[:period]))
-            else:
-                prev = out[-1]
-                out.append((prev * (period - 1) + v) / period)
-        return out
 
+def _true_range_series(candles: list[dict[str, Any]]) -> list[float]:
+    """True range per bar (same construction as ADX)."""
     tr_vals: list[float] = []
-    plus_dm: list[float] = []
-    minus_dm: list[float] = []
     for i, c in enumerate(candles):
         h = float(c.get("high", 0))
         l_ = float(c.get("low", 0))
@@ -96,8 +96,6 @@ def _adx_from_candles(candles: list[dict[str, Any]], period: int = 14) -> float:
         prev_cl = float(candles[i - 1].get("close", cl)) if i > 0 else cl
         if i == 0:
             tr_vals.append(max(1e-6, (h - l_) if (h > 0 and l_ >= 0 and h >= l_) else 0))
-            plus_dm.append(0.0)
-            minus_dm.append(0.0)
         else:
             prev_h = float(candles[i - 1].get("high", h))
             prev_l = float(candles[i - 1].get("low", l_))
@@ -108,14 +106,36 @@ def _adx_from_candles(candles: list[dict[str, Any]], period: int = 14) -> float:
                 abs(cl - prev_cl),
             )
             tr_vals.append(tr if tr > 0 else abs(cl - prev_cl))
+    return tr_vals
+
+
+def _adx_from_candles(candles: list[dict[str, Any]], period: int = 14) -> float:
+    """ADX from OHLC candles. Uses close-only TR when high/low unavailable. Returns 0 if insufficient data."""
+    if len(candles) < period + 2:
+        return 0.0
+
+    tr_vals = _true_range_series(candles)
+    plus_dm: list[float] = []
+    minus_dm: list[float] = []
+    for i, c in enumerate(candles):
+        h = float(c.get("high", 0))
+        l_ = float(c.get("low", 0))
+        cl = float(c.get("close", 0))
+        prev_cl = float(candles[i - 1].get("close", cl)) if i > 0 else cl
+        if i == 0:
+            plus_dm.append(0.0)
+            minus_dm.append(0.0)
+        else:
+            prev_h = float(candles[i - 1].get("high", h))
+            prev_l = float(candles[i - 1].get("low", l_))
             up = h - prev_h if (h and prev_h) else max(0.0, cl - prev_cl)
             down = prev_l - l_ if (l_ and prev_l) else max(0.0, prev_cl - cl)
             plus_dm.append(up if up > down and up > 0 else 0.0)
             minus_dm.append(down if down > up and down > 0 else 0.0)
 
-    tr_smooth = _wilder_smooth(tr_vals, period)
-    plus_smooth = _wilder_smooth(plus_dm, period)
-    minus_smooth = _wilder_smooth(minus_dm, period)
+    tr_smooth = _wilder_smooth_list(tr_vals, period)
+    plus_smooth = _wilder_smooth_list(plus_dm, period)
+    minus_smooth = _wilder_smooth_list(minus_dm, period)
 
     di_plus = [
         100.0 * plus_smooth[i] / tr_smooth[i] if tr_smooth[i] > 0 else 0.0
@@ -131,8 +151,57 @@ def _adx_from_candles(candles: list[dict[str, Any]], period: int = 14) -> float:
         else 0.0
         for i in range(len(di_plus))
     ]
-    adx_series = _wilder_smooth(dx_vals, period)
+    adx_series = _wilder_smooth_list(dx_vals, period)
     return round(adx_series[-1], 2) if adx_series else 0.0
+
+
+def _vwap_from_candles_equal_bar_weight(candles: list[dict[str, Any]]) -> float:
+    """Session-style VWAP when index volume is zero: typical price with weight 1 per bar."""
+    if not candles:
+        return 0.0
+    synth = [{**c, "volume": 1.0} for c in candles]
+    return _vwap_from_candles(synth)
+
+
+def _parse_candle_time_ist(c: dict[str, Any]) -> datetime | None:
+    t = c.get("time")
+    if t is None:
+        return None
+    if isinstance(t, datetime):
+        dti = t
+        if dti.tzinfo is None:
+            return dti.replace(tzinfo=_NSE_IST)
+        return dti.astimezone(_NSE_IST)
+    if isinstance(t, str) and t.strip():
+        s = t.strip().replace("Z", "+00:00")
+        try:
+            dti = datetime.fromisoformat(s)
+        except ValueError:
+            return None
+        if dti.tzinfo is None:
+            return dti.replace(tzinfo=_NSE_IST)
+        return dti.astimezone(_NSE_IST)
+    return None
+
+
+def nifty_index_candles_current_session(candles: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep 5m (or any) index bars that fall on today's NSE cash session in IST."""
+    if not candles:
+        return []
+    now_ist = datetime.now(_NSE_IST)
+    today = now_ist.date()
+    open_today = datetime.combine(today, time(9, 15), tzinfo=_NSE_IST)
+    close_today = datetime.combine(today, time(15, 30), tzinfo=_NSE_IST)
+    out: list[tuple[datetime, dict[str, Any]]] = []
+    for c in candles:
+        dti = _parse_candle_time_ist(c)
+        if dti is None or dti.date() != today:
+            continue
+        if dti < open_today or dti > close_today:
+            continue
+        out.append((dti, c))
+    out.sort(key=lambda x: x[0])
+    return [x[1] for x in out]
 
 
 def _vwap_from_candles(candles: list[dict[str, Any]]) -> float:
@@ -243,6 +312,28 @@ def _bars_since_bearish_cross(ltps: list[float], fast_period: int = 9, slow_peri
     return None
 
 
+def _rsi_strictly_falling_last_n_bars(ltps: list[float], n: int) -> bool:
+    """True if RSI at the last n bar closes is strictly decreasing (oldest > … > current).
+
+    Uses the same period rule as ``_indicator_pack_from_series_bearish`` (``min(14, len(sub)-1)``).
+    """
+    if n < 2 or not ltps:
+        return False
+    vals: list[float] = []
+    for skip in range(n - 1, -1, -1):
+        sub = ltps[:-skip] if skip > 0 else ltps
+        if len(sub) < 3:
+            return False
+        p_r = min(14, len(sub) - 1)
+        if len(sub) < p_r + 1:
+            return False
+        vals.append(_rsi(sub[-30:], p_r))
+    for i in range(len(vals) - 1):
+        if not (vals[i] > vals[i + 1]):
+            return False
+    return True
+
+
 def _indicator_pack_from_series_bearish(
     ltps: list[float],
     vols: list[float],
@@ -257,6 +348,14 @@ def _indicator_pack_from_series_bearish(
     leg_score_mode: str = "legacy",
     rsi_below_for_weak: float = 50.0,
     rsi_direct_band: bool = False,
+    rsi_require_decreasing: bool = False,
+    rsi_zone_or_reversal: bool = False,
+    rsi_soft_zone_low: float = 20.0,
+    rsi_soft_zone_high: float = 45.0,
+    rsi_reversal_from_rsi: float = 70.0,
+    rsi_reversal_falling_bars: int = 0,
+    vwap_eligible_buffer_pct: float = 0.0,
+    three_factor_require_ltp_below_vwap_for_eligible: bool = True,
 ) -> dict[str, Any]:
     """Bearish mirror of _indicator_pack_from_series: price below VWAP, EMA9 < EMA21, RSI on option LTP.
 
@@ -267,6 +366,20 @@ def _indicator_pack_from_series_bearish(
 
     ``rsi_direct_band``: when True (short premium), ``rsi_ok`` = ``rsi_min`` <= RSI <= ``rsi_max`` on the leg
     (e.g. overbought 65–100); applies to both ``legacy`` and ``three_factor`` RSI checks.
+
+    ``rsi_require_decreasing`` (``three_factor`` only): when True, overrides ``rsi_direct_band``; ``rsi_ok`` is
+    RSI < ``rsi_below_for_weak`` and RSI strictly below RSI on the prior bar of the same LTP series (same period
+    as the leg RSI calculation).
+
+    ``rsi_zone_or_reversal`` (``three_factor`` only): when True, overrides decreasing/direct band; ``rsi_ok`` is
+    (RSI in [``rsi_soft_zone_low``, ``rsi_soft_zone_high``]) OR branch B: if ``rsi_reversal_falling_bars`` >= 2,
+    RSI strictly decreases over the last N bar closes (oldest > … > current); else prior-bar RSI >=
+    ``rsi_reversal_from_rsi`` and current RSI < prior-bar RSI (classic overbought reversal).
+
+    ``vwap_eligible_buffer_pct``: relax ``primary_ok`` to ``close < vwap * (1 + pct/100)`` (clamped 0–3).
+
+    ``three_factor_require_ltp_below_vwap_for_eligible``: when False and mode is ``three_factor``,
+    ``signalEligible`` is ``score >= score_threshold`` only (VWAP weakness still affects the score).
     """
     if not ltps:
         return {
@@ -284,6 +397,7 @@ def _indicator_pack_from_series_bearish(
             "rsiOk": False,
             "volumeOk": False,
             "signalEligible": False,
+            "rsiPrev": None,
         }
     mode = (leg_score_mode or "legacy").strip().lower()
     three_factor = mode == "three_factor"
@@ -315,19 +429,55 @@ def _indicator_pack_from_series_bearish(
         vwap = statistics.mean(ltps)
     avg_vol = statistics.mean(vols[:-1]) if len(vols) > 1 else max(1.0, vol_now)
     vol_ratio = (vol_now / avg_vol) if avg_vol > 0 else 0.0
-    primary_ok = close_now < vwap
+    try:
+        _vbuf = float(vwap_eligible_buffer_pct)
+    except (TypeError, ValueError):
+        _vbuf = 0.0
+    _vbuf = max(0.0, min(3.0, _vbuf))
+    vwap_primary_line = vwap * (1.0 + _vbuf / 100.0) if vwap > 0 else vwap
+    primary_ok = close_now < vwap_primary_line
     ema_ok = ema9 < ema21
     raw_vol_ok = vol_ratio > volume_min_ratio
+    rsi_prev_bar: float | None = None
+    if len(ltps) >= 4:
+        prev_ltps_r = ltps[:-1]
+        p_prev_r = min(14, len(prev_ltps_r) - 1)
+        if len(prev_ltps_r) >= p_prev_r + 1:
+            rsi_prev_bar = _rsi(prev_ltps_r[-30:], p_prev_r)
+
     if three_factor:
         include_ema_crossover_in_score = False
         include_volume_in_score = False
-        if rsi_direct_band:
+        thr = float(rsi_below_for_weak)
+        if rsi_zone_or_reversal:
+            zlo, zhi = float(rsi_soft_zone_low), float(rsi_soft_zone_high)
+            if zlo > zhi:
+                zlo, zhi = zhi, zlo
+            zone_ok = zlo - 1e-9 <= rsi <= zhi + 1e-9
+            nfall = max(0, int(rsi_reversal_falling_bars))
+            rev_ok = False
+            if nfall >= 2:
+                rev_ok = _rsi_strictly_falling_last_n_bars(ltps, nfall)
+            elif rsi_prev_bar is not None:
+                rev_ok = rsi_prev_bar >= float(rsi_reversal_from_rsi) and rsi < rsi_prev_bar
+            rsi_ok = zone_ok or rev_ok
+        elif rsi_require_decreasing:
+            if len(ltps) < 4:
+                rsi_ok = False
+            else:
+                prev_ltps = ltps[:-1]
+                p_prev = min(14, len(prev_ltps) - 1)
+                if len(prev_ltps) < p_prev + 1:
+                    rsi_ok = False
+                else:
+                    rsi_prev = _rsi(prev_ltps[-30:], p_prev)
+                    rsi_ok = (rsi < thr) and (rsi < rsi_prev)
+        elif rsi_direct_band:
             rlo, rhi = float(rsi_min), float(rsi_max)
             if rlo > rhi:
                 rlo, rhi = rhi, rlo
             rsi_ok = rlo - 1e-9 <= rsi <= rhi + 1e-9
         else:
-            thr = float(rsi_below_for_weak)
             rsi_ok = rsi < thr
         cross_pts = 0
         vol_pts = 0
@@ -361,7 +511,13 @@ def _indicator_pack_from_series_bearish(
         "emaCrossoverOk": ema_crossover,
         "rsiOk": rsi_ok,
         "volumeOk": volume_ok,
-        "signalEligible": primary_ok and score >= score_threshold,
+        "signalEligible": (
+            (score >= score_threshold)
+            if three_factor
+            and not three_factor_require_ltp_below_vwap_for_eligible
+            else (primary_ok and score >= score_threshold)
+        ),
+        "rsiPrev": round(rsi_prev_bar, 2) if rsi_prev_bar is not None else None,
     }
 
 
@@ -481,6 +637,30 @@ def _spot_trend_payload_from_candles(
     )
     leg_mode_spot = str(ip.get("shortPremiumLegScoreMode") or "").strip().lower()
     rsi_below_spot = float(ip.get("shortPremiumRsiBelow", 50) or 50)
+    rsi_direct_spot = bool(ip.get("shortPremiumRsiDirectBand"))
+    rsi_dec_spot = bool(ip.get("shortPremiumRsiDecreasing"))
+    rsi_zone_or_spot = str(ip.get("shortPremiumRsiZoneOrReversal") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+    try:
+        rsi_zlo_sp = float(ip.get("shortPremiumRsiSoftZoneLow") or 20)
+    except (TypeError, ValueError):
+        rsi_zlo_sp = 20.0
+    try:
+        rsi_zhi_sp = float(ip.get("shortPremiumRsiSoftZoneHigh") or 45)
+    except (TypeError, ValueError):
+        rsi_zhi_sp = 45.0
+    try:
+        rsi_rfr_sp = float(ip.get("shortPremiumRsiReversalFromRsi") or 70)
+    except (TypeError, ValueError):
+        rsi_rfr_sp = 70.0
+    try:
+        rsi_rfb_sp = int(ip.get("shortPremiumRsiReversalFallingBars") or 0)
+    except (TypeError, ValueError):
+        rsi_rfb_sp = 0
+    rsi_rfb_sp = max(0, min(20, rsi_rfb_sp))
     inc_cross_bear_spot = bool(ip.get("include_ema_crossover_in_score", True))
     inc_vol_bear_spot = bool(ip.get("include_volume_in_leg_score", True))
     if leg_mode_spot == "three_factor":
@@ -498,6 +678,13 @@ def _spot_trend_payload_from_candles(
         include_ema_crossover_in_score=inc_cross_bear_spot,
         leg_score_mode=leg_mode_spot or "legacy",
         rsi_below_for_weak=rsi_below_spot,
+        rsi_direct_band=rsi_direct_spot,
+        rsi_require_decreasing=rsi_dec_spot,
+        rsi_zone_or_reversal=rsi_zone_or_spot,
+        rsi_soft_zone_low=rsi_zlo_sp,
+        rsi_soft_zone_high=rsi_zhi_sp,
+        rsi_reversal_from_rsi=rsi_rfr_sp,
+        rsi_reversal_falling_bars=rsi_rfb_sp,
     )
     bs = int(bull["score"])
     be = int(bear["score"])
@@ -565,13 +752,19 @@ def _indicator_pack_from_series(
         vwap = statistics.mean(ltps)
     avg_vol = statistics.mean(vols[:-1]) if len(vols) > 1 else max(1.0, vol_now)
     vol_ratio = (vol_now / avg_vol) if avg_vol > 0 else 0.0
+    # Pass/fail must use the same rounded values we expose to the UI (avoids "RSI 55.29" vs rsi_ok false).
+    close_r = round(close_now, 2)
+    vwap_r = round(vwap, 2)
+    ema9_r = round(ema9, 2)
+    ema21_r = round(ema21, 2)
+    rsi_r = round(rsi, 2)
     if strict_bullish_comparisons:
-        primary_ok = close_now > vwap
-        ema_ok = ema9 > ema21
+        primary_ok = close_r > vwap_r
+        ema_ok = ema9_r > ema21_r
     else:
-        primary_ok = close_now >= vwap
-        ema_ok = ema9 >= ema21
-    rsi_ok = rsi_min <= rsi <= rsi_max
+        primary_ok = close_r >= vwap_r
+        ema_ok = ema9_r >= ema21_r
+    rsi_ok = (rsi_min - 1e-6) <= rsi_r <= (rsi_max + 1e-6)
     raw_vol_ok = vol_ratio > volume_min_ratio
     volume_ok = raw_vol_ok if include_volume_in_score else True
     cross_pts = (1 if ema_crossover else 0) if include_ema_crossover_in_score else 0
@@ -584,10 +777,10 @@ def _indicator_pack_from_series(
         + vol_pts
     )
     return {
-        "ema9": round(ema9, 2),
-        "ema21": round(ema21, 2),
-        "rsi": round(rsi, 2),
-        "vwap": round(vwap, 2),
+        "ema9": ema9_r,
+        "ema21": ema21_r,
+        "rsi": rsi_r,
+        "vwap": vwap_r,
         "avgVolume": float(round(avg_vol, 2)),
         "volumeSpikeRatio": round(vol_ratio, 2),
         "score": score,
@@ -656,6 +849,14 @@ def _indicator_pack_from_quote_fallback_bearish(
     leg_score_mode: str = "legacy",
     rsi_below_for_weak: float = 50.0,
     rsi_direct_band: bool = False,
+    rsi_require_decreasing: bool = False,
+    rsi_zone_or_reversal: bool = False,
+    rsi_soft_zone_low: float = 20.0,
+    rsi_soft_zone_high: float = 45.0,
+    rsi_reversal_from_rsi: float = 70.0,
+    rsi_reversal_falling_bars: int = 0,
+    vwap_eligible_buffer_pct: float = 0.0,
+    three_factor_require_ltp_below_vwap_for_eligible: bool = True,
 ) -> dict[str, Any]:
     """Same synthetic OHLC path as bullish fallback, but bearish pack (premium weakness on option LTP)."""
     ohlc = quote.get("ohlc") or {}
@@ -680,6 +881,14 @@ def _indicator_pack_from_quote_fallback_bearish(
         leg_score_mode=leg_score_mode,
         rsi_below_for_weak=rsi_below_for_weak,
         rsi_direct_band=rsi_direct_band,
+        rsi_require_decreasing=rsi_require_decreasing,
+        rsi_zone_or_reversal=rsi_zone_or_reversal,
+        rsi_soft_zone_low=rsi_soft_zone_low,
+        rsi_soft_zone_high=rsi_soft_zone_high,
+        rsi_reversal_from_rsi=rsi_reversal_from_rsi,
+        rsi_reversal_falling_bars=rsi_reversal_falling_bars,
+        vwap_eligible_buffer_pct=vwap_eligible_buffer_pct,
+        three_factor_require_ltp_below_vwap_for_eligible=three_factor_require_ltp_below_vwap_for_eligible,
     )
 
 
@@ -701,6 +910,45 @@ def _next_weekday_dates(weekday: int, count: int) -> list[date]:
     return out
 
 
+def _estimated_nse_holidays() -> set[date]:
+    """
+    Fallback holiday set for weekly expiry preponement when broker does not publish weeklies.
+    Extend via env: S004_NSE_HOLIDAYS=14APR2026,01MAY2026
+    """
+    raw = str(os.getenv("S004_NSE_HOLIDAYS", "") or "").strip()
+    labels = [x.strip().upper() for x in raw.split(",") if x.strip()]
+    # Default known holiday causing NIFTY weekly preponement in Apr 2026.
+    if not labels:
+        labels = ["14APR2026"]
+    out: set[date] = set()
+    for lbl in labels:
+        try:
+            out.add(datetime.strptime(lbl, "%d%b%Y").date())
+        except ValueError:
+            continue
+    return out
+
+
+def _next_weekly_dates_with_holiday_preponement(weekday: int, count: int) -> list[date]:
+    holidays = _estimated_nse_holidays()
+    out: list[date] = []
+    seen: set[date] = set()
+    cursor = date.today()
+    while len(out) < count:
+        cursor += timedelta(days=1)
+        if cursor.weekday() != weekday:
+            continue
+        ex = cursor
+        while ex.weekday() >= 5 or ex in holidays:
+            ex -= timedelta(days=1)
+        if ex <= date.today() or ex in seen:
+            continue
+        seen.add(ex)
+        out.append(ex)
+    out.sort()
+    return out
+
+
 def get_expiries_for_instrument(instrument: str) -> list[str]:
     """Fallback only: next few weekly-ish dates (may not match real NFO expiries). Prefer ``get_expiries_for_analytics``."""
     key = instrument.strip().upper()
@@ -711,7 +959,7 @@ def get_expiries_for_instrument(instrument: str) -> list[str]:
         "SENSEX": 3,  # Thursday
     }
     wd = weekday_map.get(key, 1)
-    return [_format_expiry(x) for x in _next_weekday_dates(wd, 6)]
+    return [_format_expiry(x) for x in _next_weekly_dates_with_holiday_preponement(wd, 6)]
 
 
 def verify_kite_session_sync(kite: KiteConnect | None) -> bool:
@@ -827,18 +1075,38 @@ def resolve_expiry_min_dte_weekday_with_fallback(
     weekday: int | None,
 ) -> str | None:
     """
-    Prefer ``weekday`` when set; if no listed expiry matches that day while meeting min DTE,
-    fall back to the earliest expiry that still satisfies min calendar DTE (same as weekday=None).
-    Ensures chain fetch can proceed when the broker list has no qualifying weekly on the nominal day.
+    When ``weekday`` is set (e.g. NIFTY weekly Tuesday), prefer that weekday's earliest
+    qualifying expiry. If the broker also lists an **earlier** expiry that meets min DTE
+    and is **several days** before that weekday match, use the earlier one — this follows
+    NSE **holiday-preponed** index expiries (e.g. Monday 13 Apr when Tuesday 14 Apr is a holiday).
+
+    If no expiry matches ``weekday`` at all, fall back to earliest min-DTE (any weekday).
     """
-    picked = select_expiry_min_dte_and_weekday(
-        expiries, today, min_dte_days=min_dte_days, weekday=weekday
-    )
-    if picked is not None or weekday is None:
-        return picked
-    return select_expiry_min_dte_and_weekday(
+    picked_any = select_expiry_min_dte_and_weekday(
         expiries, today, min_dte_days=min_dte_days, weekday=None
     )
+    if weekday is None:
+        return picked_any
+
+    picked_wd = select_expiry_min_dte_and_weekday(
+        expiries, today, min_dte_days=min_dte_days, weekday=weekday
+    )
+    if picked_any is None:
+        return picked_wd
+    if picked_wd is None:
+        return picked_any
+
+    try:
+        d_any = datetime.strptime(picked_any.strip().upper(), "%d%b%Y").date()
+        d_wd = datetime.strptime(picked_wd.strip().upper(), "%d%b%Y").date()
+    except ValueError:
+        return picked_wd
+
+    # Gap threshold: skip one Tue in favour of Mon preponement (~6–8 days), but do not
+    # bypass a nearby Tue for a Thu/earlier-week series (gap usually < 6).
+    if d_any < d_wd and (d_wd - d_any).days >= 6:
+        return picked_any
+    return picked_wd
 
 
 def pick_expiry_with_min_calendar_dte(
@@ -880,10 +1148,20 @@ def fetch_indices_spot_sync(kite: KiteConnect | None = None) -> dict[str, dict[s
             result: dict[str, dict[str, Any]] = {}
             for key in keys:
                 entry = data.get(SPOT_SYMBOLS[key], {})
-                spot = float(entry.get("last_price", 0) or 0)
                 o = entry.get("ohlc") or {}
-                prev = float(o.get("close") or o.get("open") or spot or 1)
-                result[key] = {"spot": spot, "spotChgPct": _ltp_change_pct(spot, prev)}
+                last = float(entry.get("last_price", 0) or 0)
+                oc = float(o.get("close", 0) or 0)
+                oo = float(o.get("open", 0) or 0)
+                # Zerodha sometimes returns last_price 0 while session OHLC is populated (feed lag / halt).
+                spot = last if last > 0 else (oo if oo > 0 else oc)
+                if spot <= 0:
+                    spot = float(_BASE_SPOTS.get(key, 22450.0))
+                    result[key] = {"spot": spot, "spotChgPct": float(_BASE_CHG.get(key, 0.0))}
+                    continue
+                prev_ref = oc if oc > 0 else (oo if oo > 0 else spot)
+                if prev_ref <= 0:
+                    prev_ref = spot
+                result[key] = {"spot": spot, "spotChgPct": _ltp_change_pct(spot, prev_ref)}
             return result
         except Exception:
             pass
@@ -917,7 +1195,10 @@ def _resolve_spot(instrument: str, kite: KiteConnect | None) -> tuple[float, flo
         try:
             indices = fetch_indices_spot_sync(kite)
             if key in indices:
-                return float(indices[key]["spot"]), float(indices[key]["spotChgPct"])
+                sp = float(indices[key]["spot"])
+                ch = float(indices[key]["spotChgPct"])
+                if sp > 0:
+                    return sp, ch
         except Exception:
             pass
     return _BASE_SPOTS.get(key, 22450.0), _BASE_CHG.get(key, 0.0)
@@ -973,7 +1254,7 @@ def fetch_index_candles_sync(
 ) -> list[dict[str, Any]]:
     """Fetch OHLCV for an index (NIFTY, etc.) via Kite historical_data.
 
-    ``interval`` examples: ``minute``, ``3minute``, ``5minute``, ``15minute``, ``60minute``, ``day``.
+    ``interval`` examples: ``minute``, ``3minute``, ``5minute``, ``15minute``, ``30minute``, ``60minute``, ``day``.
 
     Uses **IST** bounds for ``from``/``to``. Passing UTC wall clock makes Zerodha treat it as IST,
     so e.g. 10:52 IST becomes an effective end time of ~05:22 IST and drops the current session.
@@ -1009,6 +1290,68 @@ def fetch_index_candles_sync(
     except Exception:
         pass
     return []
+
+
+def fetch_nifty_spot_trail_5m_for_session_sync(
+    kite: KiteConnect | None,
+    instrument: str = "NIFTY",
+) -> list[dict[str, Any]]:
+    """5m index closes for **today's** NSE cash session (IST), for landing spot-vs-walls chart.
+
+    Returns ``[{"ts": <UTC epoch ms>, "spot": <close>}, ...]`` sorted by ``ts``, aligned with the
+    frontend session grid (09:15–15:30 IST). Empty when Kite unavailable or outside session data.
+    """
+    if kite is None:
+        return []
+    tok = _get_spot_token(kite, instrument)
+    if not tok:
+        return []
+    try:
+        to_dt = datetime.now(_NSE_IST)
+        from_dt = to_dt - timedelta(days=4)
+        data = kite.historical_data(tok, from_dt, to_dt, "5minute")
+        if not isinstance(data, list) or not data:
+            return []
+    except Exception:
+        return []
+
+    now_ist = datetime.now(_NSE_IST)
+    today = now_ist.date()
+    open_today = datetime.combine(today, time(9, 15), tzinfo=_NSE_IST)
+    close_today = datetime.combine(today, time(15, 30), tzinfo=_NSE_IST)
+    open_ms = int(open_today.timestamp() * 1000)
+    close_ms = int(close_today.timestamp() * 1000)
+    now_ms = int(now_ist.timestamp() * 1000)
+    end_ms = min(now_ms, close_ms)
+    slot_ms = 5 * 60 * 1000
+
+    by_slot: dict[int, dict[str, Any]] = {}
+    for d in data:
+        dt_raw = d.get("date")
+        if dt_raw is None:
+            continue
+        if isinstance(dt_raw, datetime):
+            dti = dt_raw
+            if dti.tzinfo is None:
+                dti = dti.replace(tzinfo=_NSE_IST)
+            else:
+                dti = dti.astimezone(_NSE_IST)
+        else:
+            continue
+        if dti.date() != today:
+            continue
+        ts_ms = int(dti.timestamp() * 1000)
+        if ts_ms < open_ms - slot_ms or ts_ms > end_ms + slot_ms:
+            continue
+        slot = int((ts_ms - open_ms) // slot_ms)
+        if slot < 0:
+            continue
+        close_px = float(d.get("close") or 0)
+        if close_px <= 0:
+            continue
+        by_slot[slot] = {"ts": ts_ms, "spot": round(close_px, 2)}
+
+    return [by_slot[k] for k in sorted(by_slot)]
 
 
 def _build_synthetic_chain(
@@ -1116,6 +1459,87 @@ def _window_size() -> int:
     except ValueError:
         value = 30
     return max(10, min(60, value))
+
+
+def _option_hist_interval() -> str:
+    v = str(os.getenv("S004_OPTION_INDICATOR_INTERVAL", "3minute") or "3minute").strip()
+    return v if v else "3minute"
+
+
+def _get_option_leg_hist_series_cached(
+    kite: KiteConnect,
+    instrument_token: int,
+    budget_counter: list[int],
+) -> tuple[list[float], list[float]]:
+    """Fetch option closes/volumes for indicator series; short TTL cache; ``budget_counter[0]`` decrements on real API call."""
+    iv = _option_hist_interval()
+    key = (instrument_token, iv)
+    now_ts = datetime.utcnow().timestamp()
+    cached = _OPTION_LEG_HIST_CACHE.get(key)
+    if cached and (now_ts - cached[0]) < _OPTION_LEG_HIST_TTL_SEC:
+        return list(cached[1]), list(cached[2])
+    if budget_counter[0] <= 0:
+        return [], []
+    try:
+        to_dt = datetime.now(_NSE_IST)
+        from_dt = to_dt - timedelta(days=3)
+        data = kite.historical_data(int(instrument_token), from_dt, to_dt, iv)
+    except Exception:
+        return [], []
+    closes: list[float] = []
+    vols: list[float] = []
+    if isinstance(data, list):
+        for d in data:
+            try:
+                closes.append(float(d["close"]))
+                vols.append(float(d.get("volume") or 0))
+            except (TypeError, ValueError, KeyError):
+                continue
+    budget_counter[0] -= 1
+    _OPTION_LEG_HIST_CACHE[key] = (now_ts, closes, vols)
+    return closes, vols
+
+
+def _augment_option_leg_series_if_thin(
+    kite: KiteConnect | None,
+    poll_ltps: list[float],
+    poll_vols: list[float],
+    live_ltp: float,
+    live_vol: float,
+    inst_row: dict[str, Any],
+    budget_counter: list[int],
+) -> tuple[list[float], list[float]]:
+    """When poll history is short, prepend Kite historical closes so EMA/VWAP/RSI are meaningful (TrendSnap / long legs)."""
+    if kite is None:
+        return poll_ltps, poll_vols
+    try:
+        min_poll = int(os.getenv("S004_OPTION_MIN_POLL_FOR_INDICATORS", "22") or "22")
+    except ValueError:
+        min_poll = 22
+    min_poll = max(5, min(60, min_poll))
+    if len(poll_ltps) >= min_poll:
+        return poll_ltps, poll_vols
+    tok = int(inst_row.get("instrument_token", 0) or 0)
+    if not tok:
+        return poll_ltps, poll_vols
+    h_c, h_v = _get_option_leg_hist_series_cached(kite, tok, budget_counter)
+    if len(h_c) < 5:
+        return poll_ltps, poll_vols
+    try:
+        tail = min(int(os.getenv("S004_OPTION_HIST_MAX_BARS", "80") or "80"), len(h_c))
+    except ValueError:
+        tail = min(80, len(h_c))
+    tail = max(5, tail)
+    mlp = [float(x) for x in h_c[-tail:]]
+    mvo = [max(0.0, float(x)) for x in h_v[-tail:]] if len(h_v) >= tail else []
+    pad = max(1.0, float(live_vol))
+    while len(mvo) < len(mlp):
+        mvo.insert(0, pad)
+    if mlp:
+        mlp[-1] = float(live_ltp)
+    if mvo:
+        mvo[-1] = max(0.0, float(live_vol))
+    return mlp, mvo
 
 
 def _expiry_as_date(raw: Any) -> date | None:
@@ -1244,6 +1668,48 @@ def _build_live_chain(
     req_rsi_eligible = bool(ip_global.get("requireRsiForEligible"))
     rsi_below_short = float(ip_global.get("shortPremiumRsiBelow", 50) or 50)
     rsi_direct_short = bool(ip_global.get("shortPremiumRsiDirectBand"))
+    rsi_decreasing_short = bool(ip_global.get("shortPremiumRsiDecreasing"))
+    rsi_zone_or = str(ip_global.get("shortPremiumRsiZoneOrReversal") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+    try:
+        rsi_zone_lo = float(ip_global.get("shortPremiumRsiSoftZoneLow") or 20)
+    except (TypeError, ValueError):
+        rsi_zone_lo = 20.0
+    try:
+        rsi_zone_hi = float(ip_global.get("shortPremiumRsiSoftZoneHigh") or 45)
+    except (TypeError, ValueError):
+        rsi_zone_hi = 45.0
+    try:
+        rsi_rev_from = float(ip_global.get("shortPremiumRsiReversalFromRsi") or 70)
+    except (TypeError, ValueError):
+        rsi_rev_from = 70.0
+    try:
+        rsi_fall_n = int(ip_global.get("shortPremiumRsiReversalFallingBars") or 0)
+    except (TypeError, ValueError):
+        rsi_fall_n = 0
+    rsi_fall_n = max(0, min(20, rsi_fall_n))
+    try:
+        vwap_buf_short = float(ip_global.get("shortPremiumVwapEligibleBufferPct") or 0)
+    except (TypeError, ValueError):
+        vwap_buf_short = 0.0
+    vwap_buf_short = max(0.0, min(3.0, vwap_buf_short))
+    _tfvw = ip_global.get("shortPremiumThreeFactorRequireLtpBelowVwapForEligible")
+    if _tfvw is None:
+        tf_req_vwap_below = True
+    else:
+        tf_req_vwap_below = (
+            bool(_tfvw) if isinstance(_tfvw, bool) else str(_tfvw).strip().lower() in {"1", "true", "yes"}
+        )
+
+    try:
+        hist_budget = int(os.getenv("S004_OPTION_HIST_FETCH_BUDGET", "32") or "32")
+    except ValueError:
+        hist_budget = 32
+    hist_budget = max(0, min(80, hist_budget))
+    hist_bud = [hist_budget]
 
     for strike in strikes:
         call_q = quote_data.get(f"NFO:{by_key[(strike, 'CE')]['tradingsymbol']}") if (strike, "CE") in by_key else {}
@@ -1272,18 +1738,46 @@ def _build_live_chain(
         prev_call_vol = float(prev.get("call_vol", call_vol))
         prev_put_vol = float(prev.get("put_vol", put_vol))
 
-        call_ltp_series = [float(s.get(strike, {}).get("call_ltp", 0.0)) for s in history_snapshots]
-        put_ltp_series = [float(s.get(strike, {}).get("put_ltp", 0.0)) for s in history_snapshots]
-        call_vol_series = [float(s.get(strike, {}).get("call_vol", 0.0)) for s in history_snapshots]
-        put_vol_series = [float(s.get(strike, {}).get("put_vol", 0.0)) for s in history_snapshots]
-        call_ltp_series = [x for x in call_ltp_series if x > 0]
-        put_ltp_series = [x for x in put_ltp_series if x > 0]
-        call_vol_series = [max(0.0, x) for x in call_vol_series[-len(call_ltp_series) :]]
-        put_vol_series = [max(0.0, x) for x in put_vol_series[-len(put_ltp_series) :]]
+        call_ltp_series: list[float] = []
+        call_vol_series: list[float] = []
+        put_ltp_series: list[float] = []
+        put_vol_series: list[float] = []
+        for snap in history_snapshots:
+            row = snap.get(strike) or {}
+            cl = float(row.get("call_ltp", 0.0))
+            cv = max(0.0, float(row.get("call_vol", 0.0)))
+            pl = float(row.get("put_ltp", 0.0))
+            pv = max(0.0, float(row.get("put_vol", 0.0)))
+            if cl > 0:
+                call_ltp_series.append(cl)
+                call_vol_series.append(cv)
+            if pl > 0:
+                put_ltp_series.append(pl)
+                put_vol_series.append(pv)
         call_ltp_series.append(max(0.0, call_ltp))
         put_ltp_series.append(max(0.0, put_ltp))
         call_vol_series.append(max(0.0, call_vol))
         put_vol_series.append(max(0.0, put_vol))
+        call_inst_row = by_key.get((strike, "CE"), {})
+        put_inst_row = by_key.get((strike, "PE"), {})
+        call_ltp_series, call_vol_series = _augment_option_leg_series_if_thin(
+            kite,
+            call_ltp_series,
+            call_vol_series,
+            call_ltp,
+            call_vol,
+            call_inst_row,
+            hist_bud,
+        )
+        put_ltp_series, put_vol_series = _augment_option_leg_series_if_thin(
+            kite,
+            put_ltp_series,
+            put_vol_series,
+            put_ltp,
+            put_vol,
+            put_inst_row,
+            hist_bud,
+        )
         ip = ip_global
         max_cross = ip.get("max_candles_since_cross")
         rsi_min = float(ip.get("rsi_min", 50))
@@ -1311,6 +1805,14 @@ def _build_live_chain(
                 leg_score_mode=leg_mode_short or "legacy",
                 rsi_below_for_weak=rsi_below_short,
                 rsi_direct_band=rsi_direct_short,
+                rsi_require_decreasing=rsi_decreasing_short,
+                rsi_zone_or_reversal=rsi_zone_or,
+                rsi_soft_zone_low=rsi_zone_lo,
+                rsi_soft_zone_high=rsi_zone_hi,
+                rsi_reversal_from_rsi=rsi_rev_from,
+                rsi_reversal_falling_bars=rsi_fall_n,
+                vwap_eligible_buffer_pct=vwap_buf_short,
+                three_factor_require_ltp_below_vwap_for_eligible=tf_req_vwap_below,
             )
             put_ind = _indicator_pack_from_series_bearish(
                 put_ltp_series,
@@ -1325,6 +1827,14 @@ def _build_live_chain(
                 leg_score_mode=leg_mode_short or "legacy",
                 rsi_below_for_weak=rsi_below_short,
                 rsi_direct_band=rsi_direct_short,
+                rsi_require_decreasing=rsi_decreasing_short,
+                rsi_zone_or_reversal=rsi_zone_or,
+                rsi_soft_zone_low=rsi_zone_lo,
+                rsi_soft_zone_high=rsi_zone_hi,
+                rsi_reversal_from_rsi=rsi_rev_from,
+                rsi_reversal_falling_bars=rsi_fall_n,
+                vwap_eligible_buffer_pct=vwap_buf_short,
+                three_factor_require_ltp_below_vwap_for_eligible=tf_req_vwap_below,
             )
         else:
             call_ind = _indicator_pack_from_series(
@@ -1375,6 +1885,14 @@ def _build_live_chain(
                     leg_score_mode=leg_mode_short or "legacy",
                     rsi_below_for_weak=rsi_below_short,
                     rsi_direct_band=rsi_direct_short,
+                    rsi_require_decreasing=rsi_decreasing_short,
+                    rsi_zone_or_reversal=rsi_zone_or,
+                    rsi_soft_zone_low=rsi_zone_lo,
+                    rsi_soft_zone_high=rsi_zone_hi,
+                    rsi_reversal_from_rsi=rsi_rev_from,
+                    rsi_reversal_falling_bars=rsi_fall_n,
+                    vwap_eligible_buffer_pct=vwap_buf_short,
+                    three_factor_require_ltp_below_vwap_for_eligible=tf_req_vwap_below,
                 )
             else:
                 call_ind = _indicator_pack_from_quote_fallback(
@@ -1412,6 +1930,14 @@ def _build_live_chain(
                     leg_score_mode=leg_mode_short or "legacy",
                     rsi_below_for_weak=rsi_below_short,
                     rsi_direct_band=rsi_direct_short,
+                    rsi_require_decreasing=rsi_decreasing_short,
+                    rsi_zone_or_reversal=rsi_zone_or,
+                    rsi_soft_zone_low=rsi_zone_lo,
+                    rsi_soft_zone_high=rsi_zone_hi,
+                    rsi_reversal_from_rsi=rsi_rev_from,
+                    rsi_reversal_falling_bars=rsi_fall_n,
+                    vwap_eligible_buffer_pct=vwap_buf_short,
+                    three_factor_require_ltp_below_vwap_for_eligible=tf_req_vwap_below,
                 )
             else:
                 put_ind = _indicator_pack_from_quote_fallback(
@@ -1495,6 +2021,7 @@ def _build_live_chain(
                     "rsiOk": call_ind["rsiOk"],
                     "volumeOk": call_ind["volumeOk"],
                     "signalEligible": call_ind["signalEligible"],
+                    "rsiPrev": call_ind.get("rsiPrev"),
                     "regimeSellCe": regime_sell_ce,
                 },
                 "put": {
@@ -1527,6 +2054,7 @@ def _build_live_chain(
                     "rsiOk": put_ind["rsiOk"],
                     "volumeOk": put_ind["volumeOk"],
                     "signalEligible": put_ind["signalEligible"],
+                    "rsiPrev": put_ind.get("rsiPrev"),
                     "regimeSellPe": regime_sell_pe,
                 },
             }
@@ -1654,6 +2182,88 @@ def _apply_short_premium_skew_pcr_leg_scores(chain: list[dict[str, Any]], ip: di
             leg["score"] = min(leg_cap, tech + skew_b + pcr_b)
 
 
+def _apply_short_premium_enrichment_filters(
+    chain: list[dict[str, Any]],
+    ip: dict[str, Any],
+    score_threshold: int,
+) -> None:
+    """
+    Optional pseudocode-style vetoes (strategy JSON). Defaults off — no effect unless set.
+
+    - shortPremiumExpansionBlockRsi: block when RSI above this and LTP > VWAP (expansion-phase premium).
+    - shortPremiumVwapWeaknessMinPct: when LTP < VWAP, require (VWAP-LTP)/VWAP >= this fraction (e.g. 0.01).
+    - shortPremiumMinMomentumPoints: require primary+EMA+RSI OK count >= N (1..3).
+    - shortPremiumGhostRsiDropPts: require prior-bar RSI minus current RSI >= N (timing confirmation).
+    """
+    if str(ip.get("positionIntent", "")).lower() != "short_premium":
+        return
+    try:
+        exp_rsi = float(ip.get("shortPremiumExpansionBlockRsi") or 0)
+    except (TypeError, ValueError):
+        exp_rsi = 0.0
+    try:
+        min_vwap_pct = float(ip.get("shortPremiumVwapWeaknessMinPct") or 0)
+    except (TypeError, ValueError):
+        min_vwap_pct = 0.0
+    try:
+        min_momentum = int(ip.get("shortPremiumMinMomentumPoints") or 0)
+    except (TypeError, ValueError):
+        min_momentum = 0
+    try:
+        ghost_pts = float(ip.get("shortPremiumGhostRsiDropPts") or 0)
+    except (TypeError, ValueError):
+        ghost_pts = 0.0
+
+    if exp_rsi <= 0 and min_vwap_pct <= 0 and min_momentum <= 0 and ghost_pts <= 0:
+        return
+
+    for row in chain:
+        for leg_key in ("call", "put"):
+            leg = row.get(leg_key) or {}
+            if not leg or not leg.get("signalEligible"):
+                continue
+            rsi = float(leg.get("rsi") or 0)
+            vwap = float(leg.get("vwap") or 0)
+            ltp = float(leg.get("ltp") or 0)
+            primary = bool(leg.get("primaryOk"))
+            ema_ok = bool(leg.get("emaOk"))
+            rsi_ok = bool(leg.get("rsiOk"))
+
+            if exp_rsi > 0 and rsi > exp_rsi and ltp > vwap and vwap > 0:
+                leg["signalEligible"] = False
+                leg["shortPremiumExpansionBlocked"] = True
+                continue
+
+            if min_vwap_pct > 0 and vwap > 1e-9 and ltp < vwap:
+                if (vwap - ltp) / vwap < min_vwap_pct:
+                    leg["signalEligible"] = False
+                    leg["shortPremiumVwapDistanceBlocked"] = True
+                    continue
+
+            if min_momentum > 0:
+                tech_pts = int(primary) + int(ema_ok) + int(rsi_ok)
+                if tech_pts < min_momentum:
+                    leg["signalEligible"] = False
+                    leg["shortPremiumMomentumBlocked"] = True
+                    continue
+
+            if ghost_pts > 0:
+                rprev = leg.get("rsiPrev")
+                if rprev is None:
+                    leg["signalEligible"] = False
+                    leg["shortPremiumGhostBlocked"] = True
+                    continue
+                try:
+                    rpv = float(rprev)
+                except (TypeError, ValueError):
+                    leg["signalEligible"] = False
+                    leg["shortPremiumGhostBlocked"] = True
+                    continue
+                if (rpv - rsi) < ghost_pts:
+                    leg["signalEligible"] = False
+                    leg["shortPremiumGhostBlocked"] = True
+
+
 def fetch_option_chain_sync(
     kite: KiteConnect | None,
     instrument: str,
@@ -1694,6 +2304,7 @@ def fetch_option_chain_sync(
     _add_ivr_to_chain(chain)
     if short_pm:
         _apply_short_premium_skew_pcr_leg_scores(chain, ip)
+        _apply_short_premium_enrichment_filters(chain, ip, int(score_threshold))
 
     adx_val: float | None = None
     adx_min = ip.get("adx_min_threshold")

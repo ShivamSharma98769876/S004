@@ -104,15 +104,31 @@ async def _active_strategy_for_banner(user_id: int) -> dict | None:
         """,
         user_id,
     )
-    if row:
-        sid = str(row["strategy_id"])
-        ver = str(row["strategy_version"])
-        dn = row.get("display_name")
+    async def _build_payload(sid: str, ver: str, dn: Any) -> dict[str, Any]:
+        from app.services.trades_service import get_strategy_score_params
+
+        position_intent = "long_premium"
+        try:
+            params = await get_strategy_score_params(sid, ver, user_id)
+            pi = str(
+                params.get("execution_action_intent", params.get("position_intent", "long_premium"))
+            ).strip().lower()
+            if pi in {"long_premium", "short_premium"}:
+                position_intent = pi
+        except Exception:
+            position_intent = "long_premium"
         return {
             "strategyId": sid,
             "strategyVersion": ver,
             "displayName": str(dn).strip() if dn else sid,
+            "positionIntent": position_intent,
         }
+
+    if row:
+        sid = str(row["strategy_id"])
+        ver = str(row["strategy_version"])
+        dn = row.get("display_name")
+        return await _build_payload(sid, ver, dn)
     row = await fetchrow(
         """
         SELECT sub.strategy_id, sub.strategy_version, c.display_name
@@ -128,11 +144,7 @@ async def _active_strategy_for_banner(user_id: int) -> dict | None:
         sid = str(row["strategy_id"])
         ver = str(row["strategy_version"])
         dn = row.get("display_name")
-        return {
-            "strategyId": sid,
-            "strategyVersion": ver,
-            "displayName": str(dn).strip() if dn else sid,
-        }
+        return await _build_payload(sid, ver, dn)
     return None
 
 

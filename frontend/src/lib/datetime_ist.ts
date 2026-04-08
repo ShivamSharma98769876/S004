@@ -157,3 +157,41 @@ export const intlDateTimeOptionsIST: Intl.DateTimeFormatOptions = {
   month: "short",
   ...intlTimeOptionsIST,
 };
+
+/** NSE NIFTY cash session (IST, no DST). */
+const NSE_OPEN_IST = { h: 9, m: 15 };
+const NSE_CLOSE_IST = { h: 15, m: 30 };
+
+function istYmdParts(utcMs: number): { y: number; mo: number; d: number } {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: APP_TIMEZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(new Date(utcMs));
+  const y = Number(parts.find((p) => p.type === "year")?.value);
+  const mo = Number(parts.find((p) => p.type === "month")?.value);
+  const d = Number(parts.find((p) => p.type === "day")?.value);
+  return { y, mo, d };
+}
+
+/** UTC epoch ms for a calendar instant in IST (Asia/Kolkata, +05:30). */
+export function utcMsForIstWallClock(y: number, month: number, day: number, hour: number, minute: number): number {
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return Date.parse(`${y}-${pad(month)}-${pad(day)}T${pad(hour)}:${pad(minute)}:00+05:30`);
+}
+
+/** Today’s NSE cash open / close in UTC ms from a reference instant (default now). */
+export function nseCashSessionBoundsUtcMs(refUtcMs: number = Date.now()): { open: number; close: number } {
+  const { y, mo, d } = istYmdParts(refUtcMs);
+  return {
+    open: utcMsForIstWallClock(y, mo, d, NSE_OPEN_IST.h, NSE_OPEN_IST.m),
+    close: utcMsForIstWallClock(y, mo, d, NSE_CLOSE_IST.h, NSE_CLOSE_IST.m),
+  };
+}
+
+/** Whether `utcMs` falls inside today’s NSE cash session in IST. */
+export function isNseCashSessionNow(utcMs: number = Date.now()): boolean {
+  const { open, close } = nseCashSessionBoundsUtcMs(utcMs);
+  return utcMs >= open && utcMs <= close;
+}

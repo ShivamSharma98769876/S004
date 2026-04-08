@@ -27,14 +27,6 @@ export default function SettingsPage() {
   const [warning, setWarning] = useState<string>("");
   const [strategyOptions, setStrategyOptions] = useState<{ strategy_id: string; version: string; display_name: string }[]>([]);
   const [loadingStrategy, setLoadingStrategy] = useState(false);
-  const [connectNotice, setConnectNotice] = useState<string>("");
-  const [connectingKite, setConnectingKite] = useState(false);
-  const [reveal, setReveal] = useState({
-    apiSecret: false,
-    password: false,
-    totpSecret: false,
-    accessToken: false,
-  });
   const [approval, setApproval] = useState<{ approved_paper: boolean; approved_live: boolean } | null>(null);
   const [toast, setToast] = useState<{ message: string; type: "success" | "error" | "info" } | null>(null);
 
@@ -147,67 +139,6 @@ export default function SettingsPage() {
     }
   };
 
-  const connectKite = async () => {
-    setConnectNotice("");
-    if (!credentials.apiKey.trim() || !credentials.apiSecret.trim()) {
-      setConnectNotice("API Key and API Secret are required to connect Kite.");
-      return;
-    }
-    const hasRequestToken = !!credentials.requestToken.trim();
-    const hasAccessToken = !!credentials.accessToken.trim();
-    if (!hasRequestToken && !hasAccessToken) {
-      setConnectNotice("Enter Request Token (to generate Access Token) or Access Token (to connect directly).");
-      return;
-    }
-    setConnectingKite(true);
-    try {
-      const resp = await apiJson<{
-        status: string;
-        brokerConnected: boolean;
-        generatedAccessToken: boolean;
-        accessToken: string;
-      }>("/api/settings/zerodha/connect", "POST", {
-        apiKey: credentials.apiKey,
-        apiSecret: credentials.apiSecret,
-        requestToken: hasRequestToken ? credentials.requestToken : "",
-        accessToken: hasAccessToken ? credentials.accessToken : "",
-      });
-      setCredentials((c) => ({ ...c, accessToken: resp.accessToken }));
-      setMaster((m) => ({ ...m, brokerConnected: !!resp.brokerConnected }));
-      setConnectNotice(
-        resp.generatedAccessToken
-          ? "Access token generated from request token and connected."
-          : "Connected using access token (no generation)."
-      );
-    } catch (e) {
-      setMaster((m) => ({ ...m, brokerConnected: false }));
-      setConnectNotice(e instanceof Error ? e.message : "Kite connection failed.");
-    } finally {
-      setConnectingKite(false);
-    }
-  };
-
-  const hasRequestToken = !!credentials.requestToken.trim();
-  const hasAccessToken = !!credentials.accessToken.trim();
-  const connectButtonLabel = hasAccessToken
-    ? "Connect Kite"
-    : "Generate Access Token & Connect Kite";
-
-  const disconnectKite = async () => {
-    setConnectNotice("");
-    setConnectingKite(true);
-    try {
-      await apiJson<{ status: string; brokerConnected: boolean }>("/api/settings/zerodha/disconnect", "POST");
-      setCredentials((c) => ({ ...c, accessToken: "" }));
-      setMaster((m) => ({ ...m, brokerConnected: false }));
-      setConnectNotice("Disconnected. Access token cleared.");
-    } catch (e) {
-      setConnectNotice(e instanceof Error ? e.message : "Kite disconnect failed.");
-    } finally {
-      setConnectingKite(false);
-    }
-  };
-
   const resetDefaults = () => {
     setMaster(DEFAULT_TRADING_SETUP.master);
     setCredentials(DEFAULT_TRADING_SETUP.credentials);
@@ -218,6 +149,11 @@ export default function SettingsPage() {
     setWarning("");
     setSavedAt(new Date().toISOString());
   };
+
+  const positionIntent =
+    String(strategy.details?.positionIntent || "long_premium").toLowerCase() === "short_premium"
+      ? "short_premium"
+      : "long_premium";
 
   return (
     <AppFrame title="Trading Settings" subtitle="Configure credentials, risk controls, trade filters, and strategy runtime.">
@@ -255,125 +191,29 @@ export default function SettingsPage() {
                   <path d="M7 14a5 5 0 1 1 3.9 4.86L9 21H7v-2H5v-2H3v-2h4.17l1.34-1.34A4.94 4.94 0 0 1 7 14Zm8-3a2 2 0 1 0 0-4 2 2 0 0 0 0 4Z" />
                 </svg>
               </span>{" "}
-              ZERODHA CREDENTIALS
+              BROKER CONNECTIONS
             </span>
           </div>
           <div className="form-grid">
             <div className="field field-span-2">
-              <span>Connection Status</span>
+              <span>Status</span>
               <span className={`chip ${master.brokerConnected ? "chip-status-active" : "chip-status-paused"}`}>
                 {master.brokerConnected ? "Connected" : "Disconnected"}
               </span>
+              {master.activeBroker ? (
+                <small className="summary-label" style={{ display: "block", marginTop: 8 }}>
+                  Active broker: <strong>{master.activeBroker}</strong>
+                </small>
+              ) : null}
             </div>
-            <label className="field">
-              <span>API Key</span>
-              <input
-                className="control-input"
-                value={credentials.apiKey}
-                onChange={(e) => setCredentials((c) => ({ ...c, apiKey: e.target.value }))}
-              />
-            </label>
-            <label className="field">
-              <span>API Secret</span>
-              <div className="settings-input-with-toggle">
-                <input
-                  className="control-input"
-                  type={reveal.apiSecret ? "text" : "password"}
-                  value={credentials.apiSecret}
-                  onChange={(e) => setCredentials((c) => ({ ...c, apiSecret: e.target.value }))}
-                />
-                <button
-                  type="button"
-                  className="settings-eye-btn"
-                  onClick={() => setReveal((r) => ({ ...r, apiSecret: !r.apiSecret }))}
-                >
-                  {reveal.apiSecret ? "Hide" : "Show"}
-                </button>
-              </div>
-            </label>
-            <label className="field">
-              <span>User ID</span>
-              <input
-                className="control-input"
-                value={credentials.userId}
-                onChange={(e) => setCredentials((c) => ({ ...c, userId: e.target.value }))}
-              />
-            </label>
-            <label className="field">
-              <span>Password</span>
-              <div className="settings-input-with-toggle">
-                <input
-                  className="control-input"
-                  type={reveal.password ? "text" : "password"}
-                  value={credentials.password}
-                  onChange={(e) => setCredentials((c) => ({ ...c, password: e.target.value }))}
-                />
-                <button
-                  type="button"
-                  className="settings-eye-btn"
-                  onClick={() => setReveal((r) => ({ ...r, password: !r.password }))}
-                >
-                  {reveal.password ? "Hide" : "Show"}
-                </button>
-              </div>
-            </label>
-            <label className="field field-span-2">
-              <span>TOTP Secret Key</span>
-              <div className="settings-input-with-toggle">
-                <input
-                  className="control-input"
-                  type={reveal.totpSecret ? "text" : "password"}
-                  value={credentials.totpSecret}
-                  onChange={(e) => setCredentials((c) => ({ ...c, totpSecret: e.target.value }))}
-                />
-                <button
-                  type="button"
-                  className="settings-eye-btn"
-                  onClick={() => setReveal((r) => ({ ...r, totpSecret: !r.totpSecret }))}
-                >
-                  {reveal.totpSecret ? "Hide" : "Show"}
-                </button>
-              </div>
-            </label>
-            <label className="field field-span-2">
-              <span>Request Token</span>
-              <input
-                className="control-input"
-                value={credentials.requestToken}
-                onChange={(e) => setCredentials((c) => ({ ...c, requestToken: e.target.value }))}
-                placeholder="Paste Zerodha request token from Kite login"
-              />
-              <small className="summary-label">Enter to generate Access Token and connect.</small>
-            </label>
-            <label className="field field-span-2">
-              <span>Access Token</span>
-              <div className="settings-input-with-toggle">
-                <input
-                  className="control-input"
-                  type={reveal.accessToken ? "text" : "password"}
-                  value={credentials.accessToken}
-                  onChange={(e) => setCredentials((c) => ({ ...c, accessToken: e.target.value }))}
-                  placeholder="Or paste existing access token to connect directly"
-                />
-                <button
-                  type="button"
-                  className="settings-eye-btn"
-                  onClick={() => setReveal((r) => ({ ...r, accessToken: !r.accessToken }))}
-                >
-                  {reveal.accessToken ? "Hide" : "Show"}
-                </button>
-              </div>
-              <small className="summary-label">Enter to connect directly (no generation).</small>
-            </label>
             <div className="field field-span-2">
-              <span>Kite Connect Action</span>
-              <button className="action-button" onClick={connectKite} disabled={connectingKite}>
-                {connectingKite ? "Connecting..." : connectButtonLabel}
-              </button>
-              <button className="action-button pause" onClick={disconnectKite} disabled={connectingKite}>
-                Disconnect Kite
-              </button>
-              {!!connectNotice && <small className="summary-label">{connectNotice}</small>}
+              <p className="summary-label" style={{ marginBottom: 12, lineHeight: 1.5 }}>
+                Connect Zerodha Kite, FYERS, and choose which broker is active. Paper quotes can use the admin shared
+                Zerodha session when you have no own connection.
+              </p>
+              <Link href="/settings/brokers" className="action-button" style={{ display: "inline-block", textAlign: "center", textDecoration: "none" }}>
+                Open Brokers hub
+              </Link>
             </div>
           </div>
         </div>
@@ -737,10 +577,32 @@ export default function SettingsPage() {
                 <span className="field-hint">Contact admin for Paper or Live approval.</span>
               )}
             </label>
+            <label className="field">
+              <span>Option Position Intent</span>
+              <select
+                className="control-select"
+                value={positionIntent}
+                onChange={(e) =>
+                  setStrategy((s) => ({
+                    ...s,
+                    details: {
+                      ...(s.details ?? {}),
+                      positionIntent: e.target.value === "short_premium" ? "short_premium" : "long_premium",
+                    },
+                  }))
+                }
+              >
+                <option value="long_premium">Long Premium (BUY options)</option>
+                <option value="short_premium">Short Premium (SELL options)</option>
+              </select>
+              <span className="field-hint">
+                Auto-trade will use this strategy intent when generating recommendation side.
+              </span>
+            </label>
           </div>
 
           <p className="strategy-details-hint">
-            Strategy details (display name, description, indicators JSON) are edited in the Marketplace.
+            Strategy details are managed in Marketplace. Position Intent can be overridden here per user/strategy.
             Timeframe, Target, and SL are set in Trading Parameters above.
           </p>
         </div>

@@ -37,7 +37,7 @@ SELECT
     '{"win_rate_30d": 61.2, "pnl_30d": 12450.25}'::jsonb,
     '{
       "displayName": "TrendSnap Momentum",
-      "description": "Four-factor option read on the latest candle: close above VWAP (required gate), EMA9 above EMA21, RSI 50-75, volume above 1.02x average. RSI must be in band for eligibility (not score-only). NIFTY spot trend must align: bullish for CE, bearish for PE. Early session uses relaxed min contract volume until 10:00 IST. Exits use SL, target, and breakeven from Settings.",
+      "description": "Four-factor option read on the latest candle: close above VWAP (required gate), EMA9 above EMA21, RSI 50-75, volume above 1.02x average. RSI must be in band for eligibility (not score-only). NIFTY spot trend must align: bullish for CE, bearish for PE. Strike choice ranks eligible legs by score then by option flow (aligned with landing CE/PE tilt), OI/volume depth, OI change, and Long Buildup. Early session uses relaxed min contract volume until 10:00 IST. Exits use SL, target, and breakeven from Settings.",
       "requireRsiForEligible": true,
       "longPremiumSpotAlign": true,
       "includeEmaCrossoverInScore": false,
@@ -59,12 +59,27 @@ SELECT
         "maxOtmSteps": 3,
         "deltaPreferredCE": 0.45,
         "deltaPreferredPE": -0.45,
-        "description": "Liquidity: min OI 5k, min volume 300 (120 until 10:00 IST). Max 2 eligible strikes per refresh. Max 3 steps OTM. Prefer delta near 0.45 CE / -0.45 PE; rank by score and fit."
+        "flowRanking": {
+          "enabled": true,
+          "useChainFlowTilt": true,
+          "tiltWeight": 0.22,
+          "percentileOiWeight": 1.0,
+          "percentileVolWeight": 1.0,
+          "oiChgScaleWeight": 0.12,
+          "longBuildupBonus": 0.28,
+          "shortCoveringBonus": 0.24,
+          "pinPenaltyOnExpiryDay": true,
+          "pinMaxDistanceFromSpot": 150,
+          "pinOiDominanceRatio": 1.2,
+          "pinPenaltyWeight": 0.18,
+          "description": "After rule score, rank by flow tilt, OI/vol percentiles, OI change, Long Buildup / Short Covering. On expiry day (calendar DTE 0 IST only), subtract a soft rank penalty at the top-OI CE/PE strike if within pinMaxDistanceFromSpot of spot and OI dominance vs second strike passes pinOiDominanceRatio — no hard ban."
+        },
+        "description": "Liquidity: min OI 5k, min volume 300 (120 until 10:00 IST). Max 2 eligible strikes per refresh. Max 3 steps OTM. Prefer delta near 0.45 CE / -0.45 PE; rank by score, then flow ranking (OI/vol/ΔOI + landing flow tilt)."
       },
       "scoreThreshold": 3,
       "scoreMax": 4,
       "autoTradeScoreThreshold": 4,
-      "scoreDescription": "Primary: latest option close must be above VWAP (otherwise no signal). Score 0-4: +1 VWAP pass, +1 EMA9 above EMA21, +1 RSI 50-75, +1 volume above 1.02x average. No crossover or IVR points. Eligible BUY when score >= 3 AND RSI in 50-75 AND NIFTY spot regime matches leg (bullish/CE, bearish/PE). Auto-execute still requires autoTradeScoreThreshold."
+      "scoreDescription": "Primary: latest option close must be above VWAP (otherwise no signal). Score 0-4: +1 VWAP pass, +1 EMA9 above EMA21, +1 RSI 50-75, +1 volume above 1.02x average. No crossover or IVR points. Eligible BUY when score >= 3 AND RSI in 50-75 AND NIFTY spot regime matches leg (bullish/CE, bearish/PE). Among ties, strikes rank by flow (landing-style CE/PE tilt, OI/vol percentiles, OI change, Long Buildup). Auto-execute still requires autoTradeScoreThreshold."
     }'::jsonb,
     u.id
 FROM s004_users u
@@ -267,9 +282,9 @@ INSERT INTO s004_strategy_catalog (
 )
 SELECT
     'strat-nifty-ivr-trend-short',
-    '1.1.0',
+    '1.2.0',
     'Nifty IVR Trend Short',
-    'NIFTY naked short premium: symmetric CE/PE (EMA9 cross below EMA21 + LTP<VWAP on leg), chain IVR 55–100, leg RSI 65–100 (direct band), VIX delta bands. High risk; margin required.',
+    'NIFTY naked short premium: symmetric CE/PE (EMA9 cross below EMA21 + LTP<VWAP on leg), chain IVR 45–100, leg RSI <80 and falling vs prior bar, VIX delta bands. Min OI 3k / volume 200 per strike. High risk; margin required.',
     'HIGH',
     'ADMIN',
     'PUBLISHED',
@@ -280,20 +295,20 @@ SELECT
       "strategyType": "rule-based",
       "positionIntent": "short_premium",
       "displayName": "Nifty IVR Trend Short",
-      "description": "NIFTY short premium. Per-leg regime on option LTP: fresh EMA9 cross below EMA21 within emaCrossover.maxCandlesSinceCross and last close < leg VWAP for both sell-CE and sell-PE (symmetric). If both legs qualify at one strike, the more recent cross wins. VIX→delta via shortPremiumDeltaVixBands; leg RSI band via indicators.rsi when shortPremiumRsiDirectBand. Per-strike chain IVR in [ivr.minThreshold, maxLegThreshold]. No ADX; no min OI/volume when both are 0.",
+      "description": "NIFTY short premium. Per-leg regime on option LTP: fresh EMA9 cross below EMA21 within emaCrossover.maxCandlesSinceCross and last close < leg VWAP for both sell-CE and sell-PE (symmetric). If both legs qualify at one strike, the more recent cross wins. VIX→delta via shortPremiumDeltaVixBands; leg RSI when shortPremiumRsiDecreasing. Per-strike chain IVR in [ivr.minThreshold, maxLegThreshold]. Strike liquidity: minOi 3000, minVolume 200.",
       "spotRegimeMode": "ema_cross_vwap",
       "spotRegimeSatisfiedScore": 5,
       "includeVolumeInLegScore": false,
       "indicators": {
         "ema": {"fast": 9, "slow": 21, "description": "EMA9 vs EMA21 on each option leg LTP series; regime uses a fresh crossover on that leg."},
-        "emaCrossover": {"bonus": 0, "maxCandlesSinceCross": 5, "description": "Fresh cross within this many candles on the leg LTP series (default 5 if unset)."},
-        "ivr": {"minThreshold": 55, "maxLegThreshold": 100, "description": "Per-strike chain IVR must be between minThreshold and maxLegThreshold (inclusive)."},
-        "rsi": {"period": 14, "min": 65, "max": 100, "description": "Option-leg RSI (on LTP series). With shortPremiumRsiDirectBand=true, leg RSI must lie in [min, max] (overbought band)."},
+        "emaCrossover": {"bonus": 0, "maxCandlesSinceCross": 8, "description": "Fresh cross within this many candles on the leg LTP series."},
+        "ivr": {"minThreshold": 45, "maxLegThreshold": 100, "description": "Per-strike chain IVR must be between minThreshold and maxLegThreshold (inclusive)."},
+        "rsi": {"period": 14, "min": 0, "max": 100, "description": "Option-leg RSI on LTP series (period). With shortPremiumRsiDecreasing=true and three_factor, leg RSI must be < shortPremiumRsiBelow and falling vs the prior bar."},
         "vwap": {"description": "Leg last close vs leg VWAP: required LTP close < VWAP for both sell-PE and sell-CE regime paths (spotRegimeMode ema_cross_vwap)."}
       },
       "strikeSelection": {
-        "minOi": 0,
-        "minVolume": 0,
+        "minOi": 3000,
+        "minVolume": 200,
         "maxOtmSteps": 4,
         "deltaPreferredCE": 0.32,
         "deltaPreferredPE": -0.32,
@@ -315,27 +330,28 @@ SELECT
           }
         },
         "shortPremiumDeltaOnlyStrikes": true,
-        "shortPremiumRsiDirectBand": true,
+        "shortPremiumRsiDirectBand": false,
+        "shortPremiumRsiDecreasing": true,
         "minDteCalendarDays": 2,
         "niftyWeeklyExpiryWeekday": "TUE",
         "selectStrikeByMinGamma": true,
-        "maxStrikeRecommendations": 1,
+        "maxStrikeRecommendations": 3,
         "shortPremiumAsymmetricDatm": false,
         "shortPremiumCeMinSteps": 2,
         "shortPremiumCeMaxSteps": 4,
         "shortPremiumPeMinSteps": -4,
         "shortPremiumPeMaxSteps": 2,
         "shortPremiumLegScoreMode": "three_factor",
-        "shortPremiumRsiBelow": 50,
+        "shortPremiumRsiBelow": 80,
         "shortPremiumIvrSkewMin": 5,
         "shortPremiumPcrBonusVsChain": true,
         "shortPremiumPcrChainEpsilon": 0,
-        "description": "India VIX first; delta-only strike ladder. VIX>17 → CE +0.29..+0.35, PE -0.35..-0.29; VIX≤17 → CE +0.33..+0.40, PE -0.40..-0.33. Regime: same for CE/PE — fresh EMA9<EMA21 cross + LTP<VWAP on leg. shortPremiumRsiDirectBand: leg RSI in indicators.rsi min–max (65–100). IVR band on chain ivr. ±strikes/side floor 12 (env S004_SHORT_PREMIUM_DELTA_ONLY_STRIKES_EACH_SIDE). DTE≥2; Tue weekly; min gamma; three_factor + skew/PCR."
+        "description": "India VIX first; delta-only strike ladder. Min OI 3000 and min volume 200 per strike. VIX>17 → CE +0.29..+0.35, PE -0.35..-0.29; VIX≤17 → wider bands. IVR min 45 (per-strike). Regime: fresh EMA9<EMA21 + LTP<VWAP. RSI decreasing <80. Auto at score ≥4. ±strikes/side floor 12 (env). DTE≥2; Tue weekly; min gamma; three_factor + skew/PCR."
       },
       "scoreThreshold": 3,
       "scoreMax": 5,
       "autoTradeScoreThreshold": 4,
-      "scoreDescription": "Symmetric sell CE/PE: regimeSellPe/Ce = fresh EMA9 cross below EMA21 + LTP < leg VWAP (tie-break if both). Leg RSI in [indicators.rsi.min, max] when shortPremiumRsiDirectBand. Leg IVR in [ivr.minThreshold, maxLegThreshold]. three_factor technical up to 3 points + skew/PCR bonuses. Auto-trade at autoTradeScoreThreshold."
+      "scoreDescription": "Symmetric sell CE/PE: regimeSellPe/Ce = fresh EMA9 cross below EMA21 + LTP < leg VWAP (tie-break if both). Leg RSI below shortPremiumRsiBelow and decreasing vs prior bar when shortPremiumRsiDecreasing. Leg IVR in [ivr.minThreshold, maxLegThreshold]. three_factor technical up to 3 points + skew/PCR bonuses. Auto-trade at autoTradeScoreThreshold."
     }'::jsonb,
     u.id
 FROM s004_users u
@@ -395,7 +411,7 @@ INSERT INTO s004_strategy_config_versions (
 )
 SELECT
     'strat-nifty-ivr-trend-short',
-    '1.1.0',
+    '1.2.0',
     1,
     '{
       "timeframe": "3-min",

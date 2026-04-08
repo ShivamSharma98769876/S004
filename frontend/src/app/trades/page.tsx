@@ -1,8 +1,8 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import AppFrame from "@/components/AppFrame";
-import { apiJson, isAdmin } from "@/lib/api_client";
+import { apiJson, isAdmin, postTradesRefreshCycle } from "@/lib/api_client";
 
 type Recommendation = {
   recommendation_id: string;
@@ -31,6 +31,8 @@ type Recommendation = {
   failed_conditions?: string | null;
   heuristic_reasons?: string[] | null;
   strategy_name?: string | null;
+  strategy_id?: string | null;
+  strategy_version?: string | null;
   spot_price?: number | null;
   atm_distance?: number | null;
   timeframe?: string | null;
@@ -40,6 +42,30 @@ type Recommendation = {
 
 function compactSymbol(symbol: string): string {
   return symbol.replace(/\s+/g, "").toUpperCase();
+}
+
+function formatStrategyWithVersion(row: Recommendation): string {
+  const name = (row.strategy_name || "").trim();
+  const base = name || row.strategy_id?.trim() || "—";
+  const ver = (row.strategy_version || "").trim();
+  if (ver) {
+    return `${base} · v${ver}`;
+  }
+  return base;
+}
+
+function recommendationReasonsFull(row: Recommendation): string {
+  if (row.heuristic_reasons && row.heuristic_reasons.length > 0) {
+    return row.heuristic_reasons.join("; ");
+  }
+  return (row.failed_conditions || "").trim();
+}
+
+function formatTradeExecuteError(raw: string): string {
+  if (/recommendation\s+not\s+found/i.test(raw) || /refresh the trades/i.test(raw)) {
+    return "That row may have been replaced by a chain refresh. Reload the page, then execute again.";
+  }
+  return raw;
 }
 
 type OpenTrade = {
@@ -72,35 +98,65 @@ export default function TradesPage() {
   const [recSortDir, setRecSortDir] = useState<"asc" | "desc">("asc");
   const [openSortCol, setOpenSortCol] = useState<string>("");
   const [openSortDir, setOpenSortDir] = useState<"asc" | "desc">("asc");
+  const inFlightRef = useRef(false);
 
-  const loadAll = async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      const [recs, open] = await Promise.all([
-        apiJson<Recommendation[]>("/api/trades/recommendations", "GET", undefined, {
-          status: "GENERATED",
-          sort_by: sortBy,
-          sort_dir: sortDir,
-          min_confidence: minConfidence,
-          limit,
-          offset,
-          ...(isAdmin() && { all_strategies: "true" }),
-        }),
-        apiJson<OpenTrade[]>("/api/trades/open"),
-      ]);
-      setRecommendations(recs);
-      setOpenTrades(open);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Failed to load trades");
-    } finally {
-      setLoading(false);
-    }
-  };
+  /** Aligned with dashboard sync tick (refresh-cycle + lists). */
+  const TRADES_POLL_MS = 30_000;
+
+  const loadAll = useCallback(
+    async (opts?: { silent?: boolean }) => {
+      if (inFlightRef.current) return;
+      inFlightRef.current = true;
+      const silent = opts?.silent ?? false;
+      if (!silent) {
+        setLoading(true);
+        setError(null);
+      }
+      try {
+        // Keep page snappy: trigger refresh-cycle, but don't block list rendering on a slow broker call.
+        const refreshCycle = postTradesRefreshCycle().catch(() => null);
+        try {
+          await Promise.race([refreshCycle, new Promise((resolve) => window.setTimeout(resolve, 1200))]);
+        } catch {
+          /* still load table from stored rows */
+        }
+        const [recs, open] = await Promise.all([
+          apiJson<Recommendation[]>("/api/trades/recommendations", "GET", undefined, {
+            status: "GENERATED",
+            sort_by: sortBy,
+            sort_dir: sortDir,
+            min_confidence: minConfidence,
+            limit,
+            offset,
+            ensure_refresh: "false",
+            ...(isAdmin() && { all_strategies: "true" }),
+          }),
+          apiJson<OpenTrade[]>("/api/trades/open"),
+        ]);
+        setRecommendations(recs);
+        setOpenTrades(open);
+      } catch (e) {
+        if (!silent) {
+          setError(e instanceof Error ? e.message : "Failed to load trades");
+        }
+      } finally {
+        inFlightRef.current = false;
+        if (!silent) {
+          setLoading(false);
+        }
+      }
+    },
+    [limit, minConfidence, offset, sortBy, sortDir],
+  );
 
   useEffect(() => {
-    loadAll();
-  }, [offset, limit, sortBy, sortDir, minConfidence]);
+    void loadAll();
+  }, [loadAll]);
+
+  useEffect(() => {
+    const id = window.setInterval(() => void loadAll({ silent: true }), TRADES_POLL_MS);
+    return () => window.clearInterval(id);
+  }, [loadAll]);
 
   const execute = async (recommendationId: string, mode: "PAPER" | "LIVE") => {
     setError(null);
@@ -112,7 +168,8 @@ export default function TradesPage() {
       });
       await loadAll();
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Unable to execute selected recommendation.");
+      const raw = e instanceof Error ? e.message : "Unable to execute selected recommendation.";
+      setError(formatTradeExecuteError(raw));
     }
   };
 
@@ -249,9 +306,13 @@ export default function TradesPage() {
           </select>
         </section>
         <div className="table-wrap">
-          <table className="market-table">
+          <table className="market-table trades-eligible-table">
             <colgroup>
-              <col className="col-symbol" />
+              <col className="col-rec-symbol" />
+              <col className="col-rec-strategy" />
+              <col span={10} />
+              <col className="col-rec-reasons" />
+              <col className="col-rec-action" />
             </colgroup>
             <thead>
               <tr>
@@ -269,9 +330,20 @@ export default function TradesPage() {
                 >
                   IVR {recSortCol === "ivr" && (recSortDir === "asc" ? "↑" : "↓")}
                 </th>
-                <th className="sortable-th" onClick={() => handleRecSort("timeframe")}>TF / Refresh {recSortCol === "timeframe" && (recSortDir === "asc" ? "↑" : "↓")}</th>
-                <th className="sortable-th" onClick={() => handleRecSort("confidence_score")}>Confidence {recSortCol === "confidence_score" && (recSortDir === "asc" ? "↑" : "↓")}</th>
-                <th className="sortable-th" onClick={() => handleRecSort("score")}>Score {recSortCol === "score" && (recSortDir === "asc" ? "↑" : "↓")}</th>
+                <th
+                  className="sortable-th"
+                  title="Model confidence 0–99 from strike score and volume spike (not refresh cadence)"
+                  onClick={() => handleRecSort("confidence_score")}
+                >
+                  Confidence {recSortCol === "confidence_score" && (recSortDir === "asc" ? "↑" : "↓")}
+                </th>
+                <th
+                  className="sortable-th"
+                  title="TrendSnap: points on this option’s premium series (LTP vs VWAP, EMA9>EMA21, RSI band, volume). Not NIFTY spot."
+                  onClick={() => handleRecSort("score")}
+                >
+                  Score {recSortCol === "score" && (recSortDir === "asc" ? "↑" : "↓")}
+                </th>
                 <th className="sortable-th" onClick={() => handleRecSort("signal_eligible")}>Eligible {recSortCol === "signal_eligible" && (recSortDir === "asc" ? "↑" : "↓")}</th>
                 <th className="sortable-th" onClick={() => handleRecSort("atm_distance")}>ATM Dist {recSortCol === "atm_distance" && (recSortDir === "asc" ? "↑" : "↓")}</th>
                 <th className="sortable-th" onClick={() => handleRecSort("failed_conditions")}>Reasons {recSortCol === "failed_conditions" && (recSortDir === "asc" ? "↑" : "↓")}</th>
@@ -281,7 +353,7 @@ export default function TradesPage() {
             <tbody>
               {sortedRecs.length === 0 ? (
                 <tr>
-                  <td colSpan={15} className="empty-state">
+                  <td colSpan={14} className="empty-state">
                     No recommendations available.
                   </td>
                 </tr>
@@ -289,7 +361,9 @@ export default function TradesPage() {
                 sortedRecs.map((row) => (
                   <tr key={row.recommendation_id}>
                     <td className="strategy-name">{compactSymbol(row.symbol)}</td>
-                    <td className="summary-label">{row.strategy_name || "—"}</td>
+                    <td className="cell-strategy-rec" title={formatStrategyWithVersion(row)}>
+                      {formatStrategyWithVersion(row)}
+                    </td>
                     <td>{Number(row.entry_price).toFixed(2)}</td>
                     <td>{row.ema9 != null ? Number(row.ema9).toFixed(2) : "—"}</td>
                     <td>{row.ema21 != null ? Number(row.ema21).toFixed(2) : "—"}</td>
@@ -298,33 +372,30 @@ export default function TradesPage() {
                     <td title="IV rank proxy within this expiry chain (0–100)">
                       {row.ivr != null ? Number(row.ivr).toFixed(1) : "—"}
                     </td>
-                    <td className="summary-label">
-                      {(row.timeframe || "3m").replace("-", "")} · {row.refresh_interval_sec ?? 30}s
+                    <td title="Derived from leg score ÷ max and volume bonus; low when strike rules fail">
+                      <span className="chip chip-status-active">{Number(row.confidence_score ?? 0).toFixed(2)}</span>
                     </td>
-                    <td>
-                      <span className="chip chip-status-active">{Number(row.confidence_score).toFixed(2)}</span>
+                    <td title="Rule points on this strike’s premium (VWAP/EMA/RSI/vol). 0/4 means none of the four passed — see Reasons.">
+                      {row.score != null ? (row.score_max != null ? `${row.score}/${row.score_max}` : String(row.score)) : "—"}
                     </td>
-                    <td>{row.score != null ? (row.score_max != null ? `${row.score}/${row.score_max}` : String(row.score)) : "—"}</td>
                     <td>
                       <span className={`chip ${row.signal_eligible ? "chip-status-active" : "chip-status-paused"}`}>
                         {row.signal_eligible ? "YES" : "NO"}
                       </span>
                     </td>
                     <td>{row.atm_distance != null ? `${row.atm_distance >= 0 ? "+" : ""}${row.atm_distance}` : "—"}</td>
-                    <td className="summary-label cell-failed-conditions" title={row.heuristic_reasons?.join("; ") || row.failed_conditions || undefined}>
-                      {row.heuristic_reasons && row.heuristic_reasons.length > 0 ? (
-                        <span className="heuristic-reasons-wrap">
-                          {row.heuristic_reasons.map((r, i) => (
-                            <span key={i} className="heuristic-badge">{r}</span>
-                          ))}
-                        </span>
-                      ) : row.failed_conditions ? (
-                        row.failed_conditions.split("; ").map((c, i) => (
-                          <span key={i}>
-                            {i > 0 ? <br /> : null}{c}
+                    <td className="cell-failed-conditions">
+                      {(() => {
+                        const full = recommendationReasonsFull(row);
+                        if (!full) {
+                          return "—";
+                        }
+                        return (
+                          <span className="reasons-preview" title={full}>
+                            {full}
                           </span>
-                        ))
-                      ) : "—"}
+                        );
+                      })()}
                     </td>
                     <td>
                       <button

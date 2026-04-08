@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useId, useMemo, useState } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import AppFrame from "@/components/AppFrame";
 import TrendPulseChart, {
@@ -23,14 +23,18 @@ import MarketVerdictWidget, {
   htfTrendBias,
   sessionTrendBias,
 } from "@/components/landing/MarketVerdictWidget";
-import { apiJson, getAuth } from "@/lib/api_client";
+import OiSellerPinboardWidget, { type OiWallsPayload } from "@/components/landing/OiSellerPinboardWidget";
+import SidewaysRegimePanel, { type SidewaysRegimePayload } from "@/components/landing/SidewaysRegimePanel";
+import { apiJson, getAuth, postTradesRefreshCycle } from "@/lib/api_client";
 import { formatTimeIST } from "@/lib/datetime_ist";
 
 type MarketSnapshot = {
   nifty: { spot: number; changePct: number };
+  nifty15m?: { changePct: number | null; trendLabel: string };
   pcr: number | null;
   sentimentLabel: string;
   intradayTrendLabel: string;
+  vix?: number | null;
 };
 
 type TrendPulsePayload = {
@@ -111,6 +115,8 @@ type DecisionSnapshotPayload = {
   trendpulse: TrendPulsePayload;
   strategyDayFit?: StrategyDayFitPayload;
   newsSentiment?: NewsSentimentPayload;
+  oiWalls?: OiWallsPayload | null;
+  sidewaysRegime?: SidewaysRegimePayload | null;
   updatedAt: string;
 };
 
@@ -146,23 +152,63 @@ export default function LandingPage() {
   const [history, setHistory] = useState<SentimentHistoryPayload | null>(null);
   const [strategyFit, setStrategyFit] = useState<StrategyDayFitPayload | null>(null);
   const [newsSentiment, setNewsSentiment] = useState<NewsSentimentPayload | null>(null);
+  const [oiWalls, setOiWalls] = useState<OiWallsPayload | null>(null);
+  const [sidewaysRegime, setSidewaysRegime] = useState<SidewaysRegimePayload | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [lastRefreshAt, setLastRefreshAt] = useState<string | null>(null);
+  const inFlightRef = useRef(false);
 
   const load = useCallback(async () => {
+    if (inFlightRef.current) return;
+    inFlightRef.current = true;
     setErr(null);
     try {
-      const snapshot = await apiJson<DecisionSnapshotPayload>("/api/landing/decision-snapshot");
-      const hist = await apiJson<SentimentHistoryPayload>("/api/landing/sentiment-history", "GET", undefined, { limit: 90 });
-      setSnap(snapshot.marketSnapshot);
-      setSentiment(snapshot.sentiment);
-      setTp(snapshot.trendpulse);
-      setStrategyFit(snapshot.strategyDayFit ?? null);
-      setNewsSentiment(snapshot.newsSentiment ?? null);
-      setHistory(hist);
+      try {
+        await Promise.race([
+          postTradesRefreshCycle(),
+          new Promise((resolve) => window.setTimeout(resolve, 700)),
+        ]);
+      } catch {
+        /* still load landing */
+      }
+      const [snapshotRes, histRes] = await Promise.allSettled([
+        apiJson<DecisionSnapshotPayload>(
+          "/api/landing/decision-snapshot",
+          "GET",
+          undefined,
+          undefined,
+          { timeoutMs: 20_000 },
+        ),
+        apiJson<SentimentHistoryPayload>("/api/landing/sentiment-history", "GET", undefined, { limit: 90 }),
+      ]);
+      let hadAnySuccess = false;
+      let failureMsg: string | null = null;
+      if (snapshotRes.status === "fulfilled") {
+        const snapshot = snapshotRes.value;
+        hadAnySuccess = true;
+        setSnap(snapshot.marketSnapshot);
+        setSentiment(snapshot.sentiment);
+        setTp(snapshot.trendpulse);
+        setStrategyFit(snapshot.strategyDayFit ?? null);
+        setNewsSentiment(snapshot.newsSentiment ?? null);
+        setOiWalls(snapshot.oiWalls ?? null);
+        setSidewaysRegime(snapshot.sidewaysRegime ?? null);
+        setLastRefreshAt(snapshot.updatedAt ?? new Date().toISOString());
+      } else {
+        failureMsg = snapshotRes.reason instanceof Error ? snapshotRes.reason.message : "Failed to load snapshot";
+      }
+      if (histRes.status === "fulfilled") {
+        hadAnySuccess = true;
+        setHistory(histRes.value);
+      } else if (!failureMsg) {
+        failureMsg = histRes.reason instanceof Error ? histRes.reason.message : "Failed to load history";
+      }
+      setErr(hadAnySuccess ? null : failureMsg ?? "Failed to load");
     } catch (e) {
       setErr(e instanceof Error ? e.message : "Failed to load");
     } finally {
+      inFlightRef.current = false;
       setLoading(false);
     }
   }, []);
@@ -173,11 +219,13 @@ export default function LandingPage() {
       return;
     }
     void load();
-    const id = window.setInterval(() => void load(), 60_000);
+    /** Same cadence as dashboard/trades after refresh-cycle. */
+    const id = window.setInterval(() => void load(), 30_000);
     return () => window.clearInterval(id);
   }, [router, load]);
 
   const chg = snap?.nifty.changePct ?? 0;
+  const niftySpotLive = snap != null && snap.nifty.spot > 0;
   const chgClass = chg > 0 ? "pos" : chg < 0 ? "neg" : "";
   const dir = sentiment?.directionLabel ?? "NEUTRAL";
   const dirClass = dir === "BULLISH" ? "pos" : dir === "BEARISH" ? "neg" : "";
@@ -238,6 +286,15 @@ export default function LandingPage() {
   const replayOptIntel = latestReplay?.sentiment?.optionsIntel;
 
   const heroSessionBias = loading && !snap ? null : sessionTrendBias(snap?.intradayTrendLabel);
+  const m15 = snap?.nifty15m;
+  const m15Pct = m15?.changePct;
+  const m15Label = m15?.trendLabel;
+  const hero15mBias =
+    loading && !snap
+      ? null
+      : m15Label != null && m15Label !== "—"
+        ? sessionTrendBias(m15Label)
+        : null;
   const heroHtfBias = tp?.trendpulseEnabled ? htfTrendBias(tp.htfBias) : null;
   const trendGradId = `landingTrendFill-${useId().replace(/:/g, "")}`;
   const tpSessionNote =
@@ -247,6 +304,11 @@ export default function LandingPage() {
 
   return (
     <AppFrame>
+      <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: "0.6rem" }}>
+        <span className="summary-label">
+          Last refresh: {lastRefreshAt ? formatTimeIST(lastRefreshAt, { fallback: "—" }) : "—"}
+        </span>
+      </div>
       {err && (
         <div className="panel-accent-chain" style={{ padding: "0.75rem 1rem", marginBottom: "1rem", borderRadius: 8 }}>
           {err}
@@ -263,10 +325,18 @@ export default function LandingPage() {
             <span className="landing-hero-eyebrow">NIFTY 50</span>
             <div className="landing-hero-nifty-row">
               <span className="landing-hero-price">
-                {loading && !snap ? "—" : snap?.nifty.spot.toLocaleString("en-IN", { maximumFractionDigits: 2 })}
+                {loading && !snap
+                  ? "—"
+                  : niftySpotLive
+                    ? snap!.nifty.spot.toLocaleString("en-IN", { maximumFractionDigits: 2 })
+                    : "—"}
               </span>
               <span className={`landing-delta-pill ${chgClass}`}>
-                {loading && !snap ? "…" : `${chg >= 0 ? "+" : ""}${snap?.nifty.changePct.toFixed(2) ?? "—"}%`}
+                {loading && !snap
+                  ? "…"
+                  : niftySpotLive
+                    ? `${chg >= 0 ? "+" : ""}${snap!.nifty.changePct.toFixed(2)}%`
+                    : "n/a"}
               </span>
             </div>
           </div>
@@ -304,15 +374,21 @@ export default function LandingPage() {
 
           <div className="landing-hero-cell landing-hero-trend landing-widget-help-host">
             <LandingWidgetHelp
-              meaning="Session = today’s NIFTY % move as Bullish/Bearish/Sideways. HTF shows TrendPulse higher-timeframe bias and its chart interval. Signal = TrendPulse chart timeframe (see Market pulse)."
-              usage="Prefer trades that align with HTF bias when TrendPulse is on; counter-trend entries need stricter risk checks in your settings."
+              meaning="Session = full-day NIFTY % change. 15m = last 15-minute bar vs the prior bar (same index). HTF = TrendPulse higher-timeframe bias when subscribed. Signal = TrendPulse chart timeframe (see Market pulse)."
+              usage="Use 15m for very recent swing vs session for day bias; align with HTF when TrendPulse is on."
             />
             <span className="landing-hero-eyebrow">Trend</span>
             <div className="landing-hero-trend-stack">
               <div className="landing-hero-tf-row">
                 <div className="landing-hero-tf-meta">
                   <span className="landing-hero-tf-name">Session</span>
-                  <span className="landing-hero-tf-sub muted">NIFTY day %</span>
+                  <span className="landing-hero-tf-sub muted" title="NIFTY session % change (same as index pill)">
+                    {loading && !snap
+                      ? "NIFTY day %"
+                      : niftySpotLive
+                        ? `Day ${chg >= 0 ? "+" : ""}${chg.toFixed(2)}%`
+                        : "NIFTY day % —"}
+                  </span>
                 </div>
                 <span
                   className={
@@ -322,6 +398,32 @@ export default function LandingPage() {
                   }
                 >
                   {heroSessionBias ?? "…"}
+                </span>
+              </div>
+              <div className="landing-hero-tf-row">
+                <div className="landing-hero-tf-meta">
+                  <span className="landing-hero-tf-name">15m</span>
+                  <span
+                    className="landing-hero-tf-sub muted"
+                    title="NIFTY: last 15-minute candle close vs previous bar (IST session)"
+                  >
+                    {loading && !snap
+                      ? "Bar vs prior"
+                      : m15Pct != null && Number.isFinite(m15Pct)
+                        ? `Bar ${m15Pct >= 0 ? "+" : ""}${m15Pct.toFixed(2)}%`
+                        : "Bar vs prior —"}
+                  </span>
+                </div>
+                <span
+                  className={
+                    loading && !snap
+                      ? "landing-hero-tf-bias landing-hero-tf-bias--loading muted"
+                      : hero15mBias
+                        ? `landing-hero-tf-bias landing-hero-tf-bias--${hero15mBias.toLowerCase()}`
+                        : "landing-hero-tf-bias muted"
+                  }
+                >
+                  {loading && !snap ? "…" : hero15mBias ?? "—"}
                 </span>
               </div>
               {tp?.trendpulseEnabled && heroHtfBias ? (
@@ -351,6 +453,14 @@ export default function LandingPage() {
           tp={tp}
           news={newsSentiment}
         />
+
+        <div className="landing-sideways-regime-outer">
+          <SidewaysRegimePanel data={sidewaysRegime} loading={loading && !sidewaysRegime} />
+        </div>
+
+        <section className="landing-oi-pinboard-wrap" aria-label="Open interest walls">
+          <OiSellerPinboardWidget data={oiWalls} loading={loading && !oiWalls} />
+        </section>
 
         <section className="landing-bento" aria-label="Sentiment analytics">
           <div className="landing-bento-conviction landing-bento-cell panel-accent-signals landing-widget-help-host">

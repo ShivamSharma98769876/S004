@@ -27,6 +27,7 @@ class StrategyItemOut(BaseModel):
     publish_status: str
     pnl_30d: float
     win_rate: float
+    position_intent: Literal["long_premium", "short_premium"] | None = None
 
 
 class StrategyDetailsPayload(BaseModel):

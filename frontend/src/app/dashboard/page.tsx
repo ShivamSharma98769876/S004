@@ -10,7 +10,7 @@ import {
   type TradeMode,
   type TradingSetup,
 } from "@/lib/trading_setup";
-import { apiJson } from "@/lib/api_client";
+import { apiJson, isAdmin, postTradesRefreshCycle } from "@/lib/api_client";
 import { backendInstantMs, formatClockNowIST, formatTimeIST } from "@/lib/datetime_ist";
 
 type ClosedTrade = {
@@ -197,6 +197,11 @@ type DashboardFunds = {
   bot_capital: number;
 };
 
+function tradeSideLabel(side: string | null | undefined): string {
+  const s = String(side || "BUY").trim().toUpperCase();
+  return s === "SELL" ? "SELL" : "BUY";
+}
+
 type BackendTrade = {
   trade_ref: string;
   symbol: string;
@@ -223,7 +228,7 @@ type BackendTrade = {
 
 /** Panel copy is strategy-agnostic; active plan name lives in the dashboard status strip. */
 const STRATEGY_SIGNALS_SUBTITLE =
-  "Ranked eligible strikes from the live chain — scores, key levels, and filters. Refreshes with recommendations.";
+  "Same entry bar as auto-execute: score ≥ autoTradeScoreThreshold, confidence ≥ 80, and signal eligible (inferred from score if needed). Inside short-premium delta band. Each ~30s tick refreshes the option chain first, then open positions and signals load from that snapshot. Scope: your active subscription (admins: all strategies, like Trades).";
 
 const STRATEGY_SIGNALS_EMPTY =
   "No eligible strikes right now. When the engine marks a strike as eligible, it appears here. Auto-execute also uses this feed.";
@@ -278,11 +283,23 @@ function IconLiveSignal() {
   );
 }
 
+function formatSignalStrategyLabel(s: {
+  strategy_name?: string | null;
+  strategy_id?: string | null;
+  strategy_version?: string | null;
+}): string {
+  const name = (s.strategy_name || "").trim();
+  const base = name || s.strategy_id?.trim() || "—";
+  const ver = (s.strategy_version || "").trim();
+  return ver ? `${base} · v${ver}` : base;
+}
+
 type SignalRecommendation = {
   recommendation_id: string;
   symbol: string;
   strategy_name?: string | null;
   strategy_id?: string | null;
+  strategy_version?: string | null;
   rank_value: number;
   confidence_score?: number | null;
   score?: number | null;
@@ -337,11 +354,17 @@ export default function DashboardPage() {
     strategyId: string;
     strategyVersion: string;
     displayName: string;
+    positionIntent?: "long_premium" | "short_premium";
   } | null>(null);
 
   const refreshSignalsAndOpen = useCallback(async () => {
     setSignalExecuteError(null);
     try {
+      try {
+        await postTradesRefreshCycle();
+      } catch {
+        /* still load lists */
+      }
       const [recs, open] = await Promise.all([
         apiJson<SignalRecommendation[]>("/api/trades/recommendations", "GET", undefined, {
           status: "GENERATED",
@@ -350,6 +373,8 @@ export default function DashboardPage() {
           limit: 8,
           offset: 0,
           eligible_only: "true",
+          ensure_refresh: "false",
+          ...(isAdmin() && { all_strategies: "true" }),
         }),
         apiJson<BackendTrade[]>("/api/trades/open"),
       ]);
@@ -366,8 +391,27 @@ export default function DashboardPage() {
       setSignalExecuteError(null);
       setSignalExecuteLoading(`${recommendationId}|${mode}`);
       try {
+        const symKey = symbol.replace(/\s+/g, "").toUpperCase();
+        try {
+          await postTradesRefreshCycle();
+        } catch {
+          /* proceed with list fetch */
+        }
+        const fresh = await apiJson<SignalRecommendation[]>("/api/trades/recommendations", "GET", undefined, {
+          status: "GENERATED",
+          sort_by: "rank",
+          sort_dir: "asc",
+          limit: 24,
+          offset: 0,
+          eligible_only: "true",
+          ensure_refresh: "false",
+          ...(isAdmin() && { all_strategies: "true" }),
+        });
+        const row = fresh.find((r) => String(r.symbol || "").replace(/\s+/g, "").toUpperCase() === symKey);
+        const idToUse = row?.recommendation_id ?? recommendationId;
+        setSignals(fresh);
         await apiJson("/api/trades/execute", "POST", {
-          recommendation_id: recommendationId,
+          recommendation_id: idToUse,
           mode,
           quantity: 1,
         });
@@ -388,7 +432,7 @@ export default function DashboardPage() {
     setSetup(s);
     setClock(formatClockNowIST());
     const timer = setInterval(() => setClock(formatClockNowIST()), 1000);
-    const sync = setInterval(() => setSetup(loadTradingSetup()), 1200);
+    const sync = setInterval(() => setSetup(loadTradingSetup()), 8000);
     return () => {
       clearInterval(timer);
       clearInterval(sync);
@@ -396,7 +440,73 @@ export default function DashboardPage() {
   }, []);
 
   useEffect(() => {
-    const loadBackend = async () => {
+    /** One cadence: chain/engine first, then dashboard summary + open + signals from the same snapshot. */
+    const SYNC_POLL_MS = 30_000;
+
+    const applyEngine = (
+      engine: {
+        engineRunning: boolean;
+        mode: TradeMode | string;
+        brokerConnected?: boolean;
+        sharedApiConnected?: boolean;
+        isAdmin?: boolean;
+        kiteStatus?: "connected" | "shared" | "none";
+        platformApiOnline?: boolean;
+        maxTradesDay?: number;
+        activeStrategy?: {
+          strategyId: string;
+          strategyVersion: string;
+          displayName: string;
+          positionIntent?: "long_premium" | "short_premium";
+        };
+      } | null,
+    ) => {
+      if (!engine) return;
+      setActiveStrategyBanner(engine.activeStrategy ?? null);
+      const prev = loadTradingSetup();
+      const ks = engine.kiteStatus;
+      const kiteStatus: MasterSetup["kiteStatus"] =
+        ks === "connected" || ks === "shared" || ks === "none" ? ks : prev.master.kiteStatus;
+      const sharedApi = engine.sharedApiConnected ?? prev.master.sharedApiConnected;
+      const eng = engine as {
+        platformApiOnline?: boolean;
+        maxTradesDay?: number;
+        activeStrategy?: {
+          strategyId: string;
+          strategyVersion: string;
+          displayName: string;
+          positionIntent?: "long_premium" | "short_premium";
+        };
+      };
+      const mode: TradeMode =
+        engine.mode === "LIVE" || engine.mode === "PAPER" ? engine.mode : prev.master.mode;
+      const merged: TradingSetup = {
+        ...prev,
+        master: {
+          ...prev.master,
+          engineRunning: engine.engineRunning,
+          mode,
+          brokerConnected: engine.brokerConnected ?? prev.master.brokerConnected,
+          sharedApiConnected: sharedApi,
+          kiteStatus,
+          platformApiOnline: eng.platformApiOnline ?? prev.master.platformApiOnline,
+          maxTrades: eng.maxTradesDay ?? prev.master.maxTrades,
+        },
+        strategy: {
+          ...prev.strategy,
+          ...(eng.activeStrategy
+            ? {
+                strategyName: eng.activeStrategy.displayName,
+                strategyVersion: eng.activeStrategy.strategyVersion,
+              }
+            : {}),
+        },
+      };
+      setSetup(merged);
+      saveTradingSetup(merged);
+    };
+
+    const loadCore = async () => {
       try {
         const [s, f, o, c, engine] = await Promise.all([
           apiJson<DashboardSummary>("/api/dashboard/summary"),
@@ -416,6 +526,7 @@ export default function DashboardPage() {
               strategyId: string;
               strategyVersion: string;
               displayName: string;
+              positionIntent?: "long_premium" | "short_premium";
             };
           }>("/api/dashboard/engine").catch(() => null),
         ]);
@@ -423,45 +534,14 @@ export default function DashboardPage() {
         setFunds(f);
         setOpenTradesRows(o);
         setClosedTradesRows(c || []);
-        if (engine) {
-          setActiveStrategyBanner(engine.activeStrategy ?? null);
-          const prev = loadTradingSetup();
-          const ks = engine.kiteStatus;
-          const kiteStatus: MasterSetup["kiteStatus"] =
-            ks === "connected" || ks === "shared" || ks === "none" ? ks : prev.master.kiteStatus;
-          const sharedApi = engine.sharedApiConnected ?? prev.master.sharedApiConnected;
-          const eng = engine as {
-            platformApiOnline?: boolean;
-            maxTradesDay?: number;
-            activeStrategy?: { strategyId: string; strategyVersion: string; displayName: string };
-          };
-          const mode: TradeMode =
-            engine.mode === "LIVE" || engine.mode === "PAPER" ? engine.mode : prev.master.mode;
-          const merged: TradingSetup = {
-            ...prev,
-            master: {
-              ...prev.master,
-              engineRunning: engine.engineRunning,
-              mode,
-              brokerConnected: engine.brokerConnected ?? prev.master.brokerConnected,
-              sharedApiConnected: sharedApi,
-              kiteStatus,
-              platformApiOnline: eng.platformApiOnline ?? prev.master.platformApiOnline,
-              maxTrades: eng.maxTradesDay ?? prev.master.maxTrades,
-            },
-            strategy: {
-              ...prev.strategy,
-              ...(eng.activeStrategy
-                ? {
-                    strategyName: eng.activeStrategy.displayName,
-                    strategyVersion: eng.activeStrategy.strategyVersion,
-                  }
-                : {}),
-            },
-          };
-          setSetup(merged);
-          saveTradingSetup(merged);
-        }
+        applyEngine(engine);
+      } catch {
+        /* keep existing dashboard data */
+      }
+    };
+
+    const loadSignalsOnly = async () => {
+      try {
         const recs = await apiJson<SignalRecommendation[]>("/api/trades/recommendations", "GET", undefined, {
           status: "GENERATED",
           sort_by: "rank",
@@ -469,15 +549,29 @@ export default function DashboardPage() {
           limit: 8,
           offset: 0,
           eligible_only: "true",
+          ensure_refresh: "false",
+          ...(isAdmin() && { all_strategies: "true" }),
         });
         setSignals(recs);
       } catch {
-        // Keep existing dashboard data if backend is temporarily unavailable.
+        /* keep existing signals */
       }
     };
-    loadBackend();
-    const t = setInterval(loadBackend, 3000);
-    return () => clearInterval(t);
+
+    const runSyncedTick = async () => {
+      try {
+        await postTradesRefreshCycle();
+      } catch {
+        /* still load dashboard slices */
+      }
+      await Promise.all([loadCore(), loadSignalsOnly()]);
+    };
+
+    void runSyncedTick();
+    const syncT = window.setInterval(() => void runSyncedTick(), SYNC_POLL_MS);
+    return () => {
+      window.clearInterval(syncT);
+    };
   }, []);
 
   const openPositions = summary ? summary.open_trades : setup.master.engineRunning ? 2 : 0;
@@ -714,7 +808,7 @@ export default function DashboardPage() {
       {!!runtimeMessage && <div className="notice warning">{runtimeMessage}</div>}
 
       <div className="notice" style={{ marginBottom: 12, opacity: 0.9 }}>
-        <strong>Auto-execute:</strong> Eligible trades (score, confidence from Settings) appear in Open Trades for all users with engine running.{" "}
+        <strong>Auto-execute:</strong> Uses the same thresholds as SIGNALS (catalog autoTradeScoreThreshold, confidence ≥ 80). Opens at most a few per cycle when the engine is running; check Admin decision logs if nothing fires.{" "}
         <strong>Paper</strong> — tracked only; <strong>Live</strong> — executed in real broker (Admin&apos;s Kite). Config per user in Settings.
       </div>
 
@@ -870,11 +964,8 @@ export default function DashboardPage() {
                         <div className="dash-signal-symbol">{s.symbol}</div>
                         <div className="dash-signal-strategy-line">
                           <span className="dash-signal-strategy-label">Strategy</span>
-                          <span
-                            className="dash-signal-strategy-name"
-                            title={s.strategy_name || s.strategy_id || undefined}
-                          >
-                            {(s.strategy_name && s.strategy_name.trim()) || s.strategy_id || "—"}
+                          <span className="dash-signal-strategy-name" title={formatSignalStrategyLabel(s)}>
+                            {formatSignalStrategyLabel(s)}
                           </span>
                         </div>
                       </div>
@@ -959,7 +1050,7 @@ export default function DashboardPage() {
                     <div className="dash-signal-row-bottom">
                       <span>
                         <span className="dash-signal-tf">{s.timeframe ?? "3m"} TF</span>
-                        <span className="dash-signal-key"> · refreshes every {s.refresh_interval_sec ?? 30}s</span>
+                        <span className="dash-signal-key"> · refreshes every {s.refresh_interval_sec ?? 20}s</span>
                       </span>
                       <span className="dash-signal-time">
                         {s.created_at
@@ -986,7 +1077,7 @@ export default function DashboardPage() {
               <tr>
                 <th className="sortable-th" onClick={() => handleOpenSort("symbol")}>SYMBOL {openSortCol === "symbol" && (openSortDir === "asc" ? "↑" : "↓")}</th>
                 <th>STRATEGY</th>
-                <th>TYPE</th>
+                <th title="BUY = long option; SELL = short premium">SIDE</th>
                 <th className="sortable-th" onClick={() => handleOpenSort("mode")}>MODE {openSortCol === "mode" && (openSortDir === "asc" ? "↑" : "↓")}</th>
                 <th className="sortable-th" onClick={() => handleOpenSort("manual_execute")}>TAKEN BY {openSortCol === "manual_execute" && (openSortDir === "asc" ? "↑" : "↓")}</th>
                 <th>SCORE</th>
@@ -994,8 +1085,20 @@ export default function DashboardPage() {
                 <th className="sortable-th" onClick={() => handleOpenSort("entry_price")}>ENTRY {openSortCol === "entry_price" && (openSortDir === "asc" ? "↑" : "↓")}</th>
                 <th className="sortable-th" onClick={() => handleOpenSort("current_price")}>LTP {openSortCol === "current_price" && (openSortDir === "asc" ? "↑" : "↓")}</th>
                 <th className="sortable-th" onClick={() => handleOpenSort("qty")}>QTY {openSortCol === "qty" && (openSortDir === "asc" ? "↑" : "↓")}</th>
-                <th className="sortable-th" onClick={() => handleOpenSort("stop_loss_price")}>SL {openSortCol === "stop_loss_price" && (openSortDir === "asc" ? "↑" : "↓")}</th>
-                <th className="sortable-th" onClick={() => handleOpenSort("target_price")}>TARGET {openSortCol === "target_price" && (openSortDir === "asc" ? "↑" : "↓")}</th>
+                <th
+                  className="sortable-th"
+                  title="Long: SL below entry, target above. Short (sell premium): SL above entry, target below."
+                  onClick={() => handleOpenSort("stop_loss_price")}
+                >
+                  SL {openSortCol === "stop_loss_price" && (openSortDir === "asc" ? "↑" : "↓")}
+                </th>
+                <th
+                  className="sortable-th"
+                  title="Long: SL below entry, target above. Short (sell premium): SL above entry, target below."
+                  onClick={() => handleOpenSort("target_price")}
+                >
+                  TARGET {openSortCol === "target_price" && (openSortDir === "asc" ? "↑" : "↓")}
+                </th>
                 <th className="sortable-th" onClick={() => handleOpenSort("unrealized_pnl")}>P&L {openSortCol === "unrealized_pnl" && (openSortDir === "asc" ? "↑" : "↓")}</th>
               </tr>
             </thead>
@@ -1012,7 +1115,7 @@ export default function DashboardPage() {
                     <td>{t.symbol}</td>
                     <td className="summary-label">{t.strategy_name || "—"}</td>
                     <td>
-                      <span className="chip chip-status-paused">BUY</span>
+                      <span className="chip chip-status-paused">{tradeSideLabel(t.side)}</span>
                     </td>
                     <td>
                       <span className={`chip ${String(t.mode || "").toUpperCase() === "LIVE" ? "chip-status-active" : "chip-status-paused"}`}>
@@ -1053,14 +1156,14 @@ export default function DashboardPage() {
               <tr>
                 <th className="sortable-th" onClick={() => handleClosedSort("symbol")}>SYMBOL {closedSortCol === "symbol" && (closedSortDir === "asc" ? "↑" : "↓")}</th>
                 <th>STRATEGY</th>
-                <th>TYPE</th>
+                <th title="BUY = long option; SELL = short premium">SIDE</th>
                 <th className="sortable-th" onClick={() => handleClosedSort("mode")}>MODE {closedSortCol === "mode" && (closedSortDir === "asc" ? "↑" : "↓")}</th>
                 <th className="sortable-th" onClick={() => handleClosedSort("manual_execute")}>TAKEN BY {closedSortCol === "manual_execute" && (closedSortDir === "asc" ? "↑" : "↓")}</th>
                 <th>SCORE</th>
                 <th>CONFIDENCE</th>
-                <th className="sortable-th" onClick={() => handleClosedSort("opened_at")}>BUY TIME (IST) {closedSortCol === "opened_at" && (closedSortDir === "asc" ? "↑" : "↓")}</th>
+                <th className="sortable-th" onClick={() => handleClosedSort("opened_at")}>ENTRY TIME (IST) {closedSortCol === "opened_at" && (closedSortDir === "asc" ? "↑" : "↓")}</th>
                 <th className="sortable-th" onClick={() => handleClosedSort("entry_price")}>ENTRY {closedSortCol === "entry_price" && (closedSortDir === "asc" ? "↑" : "↓")}</th>
-                <th className="sortable-th" onClick={() => handleClosedSort("closed_at")}>SELL TIME (IST) {closedSortCol === "closed_at" && (closedSortDir === "asc" ? "↑" : "↓")}</th>
+                <th className="sortable-th" onClick={() => handleClosedSort("closed_at")}>EXIT TIME (IST) {closedSortCol === "closed_at" && (closedSortDir === "asc" ? "↑" : "↓")}</th>
                 <th className="sortable-th" onClick={() => handleClosedSort("current_price")}>EXIT {closedSortCol === "current_price" && (closedSortDir === "asc" ? "↑" : "↓")}</th>
                 <th className="sortable-th" onClick={() => handleClosedSort("qty")}>QTY {closedSortCol === "qty" && (closedSortDir === "asc" ? "↑" : "↓")}</th>
                 <th className="sortable-th" onClick={() => handleClosedSort("realized_pnl")}>P&L {closedSortCol === "realized_pnl" && (closedSortDir === "asc" ? "↑" : "↓")}</th>
@@ -1078,14 +1181,13 @@ export default function DashboardPage() {
                 sortedClosedTrades.map((t: any, i) => {
                   const pnl = Number(t.pnl ?? t.realized_pnl ?? 0);
                   const isProfit = pnl >= 0;
-                  const optType = t.symbol?.includes("CE") ? "CE" : t.symbol?.includes("PE") ? "PE" : (t.side === "BUY" ? "PE" : "CE");
                   const takenBy = t.manual_execute === false ? "Auto" : t.manual_execute === true ? "Manual" : "—";
                   return (
                     <tr key={`${t.trade_ref || t.symbol}-${i}`}>
                       <td>{t.symbol}</td>
                       <td className="summary-label">{t.strategy_name || "—"}</td>
                       <td>
-                        <span className="chip chip-status-paused">{t.type || optType}</span>
+                        <span className="chip chip-status-paused">{tradeSideLabel(t.side)}</span>
                       </td>
                       <td>
                         <span className="chip chip-status-active">{t.mode || "PAPER"}</span>

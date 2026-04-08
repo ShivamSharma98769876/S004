@@ -11,6 +11,13 @@ Long premium / verbose mode: chain diagnostics when present, counts, and failed-
 
 Short premium (default): compact log — one ``Short delta gate:`` line (includes VIX → CE/PE ranges) and one line
 per strike **in the active delta band** only. Set ``S004_EVALUATION_LOG_SHORT_FULL=1`` for the full short diagnostic blocks.
+Per-leg diagnostics use ``leg_elig`` (chain ``signalEligible``) vs ``trade_elig`` (all gates including regime / liquidity)
+and show ``conf`` (same formula as recommendation confidence).
+
+Long premium (e.g. TrendSnap Momentum): by default the log does **not** list each scanned strike — only chain summary (if any),
+counts, score thresholds, and a few ``failed_conditions`` samples. Set ``S004_EVALUATION_LOG_LONG_CANDIDATES=1`` to append a
+full per-candidate block (symbol, strike, Greeks, indicators, eligibility, failed reasons) for analysis. Keep
+``S004_EVALUATION_LOG_MAX_CANDIDATES=0`` (default) so the list is not truncated.
 """
 
 from __future__ import annotations
@@ -103,10 +110,29 @@ def _fmt_leg_evaluation_block(i: int, c: dict[str, Any], *, diagnostic: bool) ->
     else:
         dist_s = f"steps_from_ATM={_dash(dist)}"
     sc = c.get("leg_score") if diagnostic else c.get("score")
-    cf_raw = None if diagnostic else c.get("confidence_score")
-    cf_s = "—" if diagnostic else _fmt_confidence_slim(cf_raw)
-    el = c.get("leg_signal_eligible") if diagnostic else c.get("signal_eligible")
-    el_s = "YES" if el is True else "NO" if el is False else "—"
+    if diagnostic:
+        cf_raw = c.get("confidence_score")
+        cf_s = _fmt_confidence_slim(cf_raw) if cf_raw is not None and cf_raw != "" else "—"
+        leg_el = c.get("leg_signal_eligible")
+        leg_s = "YES" if leg_el is True else "NO" if leg_el is False else "—"
+        te = c.get("trade_eligible")
+        if te is None:
+            blk = str(c.get("blockers") or "").strip()
+            te_bool = blk in ("", "—")
+        else:
+            te_bool = bool(te)
+        trade_s = "YES" if te_bool else "NO"
+        elig_field = f"leg_elig={leg_s} | trade_elig={trade_s}"
+    else:
+        cf_raw = c.get("confidence_score")
+        cf_s = _fmt_confidence_slim(cf_raw) if cf_raw is not None and cf_raw != "" else "—"
+        el = c.get("signal_eligible")
+        elig_field = f"eligible={'YES' if el is True else 'NO' if el is False else '—'}"
+    stk_v = c.get("strike")
+    if isinstance(stk_v, (int, float)):
+        strike_s = str(int(stk_v))
+    else:
+        strike_s = "—"
     delta = c.get("delta")
     delta_s = f"{float(delta):.4f}" if isinstance(delta, (int, float)) else "—"
     ivr = c.get("ivr")
@@ -121,10 +147,10 @@ def _fmt_leg_evaluation_block(i: int, c: dict[str, Any], *, diagnostic: bool) ->
     if len(fail) > _FAILED_MAX_LEN:
         fail = fail[: _FAILED_MAX_LEN - 3] + "..."
 
-    # Line 1: align with "   1. SYMBOL | CE | side=BUY | ..."
+    # Line 1: align with "   1. SYMBOL | CE | strike=… | side=BUY | ..."
     line1 = (
-        f"   {i}. {sym} | {ot} | side={side} | {dist_s} | score={_dash(sc)} | "
-        f"conf={cf_s} | eligible={el_s} | Δ={delta_s} | IVR={ivr_s} | "
+        f"   {i}. {sym} | {ot} | strike={strike_s} | side={side} | {dist_s} | score={_dash(sc)} | "
+        f"conf={cf_s} | {elig_field} | Δ={delta_s} | IVR={ivr_s} | "
         f"OI={_dash(oi)} | vol×={volr_s} | LTP={ltp_s}"
     )
     ind_parts: list[str] = []
@@ -150,6 +176,11 @@ def _fmt_short_diagnostic_line(i: int, d: dict[str, Any]) -> str:
 def _short_eval_log_verbose() -> bool:
     """If true, use the long-form short-premium log (diagnostics + extra chain lines)."""
     return os.getenv("S004_EVALUATION_LOG_SHORT_FULL", "").strip().lower() in {"1", "true", "yes"}
+
+
+def _long_eval_log_candidates() -> bool:
+    """If true, long_premium snapshots include per-scanned-candidate leg blocks (for post-hoc analysis)."""
+    return os.getenv("S004_EVALUATION_LOG_LONG_CANDIDATES", "").strip().lower() in {"1", "true", "yes"}
 
 
 def _row_in_short_delta_band(row: dict[str, Any], cs: dict[str, Any]) -> bool:
@@ -358,6 +389,33 @@ def format_evaluation_event_text(event: dict[str, Any]) -> str:
             lines.append(f"  • {s}")
     else:
         lines.append("  (none)")
+
+    if not _long_eval_log_candidates():
+        cands_hint = event.get("candidates") or []
+        if isinstance(cands_hint, list) and len(cands_hint) > 0:
+            lines.append("")
+            lines.append(
+                "Per-strike detail is omitted for long premium (log size). "
+                "Set S004_EVALUATION_LOG_LONG_CANDIDATES=1 to list all scanned candidates; "
+                "keep S004_EVALUATION_LOG_MAX_CANDIDATES=0 so the list is not capped."
+            )
+
+    if _long_eval_log_candidates():
+        cands = event.get("candidates") or []
+        trunc = event.get("candidates_truncated")
+        lines.append("")
+        lines.append("Scanned candidates (detail, long premium):")
+        if trunc:
+            lines.append("  (list truncated — set S004_EVALUATION_LOG_MAX_CANDIDATES=0 for full scan in log)")
+        if isinstance(cands, list) and cands:
+            for j, c in enumerate(cands, start=1):
+                if isinstance(c, dict):
+                    lines.append(_fmt_leg_evaluation_block(j, c, diagnostic=False))
+                else:
+                    lines.append(f"   {j}. {c!r}")
+        else:
+            lines.append("  (none — chain fetch failed or zero candidates this refresh)")
+
     lines.extend(["", _SEP, ""])
     return "\n".join(lines) + "\n"
 

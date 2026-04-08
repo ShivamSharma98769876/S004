@@ -11,6 +11,8 @@ isort==5.13.2
 sqlalchemy[asyncio]
 asyncpg
 kiteconnect
+fyers-apiv3>=3.0.0
+cryptography>=42.0.0
 passlib[bcrypt]
 bcrypt>=4.0.1,<5.0
 redis==5.0.1

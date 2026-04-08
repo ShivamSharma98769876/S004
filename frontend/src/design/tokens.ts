@@ -26,6 +26,7 @@ export const USER_NAV_ITEMS: readonly AppNavItem[] = [
   { href: "/marketplace", label: "Strategies", icon: "MP" },
   { href: "/risk", label: "Risk", icon: "RK" },
   { href: "/settings", label: "Settings", icon: "ST" },
+  { href: "/settings/brokers", label: "Brokers", icon: "BR" },
 ] as const;
 
 /** Reports section – sub-items under Reports menu */
@@ -40,6 +41,7 @@ export const ADMIN_NAV_ITEMS: readonly AppNavItem[] = [
   { href: "/admin/users", label: "Users", icon: "US" },
   { href: "/admin/evolution", label: "Evolution", icon: "EV" },
   { href: "/admin/evaluation", label: "Evaluation", icon: "FV" },
+  { href: "/admin/strategy-eod", label: "Strategy EOD", icon: "EO" },
   { href: "/analytics", label: "Analytics", icon: "AN" },
 ] as const;
 

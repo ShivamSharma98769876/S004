@@ -2,8 +2,12 @@
 
 from datetime import date
 
+import pytest
+
+import app.services.option_chain_zerodha as ocz
 from app.services.option_chain_zerodha import (
     first_expiry_meeting_min_calendar_dte,
+    get_expiries_for_instrument,
     resolve_expiry_min_dte_weekday_with_fallback,
     select_expiry_min_dte_and_weekday,
 )
@@ -66,3 +70,32 @@ def test_resolve_weekday_fallback_when_min_dte_ok_but_wrong_weekday():
         )
         == "26MAR2026"
     )
+
+
+def test_resolve_prefers_preponed_monday_before_next_tuesday():
+    """
+    NSE may list weekly index expiry on Monday when Tuesday is a holiday.
+    Strict Tuesday pick would skip to the following week (e.g. 21 Apr vs 13 Apr).
+    """
+    today = date(2026, 3, 7)
+    exps = ["13APR2026", "21APR2026"]
+    assert (
+        resolve_expiry_min_dte_weekday_with_fallback(
+            exps, today, min_dte_days=2, weekday=1
+        )
+        == "13APR2026"
+    )
+
+
+def test_estimated_weekly_prepones_when_target_weekday_is_holiday(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class _FakeDate(date):
+        @classmethod
+        def today(cls) -> "_FakeDate":
+            return cls(2026, 4, 8)
+
+    monkeypatch.setattr(ocz, "date", _FakeDate)
+    monkeypatch.setenv("S004_NSE_HOLIDAYS", "14APR2026")
+    expiries = get_expiries_for_instrument("NIFTY")
+    assert expiries[0] == "13APR2026"

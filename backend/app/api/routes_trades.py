@@ -3,13 +3,15 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import time
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 from typing import Any
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from kiteconnect import KiteConnect
 from pydantic import ValidationError
 
@@ -18,17 +20,92 @@ from app.api.auth_context import get_user_id
 from app.services.ist_calendar import ist_today
 from app.services.ist_time_sql import IST_TODAY, closed_at_ist_date, closed_at_ist_date_bare
 from app.api.schemas import ExecuteRequest, ExecuteResponse, RecommendationOut, TradeOut
+from app.services.trade_chain_snapshot_service import fire_and_forget_exit_snapshot
 from app.services.trades_service import (
     ensure_recommendations,
     execute_recommendation,
     filter_recommendations_short_delta_band_only,
+    filter_rows_auto_execute_aligned,
     get_kite_for_quotes,
+    get_score_params_for_active_subscription,
     get_strategy_score_params,
     list_recommendations_for_user,
 )
 
 router = APIRouter(prefix="/trades", tags=["trades"])
 logger = logging.getLogger(__name__)
+
+# Cap synchronous refresh on GET so the client (and Next dev proxy) does not hang indefinitely; list still returns DB rows.
+_RECOMMENDATIONS_ENSURE_TIMEOUT_SEC = 90.0
+_REFRESH_CYCLE_SOFT_WAIT_SEC = 2.5
+_REFRESH_CYCLE_TASKS: dict[int, asyncio.Task[bool]] = {}
+_REFRESH_CYCLE_TASKS_LOCK = asyncio.Lock()
+
+
+async def _get_or_start_refresh_cycle_task(user_id: int, kite: KiteConnect | None) -> asyncio.Task[bool]:
+    async with _REFRESH_CYCLE_TASKS_LOCK:
+        task = _REFRESH_CYCLE_TASKS.get(user_id)
+        if task is not None and not task.done():
+            return task
+
+        task = asyncio.create_task(ensure_recommendations(user_id, kite))
+        _REFRESH_CYCLE_TASKS[user_id] = task
+
+        def _cleanup(_t: asyncio.Task[bool], uid: int = user_id) -> None:
+            cur = _REFRESH_CYCLE_TASKS.get(uid)
+            if cur is _t:
+                _REFRESH_CYCLE_TASKS.pop(uid, None)
+
+        task.add_done_callback(_cleanup)
+        return task
+
+
+def _refresh_soft_wait_seconds() -> float:
+    return max(
+        0.5,
+        min(
+            8.0,
+            float(os.getenv("TRADES_REFRESH_SOFT_WAIT_SEC", str(_REFRESH_CYCLE_SOFT_WAIT_SEC))),
+        ),
+    )
+
+
+async def _run_refresh_cycle_probe(user_id: int, kite: KiteConnect | None) -> dict[str, Any]:
+    recommendation_engine_run = False
+    in_progress = False
+    soft_wait_sec = _refresh_soft_wait_seconds()
+    t0 = time.perf_counter()
+    task = await _get_or_start_refresh_cycle_task(user_id, kite)
+    try:
+        recommendation_engine_run = await asyncio.wait_for(
+            asyncio.shield(task),
+            timeout=soft_wait_sec,
+        )
+    except asyncio.TimeoutError:
+        in_progress = True
+        recommendation_engine_run = False
+    wait_ms = int((time.perf_counter() - t0) * 1000)
+    return {
+        "recommendation_engine_run": recommendation_engine_run,
+        "in_progress": in_progress,
+        "soft_wait_sec": soft_wait_sec,
+        "refresh_cycle_wait_ms": wait_ms,
+    }
+
+
+async def _resolve_engine_provider_label(user_id: int) -> str:
+    from app.services.broker_runtime import resolve_broker_context
+
+    try:
+        ctx = await resolve_broker_context(user_id, mode="PAPER")
+        code = str(ctx.broker_code or "").strip().lower()
+        if code == "fyers":
+            return "fyers"
+        if code == "zerodha":
+            return "zerodha"
+        return "none"
+    except Exception:
+        return "none"
 
 
 def _coerce_recommendation_row(item: dict[str, Any]) -> dict[str, Any]:
@@ -192,32 +269,106 @@ def _symbol_to_kite_nfo(symbol: str) -> str:
 
 
 async def _get_kite_client_or_none(user_id: int) -> KiteConnect | None:
-    row = await fetchrow(
-        """
-        SELECT credentials_json FROM s004_user_master_settings
-        WHERE user_id = $1
-        """,
-        user_id,
-    )
-    cred = row["credentials_json"] if row else None
-    if isinstance(cred, str):
+    return await get_kite_for_quotes(user_id)
+
+
+@router.post("/refresh-cycle")
+async def post_refresh_cycle(user_id: int = Depends(get_user_id)) -> dict[str, Any]:
+    """Run the recommendation engine (option chain first, then regenerated rows).
+
+    Clients should call this once per poll tick, then fetch recommendations and open positions so every
+    screen reads the same post-chain snapshot. Subsequent GET /recommendations in the same window hit throttle
+    and return DB rows without redoing the chain."""
+    await ensure_user(user_id)
+    kite = await get_kite_for_quotes(user_id)
+    engine_provider = await _resolve_engine_provider_label(user_id)
+    try:
+        probe = await _run_refresh_cycle_probe(user_id, kite)
+        logger.info(
+            "refresh-cycle user_id=%s engine_provider=%s run=%s in_progress=%s wait_ms=%s",
+            user_id,
+            engine_provider,
+            probe.get("recommendation_engine_run"),
+            probe.get("in_progress"),
+            probe.get("refresh_cycle_wait_ms"),
+        )
+        return {"ok": True, "engine_provider": engine_provider, **probe}
+    except Exception:
+        logger.exception(
+            "refresh-cycle: ensure_recommendations failed user_id=%s engine_provider=%s",
+            user_id,
+            engine_provider,
+        )
+    return {
+        "ok": True,
+        "engine_provider": engine_provider,
+        "recommendation_engine_run": False,
+        "in_progress": False,
+    }
+
+
+@router.get("/diagnostics/perf")
+async def diagnostics_perf(user_id: int = Depends(get_user_id)) -> dict[str, Any]:
+    """One-shot timing probe for landing bundle/trendpulse and refresh-cycle wait."""
+    await ensure_user(user_id)
+    from app.api.routes_landing import _fetch_nifty_decision_bundle, trendpulse_series
+    from app.services.broker_runtime import resolve_broker_context
+    from app.services.market_data_kite_session import get_market_data_session_bundle
+
+    kite = await get_kite_for_quotes(user_id)
+    ctx = await resolve_broker_context(user_id, mode="PAPER")
+    md_bundle = await get_market_data_session_bundle(user_id)
+    provider = ctx.market_data
+
+    bundle_timeout = max(2.0, min(12.0, float(os.getenv("DIAG_BUNDLE_TIMEOUT_SEC", "6"))))
+    trendpulse_timeout = max(2.0, min(12.0, float(os.getenv("DIAG_TRENDPULSE_TIMEOUT_SEC", "5"))))
+
+    async def _probe_bundle() -> tuple[int, bool, str | None]:
+        t0 = time.perf_counter()
         try:
-            cred = json.loads(cred)
-        except json.JSONDecodeError:
-            cred = {}
-    if not isinstance(cred, dict):
-        cred = {}
-    api_key = str(cred.get("apiKey", "")).strip()
-    access_token = str(cred.get("accessToken", "")).strip()
-    if not api_key or not access_token:
-        return None
-    kite = KiteConnect(api_key=api_key)
-    kite.set_access_token(access_token)
-    return kite
+            await asyncio.wait_for(
+                _fetch_nifty_decision_bundle(
+                    provider,
+                    kite,
+                    no_broker_detail=(md_bundle["session_hint"] if not provider else None),
+                ),
+                timeout=bundle_timeout,
+            )
+            return int((time.perf_counter() - t0) * 1000), True, None
+        except Exception as exc:
+            return int((time.perf_counter() - t0) * 1000), False, str(exc)
+
+    async def _probe_trendpulse() -> tuple[int, bool, str | None]:
+        t1 = time.perf_counter()
+        try:
+            _tp = await asyncio.wait_for(trendpulse_series(user_id), timeout=trendpulse_timeout)
+            return int((time.perf_counter() - t1) * 1000), isinstance(_tp, dict), None
+        except Exception as exc:
+            return int((time.perf_counter() - t1) * 1000), False, str(exc)
+
+    (bundle_ms, bundle_ok, bundle_error), (trendpulse_ms, trendpulse_ok, trendpulse_error) = await asyncio.gather(
+        _probe_bundle(),
+        _probe_trendpulse(),
+    )
+
+    refresh_probe = await _run_refresh_cycle_probe(user_id, kite)
+    return {
+        "bundle_ms": bundle_ms,
+        "bundle_ok": bundle_ok,
+        "bundle_error": bundle_error,
+        "trendpulse_ms": trendpulse_ms,
+        "trendpulse_ok": trendpulse_ok,
+        "trendpulse_error": trendpulse_error,
+        "refresh_cycle_wait_ms": refresh_probe["refresh_cycle_wait_ms"],
+        "refresh_cycle_soft_wait_sec": refresh_probe["soft_wait_sec"],
+        "task_in_progress": refresh_probe["in_progress"],
+        "recommendation_engine_run": refresh_probe["recommendation_engine_run"],
+    }
 
 
 @router.get("/recommendations")
 async def get_recommendations(
+    response: Response,
     user_id: int = Depends(get_user_id),
     status: str = Query(default="GENERATED"),
     min_confidence: float = Query(default=0.0, ge=0.0, le=100.0),
@@ -225,37 +376,92 @@ async def get_recommendations(
     sort_dir: str = Query(default="asc"),
     limit: int = Query(default=25, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
-    eligible_only: bool = Query(default=False, description="Return only strikes eligible for auto-trade (score, signal_eligible)"),
+    eligible_only: bool = Query(
+        default=False,
+        description="Dashboard SIGNALS: same bar as auto-execute (score≥autoTradeScoreThreshold, confidence≥80, signal_eligible or inferred).",
+    ),
     all_strategies: bool = Query(default=False, description="Admin only: show recommendations from all strategies (Trades screen). Omit for subscribed strategy only (STRATEGY SIGNALS on Dashboard)."),
     short_delta_band_only: bool = Query(
         default=True,
         description="For short_premium strategies, keep only rows whose delta is inside the active short delta gate (VIX bands or fallback). Set false to show all stored rows.",
     ),
+    ensure_refresh: bool = Query(
+        default=True,
+        description="Run recommendation engine before listing. Set false when client already called /trades/refresh-cycle.",
+    ),
 ) -> list[RecommendationOut]:
+    req_t0 = time.perf_counter()
+    phase_ms: dict[str, int] = {
+        "ensure": 0,
+        "role": 0,
+        "fetch": 0,
+        "eligible_filter": 0,
+        "delta_filter": 0,
+        "score_max": 0,
+        "validate": 0,
+        "total": 0,
+    }
     await ensure_user(user_id)
     kite = await get_kite_for_quotes(user_id)  # Shared API for recommendations
-    try:
-        await ensure_recommendations(user_id, kite)
-    except Exception:
-        # Admin "all strategies" refresh can fail on one strategy, broker, or schema drift; still return DB rows.
-        logger.exception("ensure_recommendations failed user_id=%s", user_id)
+    if ensure_refresh:
+        ensure_t0 = time.perf_counter()
+        try:
+            await asyncio.wait_for(
+                ensure_recommendations(user_id, kite),
+                timeout=_RECOMMENDATIONS_ENSURE_TIMEOUT_SEC,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "ensure_recommendations timed out (%.0fs) for user_id=%s; returning stored recommendations",
+                _RECOMMENDATIONS_ENSURE_TIMEOUT_SEC,
+                user_id,
+            )
+        except Exception:
+            # Admin "all strategies" refresh can fail on one strategy, broker, or schema drift; still return DB rows.
+            logger.exception("ensure_recommendations failed user_id=%s", user_id)
+        phase_ms["ensure"] = int((time.perf_counter() - ensure_t0) * 1000)
 
+    role_t0 = time.perf_counter()
     role_row = await fetchrow("SELECT role FROM s004_users WHERE id = $1", user_id)
     is_admin = role_row and str(role_row.get("role", "")).upper() == "ADMIN"
     use_all_strategies = is_admin and all_strategies
+    phase_ms["role"] = int((time.perf_counter() - role_t0) * 1000)
 
+    score_params_prefetch: dict[str, Any] | None = None
+    fetch_t0 = time.perf_counter()
     if eligible_only:
+        # Cap rows read from DB: auto-bar drops many rows; 150-row pulls were heavy for little benefit.
+        # Admins (all_strategies): need a larger cap so eligible rows from every strategy are not cut off by LIMIT.
+        if use_all_strategies:
+            fetch_cap = min(max(limit * 6, 48), 96)
+        else:
+            fetch_cap = min(max(limit * 3, limit), 48)
+        if not use_all_strategies:
+            try:
+                score_params_prefetch = await get_score_params_for_active_subscription(user_id)
+            except Exception:
+                logger.exception("get_score_params_for_active_subscription failed user_id=%s", user_id)
         rows = await list_recommendations_for_user(
             user_id=user_id,
             status=status.upper(),
             min_confidence=min_confidence,
             sort_by=sort_by,
             sort_dir=sort_dir,
-            limit=min(limit * 2, 100),
+            limit=fetch_cap,
             offset=0,
             all_strategies=use_all_strategies,
         )
-        rows = [r for r in rows if r.get("signal_eligible") is True][:limit]
+        eligible_t0 = time.perf_counter()
+        rows = await filter_rows_auto_execute_aligned(
+            # recommendation score-bar alignment for dashboard eligible strip
+            user_id,
+            rows,
+            all_strategies=use_all_strategies,
+            min_confidence=80.0,
+            strategy_score_params=score_params_prefetch if not use_all_strategies else None,
+        )
+        phase_ms["eligible_filter"] = int((time.perf_counter() - eligible_t0) * 1000)
+        rows = rows[:limit]
     else:
         rows = await list_recommendations_for_user(
             user_id=user_id,
@@ -267,22 +473,31 @@ async def get_recommendations(
             offset=offset,
             all_strategies=use_all_strategies,
         )
+    phase_ms["fetch"] = int((time.perf_counter() - fetch_t0) * 1000)
+    delta_t0 = time.perf_counter()
     if short_delta_band_only:
         rows = await filter_recommendations_short_delta_band_only(user_id, kite, rows)
+    phase_ms["delta_filter"] = int((time.perf_counter() - delta_t0) * 1000)
+    scoremax_t0 = time.perf_counter()
     score_max: int | None = None
     if rows:
-        sid = rows[0].get("strategy_id")
-        ver = rows[0].get("strategy_version")
-        if sid and ver:
-            try:
-                params = await get_strategy_score_params(str(sid), str(ver), user_id)
-                score_max = params.get("score_max")
-            except Exception:
-                logger.exception(
-                    "get_strategy_score_params failed for recommendations sid=%s ver=%s",
-                    sid,
-                    ver,
-                )
+        if score_params_prefetch is not None and not use_all_strategies:
+            score_max = score_params_prefetch.get("score_max")
+        else:
+            sid = rows[0].get("strategy_id")
+            ver = rows[0].get("strategy_version")
+            if sid and ver:
+                try:
+                    params = await get_strategy_score_params(str(sid), str(ver), user_id)
+                    score_max = params.get("score_max")
+                except Exception:
+                    logger.exception(
+                        "get_strategy_score_params failed for recommendations sid=%s ver=%s",
+                        sid,
+                        ver,
+                    )
+    phase_ms["score_max"] = int((time.perf_counter() - scoremax_t0) * 1000)
+    validate_t0 = time.perf_counter()
     out: list[RecommendationOut] = []
     for r in rows:
         item = _coerce_recommendation_row(dict(r))
@@ -296,6 +511,17 @@ async def get_recommendations(
                 item.get("recommendation_id"),
                 exc_info=True,
             )
+    phase_ms["validate"] = int((time.perf_counter() - validate_t0) * 1000)
+    phase_ms["total"] = int((time.perf_counter() - req_t0) * 1000)
+    response.headers["X-Recommendations-Total-Ms"] = str(phase_ms["total"])
+    response.headers["X-Recommendations-Phase-Ms"] = json.dumps(phase_ms, separators=(",", ":"))
+    logger.info(
+        "recommendations timings user_id=%s ensure_refresh=%s eligible_only=%s phases_ms=%s",
+        user_id,
+        ensure_refresh,
+        eligible_only,
+        phase_ms,
+    )
     return out
 
 
@@ -316,7 +542,10 @@ async def execute_trade(
         return ExecuteResponse(status="ok", trade_ref=result["trade_ref"], order_ref=result["order_ref"])
     except ValueError as e:
         if "not found" in str(e).lower():
-            raise HTTPException(status_code=404, detail="Recommendation not found.")
+            raise HTTPException(
+                status_code=404,
+                detail=str(e) if len(str(e)) < 200 else "Recommendation not found. Refresh the list and try again.",
+            )
         if "already processed" in str(e).lower():
             raise HTTPException(status_code=400, detail="Recommendation already processed.")
         raise HTTPException(status_code=400, detail=str(e))
@@ -410,8 +639,14 @@ async def get_open_trades(user_id: int = Depends(get_user_id)) -> list[TradeOut]
             entry = float(r.get("entry_price") or 0.0)
             lots = int(r.get("quantity") or 1)
             side = str(r.get("side") or "BUY").upper()
-            target_price = float(r.get("target_price") or entry + 10)
-            stop_loss_price = float(r.get("stop_loss_price") or entry - 15)
+            if r.get("target_price") is not None:
+                target_price = float(r["target_price"])
+            else:
+                target_price = round(entry + tgt_pts, 2) if side == "BUY" else round(entry - tgt_pts, 2)
+            if r.get("stop_loss_price") is not None:
+                stop_loss_price = float(r["stop_loss_price"])
+            else:
+                stop_loss_price = round(entry - sl_pts, 2) if side == "BUY" else round(entry + sl_pts, 2)
             raw = quotes.get(nfo) if isinstance(quotes.get(nfo), dict) else {}
             ltp = float(raw.get("last_price") or 0.0)
             contracts = lots * lot_size
@@ -451,6 +686,7 @@ async def get_open_trades(user_id: int = Depends(get_user_id)) -> list[TradeOut]
                             reason,
                             json.dumps({"exit_price": exit_price, "pnl": pnl}),
                         )
+                        fire_and_forget_exit_snapshot(r["trade_ref"], user_id)
                         continue
                     # LIVE: position monitor handles exit orders; fall through to display current state
             else:
@@ -1623,7 +1859,11 @@ async def simulate_close_trade(trade_ref: str, user_id: int = Depends(get_user_i
             except Exception:
                 pass
     else:
-        exit_price = round(entry * 1.03, 2)
+        # Paper: naive mark — long profits if premium rises, short if premium falls (opposite of buy).
+        if side == "BUY":
+            exit_price = round(entry * 1.03, 2)
+        else:
+            exit_price = round(max(0.05, entry * 0.97), 2)
     pnl = round((exit_price - entry) * contracts, 2) if side == "BUY" else round((entry - exit_price) * contracts, 2)
 
     await execute(
@@ -1654,5 +1894,7 @@ async def simulate_close_trade(trade_ref: str, user_id: int = Depends(get_user_i
         current_state,
         json.dumps({"exit_price": exit_price, "pnl": pnl}),
     )
+
+    fire_and_forget_exit_snapshot(trade_ref, user_id)
 
     return {"status": "ok", "trade_ref": trade_ref, "exit_price": exit_price, "pnl": pnl}

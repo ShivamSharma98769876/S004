@@ -1,15 +1,24 @@
-"""Position monitor: polls open LIVE trades every 5s, executes SL/target/trailing exits via Kite."""
+"""Position monitor: polls open LIVE and PAPER trades on a fixed interval.
+
+LIVE: SL/target/trailing via Kite quotes + broker exit orders.
+PAPER: same quote + SL/target/trailing logic; exits update DB only (no broker).
+"""
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
+import os
 
 from app.db_client import execute, fetch, fetchrow
 from app.services.execution_service import place_exit_order
+from app.services.trade_chain_snapshot_service import fire_and_forget_exit_snapshot
 
 logger = logging.getLogger(__name__)
-POLL_INTERVAL_SEC = 5
+try:
+    POLL_INTERVAL_SEC = max(1, int((os.getenv("POSITION_MONITOR_POLL_SEC") or "5").strip()))
+except ValueError:
+    POLL_INTERVAL_SEC = 5
 
 
 def _symbol_to_kite_nfo(symbol: str) -> str:
@@ -18,8 +27,8 @@ def _symbol_to_kite_nfo(symbol: str) -> str:
 
 
 async def _get_ltp_by_user(trades: list[dict]) -> dict[int, dict[str, float]]:
-    """Fetch LTP for each (user_id, symbol) using that user's Kite. Returns {user_id: {nfo_symbol: ltp}}."""
-    from app.services.trades_service import _get_kite_for_user
+    """Fetch LTP per user via Zerodha quotes (own → platform shared → pool). FYERS active users fall back here."""
+    from app.services.trades_service import get_kite_for_quotes
 
     result: dict[int, dict[str, float]] = {}
     seen: dict[int, set[str]] = {}
@@ -34,7 +43,7 @@ async def _get_ltp_by_user(trades: list[dict]) -> dict[int, dict[str, float]]:
         seen[uid].add(nfo)
 
     for uid, symbols in seen.items():
-        kite = await _get_kite_for_user(uid)
+        kite = await get_kite_for_quotes(uid)
         if not kite:
             result[uid] = {}
             continue
@@ -107,7 +116,43 @@ async def _process_trade_exit(
         json.dumps({"exit_price": exit_price, "pnl": pnl, "broker_order_id": result.order_id}),
     )
     logger.info("Position monitor: exited %s reason=%s pnl=%.2f", trade_ref, reason, pnl)
+    fire_and_forget_exit_snapshot(trade_ref, user_id)
     return True
+
+
+async def _process_paper_exit(
+    trade: dict,
+    ltp: float,
+    reason: str,
+    exit_price: float,
+    pnl: float,
+) -> None:
+    """Mark PAPER trade EXIT in DB and log event (no broker order)."""
+    user_id = int(trade["user_id"])
+    trade_ref = str(trade["trade_ref"])
+    await execute(
+        """
+        UPDATE s004_live_trades
+        SET current_state = 'EXIT', current_price = $1, realized_pnl = $2,
+            unrealized_pnl = 0, closed_at = NOW(), updated_at = NOW()
+        WHERE trade_ref = $3 AND user_id = $4 AND current_state <> 'EXIT'
+        """,
+        exit_price,
+        pnl,
+        trade_ref,
+        user_id,
+    )
+    await execute(
+        """
+        INSERT INTO s004_trade_events (trade_ref, event_type, prev_state, next_state, reason_code, event_payload, occurred_at)
+        VALUES ($1,'AUTO_EXIT','ACTIVE','EXIT',$2,$3::jsonb,NOW())
+        """,
+        trade_ref,
+        reason,
+        json.dumps({"exit_price": exit_price, "pnl": pnl}),
+    )
+    logger.info("Position monitor (PAPER): exited %s reason=%s pnl=%.2f", trade_ref, reason, pnl)
+    fire_and_forget_exit_snapshot(trade_ref, user_id)
 
 
 async def run_monitor_cycle() -> None:
@@ -117,10 +162,10 @@ async def run_monitor_cycle() -> None:
     """
     rows = await fetch(
         """
-        SELECT t.trade_ref, t.user_id, t.symbol, t.side, t.quantity, t.entry_price,
+        SELECT t.trade_ref, t.user_id, t.mode, t.symbol, t.side, t.quantity, t.entry_price,
                t.target_price, t.stop_loss_price, t.current_state
         FROM s004_live_trades t
-        WHERE t.mode = 'LIVE' AND t.current_state <> 'EXIT'
+        WHERE t.mode IN ('LIVE', 'PAPER') AND t.current_state <> 'EXIT'
         """
     )
     if not rows:
@@ -175,11 +220,20 @@ async def run_monitor_cycle() -> None:
             profit_pct = 100.0 * (entry - ltp) / entry if entry > 0 else 0
             new_trailing_sl = ltp + trailing_pts
 
+        mode = str(r.get("mode") or "LIVE").upper()
         if hit_target:
-            await _process_trade_exit(r, ltp, "TARGET_HIT", round(ltp, 2), round(pnl, 2))
+            ep, pn = round(ltp, 2), round(pnl, 2)
+            if mode == "PAPER":
+                await _process_paper_exit(r, ltp, "TARGET_HIT", ep, pn)
+            else:
+                await _process_trade_exit(r, ltp, "TARGET_HIT", ep, pn)
             continue
         if hit_sl:
-            await _process_trade_exit(r, ltp, "SL_HIT", round(ltp, 2), round(pnl, 2))
+            ep, pn = round(ltp, 2), round(pnl, 2)
+            if mode == "PAPER":
+                await _process_paper_exit(r, ltp, "SL_HIT", ep, pn)
+            else:
+                await _process_trade_exit(r, ltp, "SL_HIT", ep, pn)
             continue
 
         if state == "ACTIVE" and profit_pct >= breakeven_pct:

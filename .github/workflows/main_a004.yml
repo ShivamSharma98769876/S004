@@ -1,15 +1,14 @@
-# Docs for the Azure Web Apps Deploy action: https://github.com/Azure/webapps-deploy
-# More GitHub Actions for Azure: https://github.com/Azure/actions
-# More info on Python, GitHub Actions, and Azure App Service: https://aka.ms/python-webapps-actions
+# Combined Next.js + FastAPI image (repo-root Dockerfile → nginx on 8080).
+# Azure: Linux Web App configured for **custom container** (not Python code stack).
 #
-# Required GitHub Actions secrets (repo → Settings → Secrets and variables → Actions):
-#   AZURE_WEBAPP_API_NAME           — exact Web App name from Azure Portal → Overview (not a display label).
-#   AZURE_WEBAPP_API_PUBLISH_PROFILE — entire .PublishSettings XML from Portal → Get publish profile.
-# If either is missing/empty, Azure/webapps-deploy@v3 fails with: "No credentials found. Add an Azure login action".
-# You do NOT need azure/login when using a non-empty publish profile.
-# Org/repo env: do not set AZURE_CORE_OUTPUT: none (it breaks Azure CLI–based steps in some actions).
+# GitHub Actions secrets:
+#   ACR_LOGIN_SERVER          e.g. myregistry.azurecr.io
+#   ACR_USERNAME              ACR username (or appId for SP with AcrPush)
+#   ACR_PASSWORD              ACR password (or service principal secret)
+#   AZURE_WEBAPP_NAME         Web App name (Overview)
+#   AZURE_WEBAPP_PUBLISH_PROFILE  Full .PublishSettings XML (Linux: set WEBSITE_WEBDEPLOY_USE_SCM=true on the app before download, per Microsoft)
 
-name: Build and deploy Python app to Azure Web App - A004
+name: Build and deploy Docker image to Azure Web App
 
 on:
   push:
@@ -17,65 +16,43 @@ on:
       - main
   workflow_dispatch:
 
+env:
+  IMAGE_NAME: s004-app
+
 jobs:
-  build:
+  build-and-deploy:
     runs-on: ubuntu-latest
     permissions:
-      contents: read #This is required for actions/checkout
+      contents: read
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python version
-        uses: actions/setup-python@v5
+      - name: Log in to Azure Container Registry
+        uses: docker/login-action@v3
         with:
-          python-version: '3.12'
+          registry: ${{ secrets.ACR_LOGIN_SERVER }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
 
-      # 🛠️ Local Build Section (Optional)
-      # The following section in your workflow is designed to catch build issues early on the client side, before deployment. This can be helpful for debugging and validation. However, if this step significantly increases deployment time and early detection is not critical for your workflow, you may remove this section to streamline the deployment process.
-      # API code and requirements live under backend/ (same layout as main_s004.yml).
-      - name: Create and Start virtual environment and Install dependencies
-        working-directory: backend
-        run: |
-          python -m venv antenv
-          source antenv/bin/activate
-          pip install -r requirements.txt
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
-      # By default, when you enable GitHub CI/CD integration through the Azure portal, the platform automatically sets the SCM_DO_BUILD_DURING_DEPLOYMENT application setting to true. This triggers the use of Oryx, a build engine that handles application compilation and dependency installation (e.g., pip install) directly on the platform during deployment. Hence, we exclude the antenv virtual environment directory from the deployment artifact to reduce the payload size.
-      - name: Zip backend for Azure
-        run: |
-          cd backend
-          zip -r ../backend-deploy.zip . \
-            -x 'antenv/*' -x 'antenv/**' \
-            -x '**/__pycache__/*' -x '**/*.pyc' \
-            -x 'tests/*' -x 'tests/**'
-
-      - name: Upload artifact for deployment jobs
-        uses: actions/upload-artifact@v4
+      - name: Build and push image
+        uses: docker/build-push-action@v6
         with:
-          name: python-app
-          path: backend-deploy.zip
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ${{ secrets.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+            ${{ secrets.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
-      # 🚫 Opting Out of Oryx Build
-      # If you prefer to disable the Oryx build process during deployment, follow these steps:
-      # 1. Remove the SCM_DO_BUILD_DURING_DEPLOYMENT app setting from your Azure App Service Environment variables.
-      # 2. Refer to sample workflows for alternative deployment strategies: https://github.com/Azure/actions-workflow-samples/tree/master/AppService
-      
-
-  deploy:
-    runs-on: ubuntu-latest
-    needs: build
-    
-    steps:
-      - name: Download artifact from build job
-        uses: actions/download-artifact@v4
-        with:
-          name: python-app
-      
-      - name: 'Deploy to Azure Web App'
+      - name: Deploy to Azure Web App (container)
         uses: Azure/webapps-deploy@v3
-        id: deploy-to-webapp
         with:
-          app-name: ${{ secrets.AZURE_WEBAPP_API_NAME }}
-          publish-profile: ${{ secrets.AZURE_WEBAPP_API_PUBLISH_PROFILE }}
-          package: backend-deploy.zip
+          app-name: ${{ secrets.AZURE_WEBAPP_NAME }}
+          publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }}
+          images: ${{ secrets.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ github.sha }}

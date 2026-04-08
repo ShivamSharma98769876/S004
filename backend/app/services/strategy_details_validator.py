@@ -210,6 +210,9 @@ def validate_strategy_details(details: dict) -> list[str]:
         if "shortPremiumRsiDirectBand" in strike and strike.get("shortPremiumRsiDirectBand") is not None:
             if not isinstance(strike.get("shortPremiumRsiDirectBand"), bool):
                 errors.append("'strikeSelection.shortPremiumRsiDirectBand' must be a boolean.")
+        if "shortPremiumRsiDecreasing" in strike and strike.get("shortPremiumRsiDecreasing") is not None:
+            if not isinstance(strike.get("shortPremiumRsiDecreasing"), bool):
+                errors.append("'strikeSelection.shortPremiumRsiDecreasing' must be a boolean.")
         for sp_key in (
             "shortPremiumCeMinSteps",
             "shortPremiumCeMaxSteps",
@@ -261,6 +264,13 @@ def validate_strategy_details(details: dict) -> list[str]:
             ("shortPremiumPcrChainEpsilon", "shortPremiumPcrChainEpsilon"),
             ("shortPremiumPcrMinForSellCe", "shortPremiumPcrMinForSellCe"),
             ("shortPremiumPcrMaxForSellPe", "shortPremiumPcrMaxForSellPe"),
+            ("shortPremiumExpansionBlockRsi", "shortPremiumExpansionBlockRsi"),
+            ("shortPremiumVwapWeaknessMinPct", "shortPremiumVwapWeaknessMinPct"),
+            ("shortPremiumMinMomentumPoints", "shortPremiumMinMomentumPoints"),
+            ("shortPremiumGhostRsiDropPts", "shortPremiumGhostRsiDropPts"),
+            ("shortPremiumRsiSoftZoneLow", "shortPremiumRsiSoftZoneLow"),
+            ("shortPremiumRsiSoftZoneHigh", "shortPremiumRsiSoftZoneHigh"),
+            ("shortPremiumRsiReversalFromRsi", "shortPremiumRsiReversalFromRsi"),
         ):
             _nv = strike.get(_nk)
             if _nv is not None and (
@@ -270,6 +280,69 @@ def validate_strategy_details(details: dict) -> list[str]:
         _pvc = strike.get("shortPremiumPcrBonusVsChain")
         if _pvc is not None and not isinstance(_pvc, (bool, str)):
             errors.append("'strikeSelection.shortPremiumPcrBonusVsChain' must be a boolean.")
+        _szor = strike.get("shortPremiumRsiZoneOrReversal")
+        if _szor is not None and not isinstance(_szor, (bool, str)):
+            errors.append("'strikeSelection.shortPremiumRsiZoneOrReversal' must be a boolean or string flag.")
+        _srfb = strike.get("shortPremiumRsiReversalFallingBars")
+        if _srfb is not None:
+            if isinstance(_srfb, bool) or not isinstance(_srfb, (int, float)):
+                errors.append(
+                    "'strikeSelection.shortPremiumRsiReversalFallingBars' must be an integer 0–20 when set."
+                )
+            elif int(_srfb) < 0 or int(_srfb) > 20:
+                errors.append(
+                    "'strikeSelection.shortPremiumRsiReversalFallingBars' must be between 0 and 20."
+                )
+        _vwbuf = strike.get("shortPremiumVwapEligibleBufferPct")
+        if _vwbuf is not None:
+            if isinstance(_vwbuf, bool) or not isinstance(_vwbuf, (int, float)):
+                errors.append(
+                    "'strikeSelection.shortPremiumVwapEligibleBufferPct' must be a number 0–3 when set."
+                )
+            elif float(_vwbuf) < 0 or float(_vwbuf) > 3:
+                errors.append(
+                    "'strikeSelection.shortPremiumVwapEligibleBufferPct' must be between 0 and 3."
+                )
+        _tfvw = strike.get("shortPremiumThreeFactorRequireLtpBelowVwapForEligible")
+        if _tfvw is not None and not isinstance(_tfvw, (bool, str)):
+            errors.append(
+                "'strikeSelection.shortPremiumThreeFactorRequireLtpBelowVwapForEligible' "
+                "must be a boolean or flag string when set."
+            )
+        for _ik, _il in (
+            ("shortPremiumIvrMinCe", "shortPremiumIvrMinCe"),
+            ("shortPremiumIvrMinPe", "shortPremiumIvrMinPe"),
+        ):
+            _iv = strike.get(_ik)
+            if _iv is not None:
+                if isinstance(_iv, bool) or not isinstance(_iv, (int, float)):
+                    errors.append(f"'strikeSelection.{_il}' must be a number 0–100 when set.")
+                elif float(_iv) < 0 or float(_iv) > 100:
+                    errors.append(f"'strikeSelection.{_il}' must be between 0 and 100.")
+        fr = strike.get("flowRanking")
+        if fr is not None:
+            if not isinstance(fr, dict):
+                errors.append("'strikeSelection.flowRanking' must be an object.")
+            else:
+                for fk, fl in (
+                    ("tiltWeight", "tiltWeight"),
+                    ("percentileOiWeight", "percentileOiWeight"),
+                    ("percentileVolWeight", "percentileVolWeight"),
+                    ("oiChgScaleWeight", "oiChgScaleWeight"),
+                    ("longBuildupBonus", "longBuildupBonus"),
+                    ("shortCoveringBonus", "shortCoveringBonus"),
+                    ("pinMaxDistanceFromSpot", "pinMaxDistanceFromSpot"),
+                    ("pinOiDominanceRatio", "pinOiDominanceRatio"),
+                    ("pinPenaltyWeight", "pinPenaltyWeight"),
+                ):
+                    fv = fr.get(fk)
+                    if fv is not None and (isinstance(fv, bool) or not isinstance(fv, (int, float))):
+                        errors.append(f"'strikeSelection.flowRanking.{fl}' must be a number when set.")
+                _ppin = fr.get("pinPenaltyOnExpiryDay")
+                if _ppin is not None and not isinstance(_ppin, (bool, str)):
+                    errors.append(
+                        "'strikeSelection.flowRanking.pinPenaltyOnExpiryDay' must be a boolean or flag string when set."
+                    )
 
     # score thresholds
     for key, label in [

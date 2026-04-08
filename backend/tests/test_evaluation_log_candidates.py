@@ -159,6 +159,66 @@ def test_short_premium_compact_log_shows_gate_and_in_band_strikes_only() -> None
     assert "compact" in text
 
 
+def test_long_premium_log_includes_candidate_detail_when_env_set(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("S004_EVALUATION_LOG_LONG_CANDIDATES", "1")
+    event: dict = {
+        "ts_ist": "2026-03-25T10:00:00+05:30",
+        "strategy_id": "strat-trendsnap-momentum",
+        "strategy_version": "1.0.0",
+        "strategy_type": "rule-based",
+        "position_intent": "long_premium",
+        "fetch_failed": False,
+        "error": None,
+        "candidate_count": 1,
+        "scanned_candidate_count": 2,
+        "eligible_count": 0,
+        "score_threshold": 3,
+        "score_max": 4,
+        "auto_trade_score_threshold": 4.0,
+        "include_ema_crossover_in_score": False,
+        "strict_bullish_comparisons": True,
+        "rsi_min": 50,
+        "rsi_max": 75,
+        "volume_min_ratio": 1.02,
+        "adx_min_threshold": None,
+        "failed_conditions_sample": ["score<3"],
+        "candidates": [
+            {
+                "symbol": "NIFTY07APR22000CE",
+                "option_type": "CE",
+                "strike": 22000,
+                "side": "BUY",
+                "distance_to_atm": 1,
+                "score": 2,
+                "confidence_score": 55.0,
+                "signal_eligible": False,
+                "delta": 0.45,
+                "ivr": 22.0,
+                "oi": 5000,
+                "volume_spike_ratio": 1.1,
+                "entry_price": 150.0,
+                "ema9": 22010.0,
+                "ema21": 21990.0,
+                "vwap": 22005.0,
+                "rsi": 60.0,
+                "failed_conditions": "score 2 < 3",
+            },
+        ],
+        "candidates_truncated": False,
+        "chain_snapshot": {
+            "option_expiry": "07APR2026",
+            "chain_rows": 20,
+            "calendar_dte_ist": 8,
+        },
+    }
+    text = format_evaluation_event_text(event)
+    assert "Scanned candidates (detail, long premium):" in text
+    assert "NIFTY07APR22000CE" in text
+    assert "strike=22000" in text
+    assert "E9=22010.00" in text
+    assert "failed: score 2 < 3" in text
+
+
 def test_short_premium_verbose_log_when_env_full(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("S004_EVALUATION_LOG_SHORT_FULL", "1")
     event: dict = {

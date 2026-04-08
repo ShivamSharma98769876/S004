@@ -15,6 +15,7 @@ type StrategyItem = {
   status: "ACTIVE" | "PAUSED" | "NOT_SUBSCRIBED";
   pnl_30d: number;
   win_rate: number;
+  position_intent?: "long_premium" | "short_premium";
 };
 
 /** Template for admin creating a new strategy. Admin customizes JSON; runtime uses saved strategy_details from catalog. */
@@ -353,6 +354,27 @@ export default function MarketplacePage() {
     }
   };
 
+  const updateIntent = async (row: StrategyItem, intent: "long_premium" | "short_premium") => {
+    try {
+      await apiJson(
+        `/api/marketplace/strategies/${encodeURIComponent(row.strategy_id)}/${encodeURIComponent(row.version)}/intent`,
+        "PUT",
+        { position_intent: intent }
+      );
+      setRows((prev) =>
+        prev.map((r) =>
+          r.strategy_id === row.strategy_id && r.version === row.version ? { ...r, position_intent: intent } : r
+        )
+      );
+      showToast(
+        `${row.display_name}: intent set to ${intent === "short_premium" ? "Short Premium" : "Long Premium"}.`,
+        "success"
+      );
+    } catch (e) {
+      showToast(e instanceof Error ? e.message : "Failed to update strategy intent.", "error");
+    }
+  };
+
   return (
     <AppFrame title="Strategy Marketplace" subtitle="Subscribe to strategies, review risk posture, and track performance.">
       {toast && (
@@ -443,6 +465,7 @@ export default function MarketplacePage() {
                 <th className="sortable-th" onClick={() => handleTableSort("pnl_30d")}>P&amp;L (30d) {tableSortCol === "pnl_30d" && (tableSortDir === "asc" ? "↑" : "↓")}</th>
                 <th className="sortable-th" onClick={() => handleTableSort("win_rate")}>Win Rate {tableSortCol === "win_rate" && (tableSortDir === "asc" ? "↑" : "↓")}</th>
                 <th className="sortable-th" onClick={() => handleTableSort("status")}>Status {tableSortCol === "status" && (tableSortDir === "asc" ? "↑" : "↓")}</th>
+                <th>Intent</th>
                 <th>Action</th>
               </tr>
             </thead>
@@ -465,6 +488,16 @@ export default function MarketplacePage() {
                   <td className="metric-neutral">{row.win_rate.toFixed(1)}%</td>
                   <td>
                     <span className={`chip chip-status-${row.status.toLowerCase()}`}>{row.status}</span>
+                  </td>
+                  <td>
+                    <select
+                      className="control-select"
+                      value={row.position_intent ?? "long_premium"}
+                      onChange={(e) => updateIntent(row, e.target.value as "long_premium" | "short_premium")}
+                    >
+                      <option value="long_premium">Long</option>
+                      <option value="short_premium">Short</option>
+                    </select>
                   </td>
                   <td>
                     <div className="marketplace-actions">

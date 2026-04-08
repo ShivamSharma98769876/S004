@@ -31,6 +31,11 @@ type StrategyOption = {
 
 const STRAT_SEP = "\u0001";
 
+function tradeSideLabel(side: string | null | undefined): string {
+  const s = String(side || "BUY").trim().toUpperCase();
+  return s === "SELL" ? "SELL" : "BUY";
+}
+
 function buildReportsQuery(params: {
   fromDate: string;
   toDate: string;
@@ -191,15 +196,15 @@ export default function ReportsPage() {
 
   const downloadCsv = () => {
     const headers = admin
-      ? ["Trade ID", "Trade Date", "User", "Symbol", "Strategy", "Type", "Mode", "Taken By", "Buy Time", "Entry", "Sell Time", "Exit", "Qty", "P&L", "Reason"]
-      : ["Trade ID", "Trade Date", "Symbol", "Strategy", "Type", "Mode", "Taken By", "Buy Time", "Entry", "Sell Time", "Exit", "Qty", "P&L", "Reason"];
+      ? ["Trade ID", "Trade Date", "User", "Symbol", "Strategy", "Side", "Mode", "Taken By", "Entry Time", "Entry", "Exit Time", "Exit", "Qty", "P&L", "Reason"]
+      : ["Trade ID", "Trade Date", "Symbol", "Strategy", "Side", "Mode", "Taken By", "Entry Time", "Entry", "Exit Time", "Exit", "Qty", "P&L", "Reason"];
     const rows = sortedTrades.map((t) => {
-      const optType = t.symbol?.includes("CE") ? "CE" : t.symbol?.includes("PE") ? "PE" : t.side === "BUY" ? "PE" : "CE";
+      const sideLabel = tradeSideLabel(t.side);
       const takenBy = t.manual_execute === false ? "Auto" : t.manual_execute === true ? "Manual" : "—";
       const pnl = Number(t.realized_pnl ?? 0);
       const cells = admin
-        ? [t.trade_ref, formatDate(t.closed_at ?? t.opened_at), String(t.username ?? "—"), t.symbol, String(t.strategy_name ?? "—"), optType, t.mode || "PAPER", takenBy, formatTime(t.opened_at), Number(t.entry_price).toFixed(2), formatTime(t.closed_at), Number(t.current_price).toFixed(2), String(t.qty ?? t.quantity ?? 0), (pnl >= 0 ? "+" : "") + pnl.toFixed(2), t.reason || "Manual"]
-        : [t.trade_ref, formatDate(t.closed_at ?? t.opened_at), t.symbol, String(t.strategy_name ?? "—"), optType, t.mode || "PAPER", takenBy, formatTime(t.opened_at), Number(t.entry_price).toFixed(2), formatTime(t.closed_at), Number(t.current_price).toFixed(2), String(t.qty ?? t.quantity ?? 0), (pnl >= 0 ? "+" : "") + pnl.toFixed(2), t.reason || "Manual"];
+        ? [t.trade_ref, formatDate(t.closed_at ?? t.opened_at), String(t.username ?? "—"), t.symbol, String(t.strategy_name ?? "—"), sideLabel, t.mode || "PAPER", takenBy, formatTime(t.opened_at), Number(t.entry_price).toFixed(2), formatTime(t.closed_at), Number(t.current_price).toFixed(2), String(t.qty ?? t.quantity ?? 0), (pnl >= 0 ? "+" : "") + pnl.toFixed(2), t.reason || "Manual"]
+        : [t.trade_ref, formatDate(t.closed_at ?? t.opened_at), t.symbol, String(t.strategy_name ?? "—"), sideLabel, t.mode || "PAPER", takenBy, formatTime(t.opened_at), Number(t.entry_price).toFixed(2), formatTime(t.closed_at), Number(t.current_price).toFixed(2), String(t.qty ?? t.quantity ?? 0), (pnl >= 0 ? "+" : "") + pnl.toFixed(2), t.reason || "Manual"];
       return cells.map(escapeCsv).join(",");
     });
     const csv = [headers.join(","), ...rows].join("\n");
@@ -329,7 +334,7 @@ export default function ReportsPage() {
           </button>
         </div>
         <p style={{ fontSize: "0.75rem", color: "var(--text-muted)", marginTop: "0.75rem", marginBottom: 0 }}>
-          <strong>Trade Date</strong> range uses each trade’s <strong>exit (sell) date</strong>. Use the calendar in the fields above to
+          <strong>Trade Date</strong> range uses each trade’s <strong>exit date</strong>. Use the calendar in the fields above to
           pick dates. No dates = latest rows (up to 500); with any filter = up to 2000 rows.
           {admin ? " User filter is available for Admin only." : ""}
         </p>
@@ -393,12 +398,12 @@ export default function ReportsPage() {
                 {admin && <th className="sortable-th" onClick={() => handleSort("username")}>USER {sortCol === "username" && (sortDir === "asc" ? "↑" : "↓")}</th>}
                 <th className="sortable-th" onClick={() => handleSort("symbol")}>SYMBOL {sortCol === "symbol" && (sortDir === "asc" ? "↑" : "↓")}</th>
                 <th>STRATEGY</th>
-                <th>TYPE</th>
+                <th title="Order side to open: BUY (long premium) or SELL (short premium)">SIDE</th>
                 <th className="sortable-th" onClick={() => handleSort("mode")}>MODE {sortCol === "mode" && (sortDir === "asc" ? "↑" : "↓")}</th>
                 <th className="sortable-th" onClick={() => handleSort("manual_execute")}>TAKEN BY {sortCol === "manual_execute" && (sortDir === "asc" ? "↑" : "↓")}</th>
-                <th className="sortable-th" onClick={() => handleSort("opened_at")}>BUY TIME (IST) {sortCol === "opened_at" && (sortDir === "asc" ? "↑" : "↓")}</th>
+                <th className="sortable-th" onClick={() => handleSort("opened_at")}>ENTRY TIME (IST) {sortCol === "opened_at" && (sortDir === "asc" ? "↑" : "↓")}</th>
                 <th className="sortable-th" onClick={() => handleSort("entry_price")}>ENTRY {sortCol === "entry_price" && (sortDir === "asc" ? "↑" : "↓")}</th>
-                <th className="sortable-th" onClick={() => handleSort("closed_at")}>SELL TIME (IST) {sortCol === "closed_at" && (sortDir === "asc" ? "↑" : "↓")}</th>
+                <th className="sortable-th" onClick={() => handleSort("closed_at")}>EXIT TIME (IST) {sortCol === "closed_at" && (sortDir === "asc" ? "↑" : "↓")}</th>
                 <th className="sortable-th" onClick={() => handleSort("current_price")}>EXIT {sortCol === "current_price" && (sortDir === "asc" ? "↑" : "↓")}</th>
                 <th className="sortable-th" onClick={() => handleSort("qty")}>QTY {sortCol === "qty" && (sortDir === "asc" ? "↑" : "↓")}</th>
                 <th className="sortable-th" onClick={() => handleSort("realized_pnl")}>P&L {sortCol === "realized_pnl" && (sortDir === "asc" ? "↑" : "↓")}</th>
@@ -416,7 +421,6 @@ export default function ReportsPage() {
                 sortedTrades.map((t, i) => {
                   const pnl = Number(t.realized_pnl ?? 0);
                   const isProfit = pnl >= 0;
-                  const optType = t.symbol?.includes("CE") ? "CE" : t.symbol?.includes("PE") ? "PE" : t.side === "BUY" ? "PE" : "CE";
                   const takenBy = t.manual_execute === false ? "Auto" : t.manual_execute === true ? "Manual" : "—";
                   return (
                     <tr key={`${t.trade_ref}-${i}`}>
@@ -426,7 +430,7 @@ export default function ReportsPage() {
                       <td className="cell-symbol-full">{t.symbol}</td>
                       <td className="summary-label">{t.strategy_name || "—"}</td>
                       <td>
-                        <span className="chip chip-status-paused">{optType}</span>
+                        <span className="chip chip-status-paused">{tradeSideLabel(t.side)}</span>
                       </td>
                       <td>
                         <span className="chip chip-status-active">{t.mode || "PAPER"}</span>

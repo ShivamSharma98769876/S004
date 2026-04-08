@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import time
 from collections import deque
 from datetime import date, datetime, timezone
 from typing import Any
@@ -15,11 +17,14 @@ from app.db_client import ensure_user, fetch, fetchrow
 from app.services.option_chain_zerodha import (
     fetch_index_candles_sync,
     fetch_indices_spot_sync,
+    fetch_nifty_spot_trail_5m_for_session_sync,
     fetch_option_chain_sync,
+    get_expiries_for_analytics,
     get_expiries_for_instrument,
+    nifty_index_candles_current_session,
 )
 from app.services.option_symbol_compact import parse_compact_option_symbol
-from app.services.sentiment_engine import compute_sentiment_snapshot
+from app.services.sentiment_engine import compute_sentiment_snapshot, compute_sideways_regime_snapshot
 from app.services.trendpulse_phase3 import apply_trendpulse_hard_gates
 from app.services.trendpulse_z import (
     build_trendpulse_chart_series,
@@ -32,13 +37,20 @@ from app.services.redis_client import (
     sentiment_history_redis_available,
 )
 from app.services.news_sentiment import compute_news_sentiment_snapshot, news_sentiment_failure_payload
+from app.services.landing_oi_walls import build_oi_walls_from_chain, oi_walls_stub
 from app.services.strategy_day_fit import attach_strategy_day_fit_to_snapshot
+from app.services.broker_runtime import resolve_broker_context
+from app.services.market_data_kite_session import get_market_data_session_bundle
 from app.services.trades_service import get_strategy_score_params, get_kite_for_quotes, _get_user_strategy
 
 TRENDPULSE_STRATEGY_ID = "strat-trendpulse-z"
 TRENDPULSE_DEFAULT_VERSION = "1.0.0"
 
 router = APIRouter(prefix="/landing", tags=["landing"])
+
+
+async def _async_empty_list() -> list[Any]:
+    return []
 
 
 def _coerce_expiry_str(val: Any) -> str | None:
@@ -77,7 +89,26 @@ def _trendpulse_recommendation_for_api(row: dict[str, Any]) -> dict[str, Any]:
         out["optionType"] = str(parsed["optionType"])
     return out
 _BROKER_TIMEOUT_SEC = 8.0
+# Landing: one chain fetch (not two in parallel) to avoid Kite 429; wider window needs more time for indicators.
+_LANDING_CHAIN_STRIKES_HALF = 20
+_LANDING_CHAIN_TIMEOUT_SEC = 28.0
+_LANDING_CHAIN_FALLBACK_HALF = 8
+_LANDING_DECISION_BUNDLE_TIMEOUT_SEC = 10.0
+_LANDING_TRENDPULSE_TIMEOUT_SEC = 8.0
+_LANDING_REGIME_CANDLES_TIMEOUT_SEC = 6.0
 _SENTIMENT_HISTORY_MAX_POINTS = 240
+
+
+def _nifty_primary_expiry_str(kite: Any) -> tuple[str | None, str]:
+    """Nearest NIFTY expiry: real NFO list when Kite is available (same as Analytics), else estimated weeklies."""
+    if kite is not None:
+        ex, src = get_expiries_for_analytics(kite, "NIFTY")
+        if ex:
+            return str(ex[0]), src
+    est = get_expiries_for_instrument("NIFTY")
+    if est:
+        return str(est[0]), "estimated_weeklies"
+    return None, "none"
 _sentiment_history: dict[int, deque[dict[str, Any]]] = {}
 _sentiment_history_lock = asyncio.Lock()
 
@@ -103,6 +134,7 @@ def _history_record(
             "drivers": sentiment.get("drivers") or [],
             "alerts": sentiment.get("alerts") or [],
             "optionsIntel": sentiment.get("optionsIntel") or {},
+            "inputs": sentiment.get("inputs") or {},
         },
         "trendpulse": {
             "enabled": bool(trendpulse.get("trendpulseEnabled")),
@@ -200,6 +232,62 @@ def _spot_trend_label(change_pct: float | None) -> str:
     return "Sideways"
 
 
+async def _fetch_nifty_15m_trend(provider: Any | None, kite: Any | None) -> dict[str, Any]:
+    """Last completed 15m bar vs prior bar on NIFTY (IST session), for landing Trend row."""
+    candles: list[Any] = []
+    try:
+        if provider:
+            candles = await asyncio.wait_for(
+                provider.index_candles("NIFTY", "15minute", 5),
+                timeout=7.0,
+            )
+        elif kite:
+            candles = await asyncio.wait_for(
+                asyncio.to_thread(fetch_index_candles_sync, kite, "NIFTY", "15minute", 5),
+                timeout=7.0,
+            )
+    except Exception:
+        candles = []
+    if not isinstance(candles, list):
+        candles = []
+    sess = nifty_index_candles_current_session(candles)
+    closes = [float(c.get("close") or 0) for c in sess if float(c.get("close") or 0) > 0]
+    if len(closes) < 2:
+        closes = [float(c.get("close") or 0) for c in candles if float(c.get("close") or 0) > 0]
+    change_pct: float | None = None
+    if len(closes) >= 2:
+        prev_c, last_c = closes[-2], closes[-1]
+        if prev_c > 0:
+            change_pct = round((last_c - prev_c) / prev_c * 100, 2)
+    label = _spot_trend_label(change_pct) if change_pct is not None else "—"
+    return {"changePct": change_pct, "trendLabel": label}
+
+
+async def _empty_nifty_15m_trend() -> dict[str, Any]:
+    return {"changePct": None, "trendLabel": "—"}
+
+
+def _coalesce_nifty_from_chain(
+    nifty_spot: float,
+    nifty_chg: float,
+    chain_payload: dict[str, Any] | None,
+) -> tuple[float, float]:
+    """If index quote returned 0 but option-chain build has a spot, use chain (same session as PCR)."""
+    if not chain_payload:
+        return nifty_spot, nifty_chg
+    try:
+        c_spot = float(chain_payload.get("spot") or 0)
+    except (TypeError, ValueError):
+        c_spot = 0.0
+    if float(nifty_spot or 0) <= 0 and c_spot > 0:
+        nifty_spot = c_spot
+        try:
+            nifty_chg = float(chain_payload.get("spotChgPct") or 0)
+        except (TypeError, ValueError):
+            nifty_chg = 0.0
+    return nifty_spot, nifty_chg
+
+
 def _to_utc_naive(dt_like: Any) -> datetime | None:
     if isinstance(dt_like, datetime):
         if dt_like.tzinfo is not None:
@@ -237,13 +325,39 @@ def _series_time_to_utc_naive(dt_like: Any) -> datetime | None:
     return d
 
 
-async def _fetch_nifty_market_and_chain(kite: Any) -> tuple[float, float, float | None, dict[str, Any] | None]:
+async def _fetch_nifty_market_and_chain(
+    market_provider: Any | None,
+    kite: Any | None = None,
+) -> tuple[float, float, float | None, dict[str, Any] | None]:
     """Fetch NIFTY spot and compact chain payload once for landing widgets/sentiment."""
     nifty_spot = 0.0
     nifty_chg = 0.0
     chain_payload: dict[str, Any] | None = None
     pcr: float | None = None
-    if kite:
+    if market_provider:
+        try:
+            idx = await asyncio.wait_for(
+                market_provider.indices(),
+                timeout=_BROKER_TIMEOUT_SEC,
+            )
+            n = idx.get("NIFTY") or {}
+            nifty_spot = float(n.get("spot") or 0)
+            nifty_chg = float(n.get("spotChgPct") or 0)
+        except Exception:
+            pass
+        try:
+            ex, _src = await market_provider.expiries("NIFTY")
+            exp_str = str(ex[0]) if ex else None
+            if exp_str:
+                chain_payload = await asyncio.wait_for(
+                    market_provider.option_chain("NIFTY", exp_str, 3, 3, True),
+                    timeout=_BROKER_TIMEOUT_SEC,
+                )
+                if chain_payload and chain_payload.get("pcr") is not None:
+                    pcr = float(chain_payload.get("pcr"))
+        except Exception:
+            pass
+    elif kite:
         try:
             idx = await asyncio.wait_for(
                 asyncio.to_thread(fetch_indices_spot_sync, kite),
@@ -255,14 +369,14 @@ async def _fetch_nifty_market_and_chain(kite: Any) -> tuple[float, float, float 
         except Exception:
             pass
         try:
-            ex = get_expiries_for_instrument("NIFTY")
-            if ex:
+            exp_str, _ = _nifty_primary_expiry_str(kite)
+            if exp_str:
                 chain_payload = await asyncio.wait_for(
                     asyncio.to_thread(
                         fetch_option_chain_sync,
                         kite,
                         "NIFTY",
-                        ex[0],
+                        exp_str,
                         3,
                         3,
                         1,
@@ -274,17 +388,164 @@ async def _fetch_nifty_market_and_chain(kite: Any) -> tuple[float, float, float 
                     pcr = float(chain_payload.get("pcr"))
         except Exception:
             pass
+    nifty_spot, nifty_chg = _coalesce_nifty_from_chain(nifty_spot, nifty_chg, chain_payload)
     return nifty_spot, nifty_chg, pcr, chain_payload
+
+
+async def _fetch_nifty_decision_bundle(
+    market_provider: Any | None,
+    kite: Any,
+    *,
+    no_broker_detail: str | None = None,
+) -> tuple[float, float, float | None, dict[str, Any] | None, dict[str, Any]]:
+    """
+    Indices once, then **one** NIFTY option chain (ATM ± N strikes) for both sentiment/PCR and OI walls.
+
+    We previously fetched narrow+wide **in parallel**, which doubled Kite traffic and often hit **429** or **8s timeouts**
+    on the heavy wide build. Single fetch + longer timeout is kinder to the broker and more reliable.
+    """
+    nifty_spot, nifty_chg = 0.0, 0.0
+    chain_narrow: dict[str, Any] | None = None
+    pcr: float | None = None
+
+    if market_provider:
+        try:
+            idx = await asyncio.wait_for(
+                market_provider.indices(),
+                timeout=_BROKER_TIMEOUT_SEC,
+            )
+            n = idx.get("NIFTY") or {}
+            nifty_spot = float(n.get("spot") or 0)
+            nifty_chg = float(n.get("spotChgPct") or 0)
+        except Exception:
+            pass
+    elif kite:
+        try:
+            idx = await asyncio.wait_for(
+                asyncio.to_thread(fetch_indices_spot_sync, kite),
+                timeout=_BROKER_TIMEOUT_SEC,
+            )
+            n = idx.get("NIFTY") or {}
+            nifty_spot = float(n.get("spot") or 0)
+            nifty_chg = float(n.get("spotChgPct") or 0)
+        except Exception:
+            pass
+
+    if not market_provider and not kite:
+        return nifty_spot, nifty_chg, pcr, chain_narrow, oi_walls_stub(
+            status="no_broker",
+            detail=no_broker_detail
+            or (
+                "No broker market-data session for quotes. Connect broker under Settings → Brokers, "
+                "or use the admin shared broker connection for paper."
+            ),
+            spot=nifty_spot,
+        )
+
+    if market_provider:
+        try:
+            ex, _src = await market_provider.expiries("NIFTY")
+            expiry_str = str(ex[0]) if ex else None
+        except Exception:
+            expiry_str = None
+    else:
+        expiry_str, _ex_src = _nifty_primary_expiry_str(kite)
+    if not expiry_str:
+        return nifty_spot, nifty_chg, pcr, chain_narrow, oi_walls_stub(
+            status="no_expiries",
+            detail="NIFTY F&O expiries are missing. From backend: python -m app.scripts.bootstrap_nfo_cache",
+            spot=nifty_spot,
+        )
+
+    async def _one_chain(half: int, timeout_sec: float) -> dict[str, Any]:
+        if market_provider:
+            return await asyncio.wait_for(
+                market_provider.option_chain("NIFTY", expiry_str, half, half, True),
+                timeout=timeout_sec,
+            )
+        return await asyncio.wait_for(
+            asyncio.to_thread(
+                fetch_option_chain_sync,
+                kite,
+                "NIFTY",
+                expiry_str,
+                half,
+                half,
+                3,
+                None,
+            ),
+            timeout=timeout_sec,
+        )
+
+    payload: dict[str, Any] | None = None
+    try:
+        # Brief pause after index quote so we don’t burst Kite with back-to-back calls.
+        await asyncio.sleep(0.25)
+        payload = await _one_chain(_LANDING_CHAIN_STRIKES_HALF, _LANDING_CHAIN_TIMEOUT_SEC)
+    except Exception:
+        try:
+            await asyncio.sleep(0.5)
+            payload = await _one_chain(_LANDING_CHAIN_FALLBACK_HALF, _BROKER_TIMEOUT_SEC * 2.5)
+        except Exception:
+            return nifty_spot, nifty_chg, None, None, oi_walls_stub(
+                status="chain_error",
+                detail=(
+                    "NIFTY option chain failed (rate limit, timeout, or market-data session error). "
+                    "Wait 1–2 minutes, avoid hammering refresh, then retry. If it persists, "
+                    "reconnect your broker under Settings → Brokers."
+                ),
+                spot=nifty_spot,
+                expiry=expiry_str,
+            )
+
+    chain_narrow = payload
+    if payload.get("pcr") is not None:
+        pcr = float(payload.get("pcr"))
+    nifty_spot, nifty_chg = _coalesce_nifty_from_chain(nifty_spot, nifty_chg, chain_narrow)
+    spot = float(nifty_spot or payload.get("spot") or 0)
+    oi_walls = build_oi_walls_from_chain(payload.get("chain") or [], spot, expiry_str)
+
+    try:
+        await asyncio.sleep(0.15)
+        if market_provider:
+            cs = await market_provider.index_candles("NIFTY", "5minute", 2)
+            trail = []
+            for c in cs if isinstance(cs, list) else []:
+                tv = c.get("time")
+                if isinstance(tv, str) and tv:
+                    try:
+                        ts = int(datetime.fromisoformat(tv.replace("Z", "+00:00")).timestamp() * 1000)
+                    except Exception:
+                        continue
+                elif isinstance(tv, datetime):
+                    ts = int(tv.timestamp() * 1000)
+                else:
+                    continue
+                trail.append({"ts": ts, "spot": float(c.get("close") or 0)})
+        else:
+            trail = await asyncio.to_thread(fetch_nifty_spot_trail_5m_for_session_sync, kite, "NIFTY")
+    except Exception:
+        trail = []
+    if isinstance(oi_walls, dict):
+        oi_walls["spotTrail"] = trail if isinstance(trail, list) else []
+
+    return nifty_spot, nifty_chg, pcr, chain_narrow, oi_walls
 
 
 @router.get("/market-snapshot")
 async def market_snapshot(user_id: int = Depends(get_user_id)) -> dict[str, Any]:
     await ensure_user(user_id)
+    ctx = await resolve_broker_context(user_id, mode="PAPER")
     kite = await get_kite_for_quotes(user_id)
-    nifty_spot, nifty_chg, pcr, _ = await _fetch_nifty_market_and_chain(kite)
+    nifty_spot, nifty_chg, pcr, _ = await _fetch_nifty_market_and_chain(ctx.market_data, kite)
+    nifty_15m = await _fetch_nifty_15m_trend(ctx.market_data, kite)
 
     return {
         "nifty": {"spot": round(nifty_spot, 2), "changePct": round(nifty_chg, 2)},
+        "nifty15m": {
+            "changePct": nifty_15m.get("changePct"),
+            "trendLabel": nifty_15m.get("trendLabel") or "—",
+        },
         "pcr": round(pcr, 2) if pcr is not None else None,
         "sentimentLabel": _pcr_sentiment(pcr),
         "intradayTrendLabel": _spot_trend_label(nifty_chg),
@@ -295,30 +556,154 @@ async def market_snapshot(user_id: int = Depends(get_user_id)) -> dict[str, Any]
 async def decision_snapshot(user_id: int = Depends(get_user_id)) -> dict[str, Any]:
     """Phase-1 composite endpoint: market + sentiment + TrendPulse payload in one call."""
     await ensure_user(user_id)
+    md_bundle = await get_market_data_session_bundle(user_id)
+    ctx = await resolve_broker_context(user_id, mode="PAPER")
+    provider = ctx.market_data
     kite = await get_kite_for_quotes(user_id)
-    nifty_spot, nifty_chg, pcr, chain_payload = await _fetch_nifty_market_and_chain(kite)
-    tp, news_raw = await asyncio.gather(
-        trendpulse_series(user_id),
-        compute_news_sentiment_snapshot(),
-        return_exceptions=True,
+    prev_rows, _, _ = await _load_sentiment_history_rows(user_id)
+    prev_rec = prev_rows[-1] if prev_rows else None
+    prev_ms = (prev_rec or {}).get("marketSnapshot") or {}
+    prev_vix = prev_ms.get("vix")
+    prev_inputs = ((prev_rec or {}).get("sentiment") or {}).get("inputs") or {}
+    prev_ce_oi = prev_inputs.get("ceOi")
+    prev_pe_oi = prev_inputs.get("peOi")
+
+    bundle_timeout = max(4.0, min(20.0, float(os.getenv("LANDING_DECISION_BUNDLE_TIMEOUT_SEC", str(_LANDING_DECISION_BUNDLE_TIMEOUT_SEC)))))
+    news_timeout = max(4.0, min(12.0, float(os.getenv("LANDING_NEWS_TIMEOUT_SEC", "8"))))
+    tp_timeout = max(3.0, min(15.0, float(os.getenv("LANDING_TRENDPULSE_TIMEOUT_SEC", str(_LANDING_TRENDPULSE_TIMEOUT_SEC)))))
+    regime_timeout = max(2.0, min(12.0, float(os.getenv("LANDING_REGIME_CANDLES_TIMEOUT_SEC", str(_LANDING_REGIME_CANDLES_TIMEOUT_SEC)))))
+    total_budget = max(
+        8.0,
+        min(
+            45.0,
+            float(
+                os.getenv(
+                    "LANDING_DECISION_TOTAL_BUDGET_SEC",
+                    "28",
+                )
+            ),
+        ),
     )
+
+    async def _shield_wait(task: asyncio.Task[Any], cap: float) -> Any:
+        try:
+            return await asyncio.wait_for(asyncio.shield(task), timeout=float(cap))
+        except Exception as exc:
+            if not task.done():
+                task.cancel()
+            return exc
+
+    bundle_task = asyncio.create_task(
+        _fetch_nifty_decision_bundle(
+            provider,
+            kite,
+            no_broker_detail=(md_bundle["session_hint"] if not provider else None),
+        )
+    )
+    tp_task = asyncio.create_task(trendpulse_series(user_id))
+    news_task = asyncio.create_task(compute_news_sentiment_snapshot())
+    regime_task = (
+        asyncio.create_task(provider.index_candles("NIFTY", "30minute", 12))
+        if provider
+        else asyncio.create_task(_async_empty_list())
+    )
+    nifty_15m_task = (
+        asyncio.create_task(_fetch_nifty_15m_trend(provider, kite))
+        if (provider or kite)
+        else asyncio.create_task(_empty_nifty_15m_trend())
+    )
+
+    try:
+        bundle_raw, tp, news_raw, regime_candles_raw, nifty_15m_raw = await asyncio.wait_for(
+            asyncio.gather(
+                _shield_wait(bundle_task, bundle_timeout),
+                _shield_wait(tp_task, tp_timeout),
+                _shield_wait(news_task, news_timeout),
+                _shield_wait(regime_task, regime_timeout),
+                _shield_wait(nifty_15m_task, 8.0),
+            ),
+            timeout=total_budget,
+        )
+    except asyncio.TimeoutError:
+        for t in (bundle_task, tp_task, news_task, regime_task, nifty_15m_task):
+            if not t.done():
+                t.cancel()
+        bundle_raw = TimeoutError("decision_snapshot total budget")
+        tp = news_raw = regime_candles_raw = nifty_15m_raw = bundle_raw
+
+    if (
+        isinstance(bundle_raw, tuple)
+        and len(bundle_raw) == 5
+    ):
+        nifty_spot, nifty_chg, pcr, chain_payload, oi_walls = bundle_raw
+    else:
+        # Keep endpoint responsive under broker slowness; return partial snapshot.
+        nifty_spot, nifty_chg, pcr, chain_payload = 0.0, 0.0, None, None
+        oi_walls = oi_walls_stub(
+            status="chain_timeout",
+            detail="Decision bundle timed out while fetching broker chain data.",
+            spot=0.0,
+        )
     if isinstance(tp, BaseException):
-        raise tp
+        tp = {
+            "strategyId": None,
+            "strategyVersion": None,
+            "strategyType": "rule-based",
+            "trendpulseEnabled": False,
+            "series": None,
+            "htfBias": None,
+            "message": "TrendPulse snapshot timed out; retry in a few seconds.",
+        }
     news_sentiment = (
         news_sentiment_failure_payload(news_raw)
         if isinstance(news_raw, BaseException)
         else news_raw
     )
+    regime_candles: list[Any] = []
+    if isinstance(regime_candles_raw, list):
+        regime_candles = regime_candles_raw
+    nifty_15m_block: dict[str, Any] = {"changePct": None, "trendLabel": "—"}
+    if isinstance(nifty_15m_raw, dict):
+        nifty_15m_block = nifty_15m_raw
     sentiment = compute_sentiment_snapshot(
         chain_payload=chain_payload,
         spot_chg_pct=nifty_chg,
         trendpulse_signal=tp.get("tradeSignal") if isinstance(tp, dict) else None,
     )
+    vix_val: float | None = None
+    if chain_payload and chain_payload.get("vix") is not None:
+        try:
+            vix_val = float(chain_payload.get("vix"))
+        except (TypeError, ValueError):
+            vix_val = None
+    vix_prev_f: float | None = None
+    if prev_vix is not None:
+        try:
+            vix_prev_f = float(prev_vix)
+        except (TypeError, ValueError):
+            vix_prev_f = None
+    spot_for_regime = float(chain_payload.get("spot") or nifty_spot or 0) if chain_payload else float(nifty_spot or 0)
+    prev_ce_f = float(prev_ce_oi) if prev_ce_oi is not None else None
+    prev_pe_f = float(prev_pe_oi) if prev_pe_oi is not None else None
+    sideways_regime = compute_sideways_regime_snapshot(
+        candles=regime_candles,
+        spot=spot_for_regime,
+        sentiment=sentiment,
+        vix=vix_val,
+        vix_prev=vix_prev_f,
+        ce_oi_prev=prev_ce_f,
+        pe_oi_prev=prev_pe_f,
+    )
     market = {
         "nifty": {"spot": round(nifty_spot, 2), "changePct": round(nifty_chg, 2)},
+        "nifty15m": {
+            "changePct": nifty_15m_block.get("changePct"),
+            "trendLabel": nifty_15m_block.get("trendLabel") or "—",
+        },
         "pcr": round(pcr, 2) if pcr is not None else None,
         "sentimentLabel": sentiment.get("sentimentLabel") or _pcr_sentiment(pcr),
         "intradayTrendLabel": _spot_trend_label(nifty_chg),
+        "vix": round(vix_val, 2) if vix_val is not None else None,
     }
     updated_at = datetime.utcnow().isoformat() + "Z"
     strategy_day_fit = await attach_strategy_day_fit_to_snapshot(
@@ -332,6 +717,8 @@ async def decision_snapshot(user_id: int = Depends(get_user_id)) -> dict[str, An
         "trendpulse": tp,
         "strategyDayFit": strategy_day_fit,
         "newsSentiment": news_sentiment,
+        "oiWalls": oi_walls,
+        "sidewaysRegime": sideways_regime,
         "updatedAt": updated_at,
     }
     await _append_sentiment_history(
@@ -387,8 +774,10 @@ async def trendpulse_series(user_id: int = Depends(get_user_id)) -> dict[str, An
     htf_es = int(tpc.get("htfEmaSlow", 34))
     adx_min = float(tpc.get("adxMin", 18))
 
+    ctx = await resolve_broker_context(user_id, mode="PAPER")
+    provider = ctx.market_data
     kite = await get_kite_for_quotes(user_id)
-    if not kite:
+    if not provider:
         return {
             "strategyId": sid,
             "strategyVersion": ver,
@@ -401,11 +790,11 @@ async def trendpulse_series(user_id: int = Depends(get_user_id)) -> dict[str, An
 
     try:
         st_candles = await asyncio.wait_for(
-            asyncio.to_thread(fetch_index_candles_sync, kite, "NIFTY", st_int, days),
+            provider.index_candles("NIFTY", st_int, days),
             timeout=_BROKER_TIMEOUT_SEC,
         )
         htf_candles = await asyncio.wait_for(
-            asyncio.to_thread(fetch_index_candles_sync, kite, "NIFTY", htf_int, days),
+            provider.index_candles("NIFTY", htf_int, days),
             timeout=_BROKER_TIMEOUT_SEC,
         )
     except Exception:
@@ -431,7 +820,7 @@ async def trendpulse_series(user_id: int = Depends(get_user_id)) -> dict[str, An
     )
     try:
         _, nifty_chg, pcr_lp, _ = await asyncio.wait_for(
-            _fetch_nifty_market_and_chain(kite),
+            _fetch_nifty_market_and_chain(provider, kite),
             timeout=_BROKER_TIMEOUT_SEC,
         )
     except Exception:

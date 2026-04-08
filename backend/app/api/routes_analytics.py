@@ -1,53 +1,21 @@
-import asyncio
 import os
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from kiteconnect import KiteConnect
 
-from app.api.auth_context import get_user_id, require_admin
-from app.db_client import fetchrow
+from app.api.auth_context import require_admin
+from app.services.broker_runtime import resolve_broker_context
+from app.services.market_data_kite_session import get_market_data_session_bundle
 from app.services.option_chain_zerodha import (
-    fetch_indices_spot_sync,
-    fetch_option_chain_sync,
     get_expiries_for_analytics,
-    verify_kite_session_sync,
 )
 
 router = APIRouter(prefix="/analytics", tags=["analytics"])
 
 
-async def _get_kite_client_or_none(user_id: int) -> KiteConnect | None:
-    row = await fetchrow(
-        """
-        SELECT credentials_json FROM s004_user_master_settings
-        WHERE user_id = $1
-        """,
-        user_id,
-    )
-    cred = row["credentials_json"] if row else None
-    if isinstance(cred, str):
-        import json
-
-        try:
-            cred = json.loads(cred)
-        except json.JSONDecodeError:
-            cred = {}
-    if not isinstance(cred, dict):
-        cred = {}
-
-    api_key = str(cred.get("apiKey", "")).strip() or os.getenv("ZERODHA_API_KEY")
-    access_token = str(cred.get("accessToken", "")).strip() or os.getenv("ZERODHA_ACCESS_TOKEN")
-    if not api_key or not access_token:
-        return None
-    kite = KiteConnect(api_key=api_key)
-    kite.set_access_token(access_token)
-    return kite
-
-
 @router.get("/config")
 async def get_analytics_config(user_id: int = Depends(require_admin)) -> dict:
-    refresh = int(os.getenv("OPTION_CHAIN_REFRESH_SECONDS", "15"))
+    refresh = int(os.getenv("OPTION_CHAIN_REFRESH_SECONDS", "30"))
     refresh = max(5, min(300, refresh))
     live_required = os.getenv("OPTION_CHAIN_REQUIRE_LIVE", "1").strip().lower() not in {"0", "false", "no"}
     from app.services.option_chain_zerodha import _window_size
@@ -72,46 +40,57 @@ async def get_expiries(
     user_id: int = Depends(require_admin),
 ) -> dict:
     inst = instrument.strip().upper()
-    kite = await _get_kite_client_or_none(user_id)
-    session_ok = await asyncio.to_thread(verify_kite_session_sync, kite)
-    # Invalid/expired token: do not use broker expiry list (would mislead); use estimated fallback.
-    kite_for_list = kite if session_ok else None
-    expiries, source = get_expiries_for_analytics(kite_for_list, inst)
-    creds_present = bool(kite)
+    bundle = await get_market_data_session_bundle(user_id)
+    ctx = await resolve_broker_context(user_id, mode="PAPER")
+    provider = ctx.market_data
+    session_ok = bundle["broker_session_ok"]
+    if provider:
+        try:
+            expiries, source = await provider.expiries(inst)
+        except Exception:
+            expiries, source = get_expiries_for_analytics(None, inst)
+    else:
+        expiries, source = get_expiries_for_analytics(None, inst)
     return {
         "instrument": inst,
         "expiries": expiries,
         "expiry_source": source,
         "broker_session_ok": session_ok,
-        "credentials_present": creds_present,
+        "credentials_present": bundle["credentials_present"],
+        "active_broker": bundle["active_broker"],
+        "market_data_quote_source": bundle["market_data_quote_source"],
+        "platform_shared_broker_code": bundle.get("platform_shared_broker_code"),
+        "session_hint": bundle["session_hint"],
     }
 
 
 @router.get("/broker-status")
 async def get_broker_status(user_id: int = Depends(require_admin)) -> dict:
     """Lightweight session check for Option Chain UI (token valid vs missing/expired)."""
-    kite = await _get_kite_client_or_none(user_id)
-    session_ok = await asyncio.to_thread(verify_kite_session_sync, kite)
+    bundle = await get_market_data_session_bundle(user_id)
     return {
-        "credentials_present": bool(kite),
-        "broker_session_ok": session_ok,
-        "message": (
-            "Zerodha session is active."
-            if session_ok
-            else (
-                "API credentials or access token missing. Add them in Settings."
-                if not kite
-                else "Access token invalid or expired. Reconnect Zerodha in Settings."
-            )
-        ),
+        "credentials_present": bundle["credentials_present"],
+        "broker_session_ok": bundle["broker_session_ok"],
+        "active_broker": bundle["active_broker"],
+        "market_data_quote_source": bundle["market_data_quote_source"],
+        "platform_shared_broker_code": bundle.get("platform_shared_broker_code"),
+        "session_hint": bundle["session_hint"],
+        "message": bundle["session_hint"],
     }
 
 
 @router.get("/indices")
 async def get_indices(user_id: int = Depends(require_admin)) -> dict:
-    kite = await _get_kite_client_or_none(user_id)
-    data = await asyncio.to_thread(fetch_indices_spot_sync, kite)
-    return data
+    ctx = await resolve_broker_context(user_id, mode="PAPER")
+    provider = ctx.market_data
+    if not provider:
+        return {
+            "NIFTY": {"spot": 0.0, "spotChgPct": 0.0},
+            "BANKNIFTY": {"spot": 0.0, "spotChgPct": 0.0},
+            "FINNIFTY": {"spot": 0.0, "spotChgPct": 0.0},
+            "SENSEX": {"spot": 0.0, "spotChgPct": 0.0},
+        }
+    return await provider.indices()
 
 
 @router.get("/summary")
@@ -140,19 +119,29 @@ async def get_option_chain(
     if inst not in {"NIFTY", "BANKNIFTY", "FINNIFTY", "SENSEX"}:
         raise HTTPException(status_code=400, detail="Invalid instrument.")
     try:
-        kite = await _get_kite_client_or_none(user_id)
-        if kite and not await asyncio.to_thread(verify_kite_session_sync, kite):
-            live_required = os.getenv("OPTION_CHAIN_REQUIRE_LIVE", "1").strip().lower() not in {"0", "false", "no"}
-            if live_required:
-                raise HTTPException(
-                    status_code=401,
-                    detail="Zerodha access token is missing, invalid, or expired. Open Settings and reconnect Kite, then refresh.",
-                )
-            kite = None
-        return await asyncio.to_thread(fetch_option_chain_sync, kite, inst, expiry, strikes_up, strikes_down)
+        live_required = os.getenv("OPTION_CHAIN_REQUIRE_LIVE", "1").strip().lower() not in {"0", "false", "no"}
+        bundle = await get_market_data_session_bundle(user_id)
+        ctx = await resolve_broker_context(user_id, mode="PAPER")
+        provider = ctx.market_data
+        if live_required:
+            if not provider or not bundle["broker_session_ok"]:
+                raise HTTPException(status_code=401, detail=bundle["session_hint"])
+        if not provider:
+            raise HTTPException(status_code=401, detail=bundle["session_hint"])
+        payload = await provider.option_chain(inst, expiry, strikes_up, strikes_down, live_required)
+        if isinstance(payload, dict):
+            payload.setdefault("broker_session_ok", bundle["broker_session_ok"])
+            payload.setdefault("credentials_present", bundle["credentials_present"])
+            payload.setdefault("active_broker", bundle["active_broker"])
+            payload.setdefault("market_data_quote_source", bundle["market_data_quote_source"])
+            payload.setdefault("platform_shared_broker_code", bundle.get("platform_shared_broker_code"))
+            payload.setdefault("session_hint", bundle["session_hint"])
+        return payload
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Option chain fetch failed: {e}")

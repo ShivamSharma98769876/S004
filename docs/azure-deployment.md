@@ -1,6 +1,12 @@
-# Deploy S004 on Azure App Service (code / Web App — no Docker)
+# Deploy S004 on Azure App Service
 
-This guide uses **two Linux Web Apps**: one for the **FastAPI** backend and one for the **Next.js** frontend. No container registry is required.
+**Single Web App (recommended if you want one URL):** use **Docker** — see **[azure-deployment-docker.md](azure-deployment-docker.md)** (nginx + Next + FastAPI in one image; workflow **`.github/workflows/main_a004.yml`**).
+
+---
+
+## Two code Web Apps (no Docker, no container registry)
+
+This section uses **two Linux Web Apps**: one for the **FastAPI** backend and one for the **Next.js** frontend.
 
 How traffic flows:
 
@@ -100,7 +106,9 @@ Provision **Azure Database for PostgreSQL** (Flexible Server). Run your schema/s
 - **Deployment Center**: connect the repo twice (different Web Apps) or use monorepo build steps with different `app-path` outputs.
 - **Without Oryx**: use the sample workflow [`.github/workflows/azure-webapps-deploy-no-oryx.yml`](../.github/workflows/azure-webapps-deploy-no-oryx.yml) (`workflow_dispatch`) or the patterns in [Azure actions-workflow-samples — App Service](https://github.com/Azure/actions-workflow-samples/tree/master/AppService).
 
-### Secrets for API deploy workflows (e.g. `main_s004.yml`, `main_a004.yml`)
+### Secrets for zip-based API deploy workflows (e.g. `main_s004.yml`)
+
+Docker deploy uses **[azure-deployment-docker.md](azure-deployment-docker.md)** secrets (`ACR_*`, `AZURE_WEBAPP_NAME`, `AZURE_WEBAPP_PUBLISH_PROFILE`).
 
 | Secret | Value |
 |--------|--------|
@@ -136,9 +144,9 @@ See [Azure actions-workflow-samples — App Service](https://github.com/Azure/ac
 
 ---
 
-## 7. Optional: single Web App via Docker later
+## 7. Single Web App via Docker
 
-If you later want **one URL** and **one** Web App without split rewrites, you can use the repo **`Dockerfile`** (nginx + Next + API) and switch that Web App to **Container** deployment. The files under `deploy/` and `Dockerfile` are for that path only.
+Use the repo **`Dockerfile`** and **`deploy/`** (nginx + Next + FastAPI on port **8080**). Full steps, app settings, and GitHub secrets: **[azure-deployment-docker.md](azure-deployment-docker.md)**.
 
 ---
 

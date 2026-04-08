@@ -36,29 +36,36 @@ SHORT_PREMIUM_DELTA_VIX_BANDS: dict[str, Any] = {
 STRIKE_DESCRIPTION = (
     "India VIX first; delta-only strike ladder. VIX>17 → CE +0.29..+0.35, PE -0.35..-0.29; "
     "VIX≤17 → CE +0.33..+0.40, PE -0.40..-0.33. Regime: same for CE/PE — fresh EMA9<EMA21 cross + LTP<VWAP on leg. "
-    "shortPremiumRsiDirectBand: leg RSI in indicators.rsi min–max (65–100). IVR band on chain ivr. "
+    "shortPremiumRsiDecreasing: leg RSI < shortPremiumRsiBelow (80) and falling vs prior bar. IVR band on chain ivr. "
     "±strikes/side floor 12 (env S004_SHORT_PREMIUM_DELTA_ONLY_STRIKES_EACH_SIDE). DTE≥2; Tue weekly; min gamma; three_factor + skew/PCR."
 )
 IVR_BLOCK: dict[str, Any] = {
-    "minThreshold": 55,
+    "minThreshold": 40,
     "maxLegThreshold": 100,
     "description": "Per-strike chain IVR must be between minThreshold and maxLegThreshold (inclusive).",
 }
 RSI_BLOCK: dict[str, Any] = {
     "period": 14,
-    "min": 65,
+    "min": 0,
     "max": 100,
-    "description": "Option-leg RSI (on LTP series). With shortPremiumRsiDirectBand=true, leg RSI must lie in [min, max] (overbought band).",
+    "description": "Option-leg RSI on LTP series (period). With shortPremiumRsiDecreasing=true and three_factor, leg RSI must be < shortPremiumRsiBelow and falling vs the prior bar.",
+}
+EMA_CROSS_BLOCK: dict[str, Any] = {
+    "bonus": 0,
+    "maxCandlesSinceCross": 8,
+    "description": "Fresh cross within this many candles on the leg LTP series.",
 }
 TOP_DESCRIPTION = (
     "NIFTY short premium. Per-leg regime on option LTP: fresh EMA9 cross below EMA21 within emaCrossover.maxCandlesSinceCross "
     "and last close < leg VWAP for both sell-CE and sell-PE (symmetric). If both legs qualify at one strike, the more recent "
-    "cross wins. VIX→delta via shortPremiumDeltaVixBands; leg RSI band via indicators.rsi when shortPremiumRsiDirectBand. "
+    "cross wins. VIX→delta via shortPremiumDeltaVixBands; leg RSI when shortPremiumRsiDecreasing: RSI < shortPremiumRsiBelow "
+    "and RSI strictly below prior-bar leg RSI (same period as indicators.rsi). "
     "Per-strike chain IVR in [ivr.minThreshold, maxLegThreshold]. No ADX; no min OI/volume when both are 0."
 )
 SCORE_DESC = (
     "Symmetric sell CE/PE: regimeSellPe/Ce = fresh EMA9 cross below EMA21 + LTP < leg VWAP (tie-break if both). "
-    "Leg RSI in [indicators.rsi.min, max] when shortPremiumRsiDirectBand. Leg IVR in [ivr.minThreshold, maxLegThreshold]. "
+    "Leg RSI below shortPremiumRsiBelow and decreasing vs prior bar when shortPremiumRsiDecreasing. "
+    "Leg IVR in [ivr.minThreshold, maxLegThreshold]. "
     "three_factor technical up to 3 points + skew/PCR bonuses. Auto-trade at autoTradeScoreThreshold."
 )
 
@@ -75,7 +82,11 @@ def merge(details: dict[str, Any]) -> dict[str, Any]:
     strike["deltaMaxAbs"] = 0.35
     strike["shortPremiumDeltaVixBands"] = deepcopy(SHORT_PREMIUM_DELTA_VIX_BANDS)
     strike["shortPremiumDeltaOnlyStrikes"] = True
-    strike["shortPremiumRsiDirectBand"] = True
+    strike["shortPremiumRsiDirectBand"] = False
+    strike["shortPremiumRsiDecreasing"] = True
+    strike["shortPremiumRsiBelow"] = 80
+    strike["selectStrikeByMinGamma"] = True
+    strike["maxStrikeRecommendations"] = 3
     if "shortPremiumAsymmetricDatm" not in strike:
         strike["shortPremiumAsymmetricDatm"] = False
     strike["description"] = STRIKE_DESCRIPTION
@@ -85,6 +96,7 @@ def merge(details: dict[str, Any]) -> dict[str, Any]:
         out["indicators"] = ind
     ind["ivr"] = deepcopy(IVR_BLOCK)
     ind["rsi"] = deepcopy(RSI_BLOCK)
+    ind["emaCrossover"] = deepcopy(EMA_CROSS_BLOCK)
     return out
 
 

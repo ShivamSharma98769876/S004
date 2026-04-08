@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 # Canonical catalog JSON (keep in sync with db/migrations/functional_seed.sql TrendSnap block).
 TRENDSNAP_CATALOG_DETAILS: dict = {
     "displayName": "TrendSnap Momentum",
-    "description": "Four-factor option read on the latest candle: close above VWAP (required gate), EMA9 above EMA21, RSI 50-75, volume above 1.02x average. RSI must be in band for eligibility (not score-only). NIFTY spot trend must align: bullish for CE, bearish for PE. Early session uses relaxed min contract volume until 10:00 IST. Exits use SL, target, and breakeven from Settings.",
+    "description": "Four-factor option read on the latest candle: close above VWAP (required gate), EMA9 above EMA21, RSI 50-75, volume above 1.02x average. RSI must be in band for eligibility (not score-only). NIFTY spot trend must align: bullish for CE, bearish for PE. Strike choice ranks eligible legs by score then option flow (landing CE/PE tilt, OI/volume, OI change, Long Buildup). Early session uses relaxed min contract volume until 10:00 IST. Exits use SL, target, and breakeven from Settings.",
     "requireRsiForEligible": True,
     "longPremiumSpotAlign": True,
     "includeEmaCrossoverInScore": False,
@@ -57,12 +57,27 @@ TRENDSNAP_CATALOG_DETAILS: dict = {
         "maxOtmSteps": 3,
         "deltaPreferredCE": 0.45,
         "deltaPreferredPE": -0.45,
-        "description": "Liquidity: min OI 5k, min volume 300 (120 until 10:00 IST). Max 2 eligible strikes per refresh. Max 3 steps OTM. Prefer delta near 0.45 CE / -0.45 PE; rank by score and fit.",
+        "flowRanking": {
+            "enabled": True,
+            "useChainFlowTilt": True,
+            "tiltWeight": 0.22,
+            "percentileOiWeight": 1.0,
+            "percentileVolWeight": 1.0,
+            "oiChgScaleWeight": 0.12,
+            "longBuildupBonus": 0.28,
+            "shortCoveringBonus": 0.24,
+            "pinPenaltyOnExpiryDay": True,
+            "pinMaxDistanceFromSpot": 150,
+            "pinOiDominanceRatio": 1.2,
+            "pinPenaltyWeight": 0.18,
+            "description": "Flow tilt, OI/vol percentiles, buildup/covering; on expiry day (DTE 0 IST) soft pin penalty at dominant near-spot OI wall — no hard ban.",
+        },
+        "description": "Liquidity: min OI 5k, min volume 300 (120 until 10:00 IST). Max 2 eligible strikes per refresh. Max 3 steps OTM. Prefer delta near 0.45 CE / -0.45 PE; rank by score, then flow ranking (OI/vol/ΔOI + landing flow tilt).",
     },
     "scoreThreshold": 3,
     "scoreMax": 4,
     "autoTradeScoreThreshold": 4,
-    "scoreDescription": "Primary: latest option close must be above VWAP (otherwise no signal). Score 0-4: +1 VWAP pass, +1 EMA9 above EMA21, +1 RSI 50-75, +1 volume above 1.02x average. No crossover or IVR points. Eligible BUY when score >= 3 AND RSI in 50-75 AND NIFTY spot regime matches leg (bullish/CE, bearish/PE). Auto-execute still requires autoTradeScoreThreshold.",
+    "scoreDescription": "Primary: latest option close must be above VWAP (otherwise no signal). Score 0-4: +1 VWAP pass, +1 EMA9 above EMA21, +1 RSI 50-75, +1 volume above 1.02x average. No crossover or IVR points. Eligible BUY when score >= 3 AND RSI in 50-75 AND NIFTY spot regime matches leg (bullish/CE, bearish/PE). Among ties, strikes rank by flow (landing-style CE/PE tilt, OI/vol percentiles, OI change, Long Buildup). Auto-execute still requires autoTradeScoreThreshold.",
 }
 
 

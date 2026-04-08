@@ -2,7 +2,16 @@
 
 from __future__ import annotations
 
+import statistics
 from typing import Any
+
+from app.services.option_chain_zerodha import (
+    _adx_from_candles,
+    _true_range_series,
+    _vwap_from_candles_equal_bar_weight,
+    _wilder_smooth_list,
+    nifty_index_candles_current_session,
+)
 
 
 def _to_float(v: Any, default: float = 0.0) -> float:
@@ -423,5 +432,167 @@ def compute_sentiment_snapshot(
             "peOi": int(round(pe_oi)),
             "ceVol": int(round(ce_vol)),
             "peVol": int(round(pe_vol)),
+        },
+    }
+
+
+def compute_sideways_regime_snapshot(
+    *,
+    candles: list[dict[str, Any]],
+    spot: float,
+    sentiment: dict[str, Any],
+    vix: float | None,
+    vix_prev: float | None,
+    ce_oi_prev: float | None,
+    pe_oi_prev: float | None,
+    adx_period: int = 14,
+    atr_period: int = 14,
+) -> dict[str, Any]:
+    """Landing sideways vs trending/volatile read using existing ADX/TR/VWAP helpers + sentiment OI skew."""
+    need = adx_period + 3
+    if not candles or len(candles) < need:
+        return {
+            "enabled": False,
+            "message": "Need more NIFTY 30-minute candles from the broker to score this read.",
+            "regimeLabel": "—",
+            "score": 0,
+            "maxScore": 6,
+            "checks": [],
+            "metrics": {},
+            "timeframe": "30m",
+        }
+
+    adx = float(_adx_from_candles(candles, adx_period))
+    tr_series = _true_range_series(candles)
+    atr_s = _wilder_smooth_list(tr_series, atr_period) if len(tr_series) >= atr_period + 1 else []
+    atr_now = float(atr_s[-1]) if atr_s else 0.0
+    atr_rising_fast = False
+    if len(atr_s) >= 6 and float(atr_s[-5]) > 1e-9:
+        atr_rising_fast = (float(atr_s[-1]) - float(atr_s[-5])) / float(atr_s[-5]) > 0.12
+
+    session = nifty_index_candles_current_session(candles)
+    vw_basis = session if len(session) >= 2 else candles[-min(48, len(candles)) :]
+    vwap = float(_vwap_from_candles_equal_bar_weight(vw_basis))
+    last_close = float(vw_basis[-1].get("close") or spot or 0) if vw_basis else float(spot or 0)
+
+    k = min(5, len(vw_basis))
+    closes_tail = [float(x.get("close") or 0) for x in vw_basis[-k:]] if k else []
+    vw_dist_pct = abs(last_close - vwap) / vwap * 100.0 if vwap > 0 else 0.0
+    vw_trending = False
+    if k >= 3 and vwap > 0:
+        all_above = all(c >= vwap * 1.00025 for c in closes_tail)
+        all_below = all(c <= vwap * 0.99975 for c in closes_tail)
+        vw_trending = all_above or all_below
+    vw_near = (not vw_trending) and vw_dist_pct <= 0.15
+
+    tail_n = min(14, len(candles))
+    bar_ranges: list[float] = []
+    for c in candles[-tail_n:]:
+        h = float(c.get("high") or 0)
+        l_ = float(c.get("low") or 0)
+        if h > 0 and l_ >= 0 and h >= l_:
+            bar_ranges.append(h - l_)
+    range_compressed = False
+    range_expanding = False
+    if len(bar_ranges) >= 2:
+        cur_r = bar_ranges[-1]
+        avg_prev = statistics.mean(bar_ranges[:-1])
+        if avg_prev > 0:
+            range_compressed = cur_r < avg_prev * 0.92
+            range_expanding = cur_r > avg_prev * 1.18
+
+    inp = sentiment.get("inputs") or {}
+    ce_oi = float(inp.get("ceOi") or 0)
+    pe_oi = float(inp.get("peOi") or 0)
+    oi_intel = sentiment.get("optionsIntel") or {}
+    oi_dom = str(oi_intel.get("oiDominant") or "EVEN")
+    both_rising = False
+    if (
+        ce_oi_prev is not None
+        and pe_oi_prev is not None
+        and ce_oi_prev >= 0
+        and pe_oi_prev >= 0
+    ):
+        both_rising = ce_oi > ce_oi_prev and pe_oi > pe_oi_prev
+    oi_sideways = both_rising and oi_dom == "EVEN"
+
+    iv_sideways = False
+    iv_rising_fast = False
+    if vix is not None and vix_prev is not None:
+        iv_rising_fast = (float(vix) - float(vix_prev)) >= 0.85
+        iv_stable = abs(float(vix) - float(vix_prev)) <= 0.55
+        iv_high = float(vix) >= 11.0
+        iv_sideways = iv_high and iv_stable and not iv_rising_fast
+
+    s_adx = 1 if adx < 20 else 0
+    s_atr = 0 if atr_rising_fast else 1
+    s_vwap = 1 if vw_near else 0
+    s_range = 1 if range_compressed and not range_expanding else 0
+    s_oi = 1 if oi_sideways else 0
+    s_iv = 1 if iv_sideways else 0
+
+    score = s_adx + s_atr + s_vwap + s_range + s_oi + s_iv
+    regime_label = "SIDEWAYS" if score >= 4 else "TRENDING_VOLATILE"
+
+    checks: list[dict[str, Any]] = [
+        {
+            "key": "adx",
+            "label": "ADX",
+            "pass": bool(s_adx),
+            "reading": f"{adx:.1f} (want <20 for chop)",
+        },
+        {
+            "key": "atr",
+            "label": "ATR",
+            "pass": bool(s_atr),
+            "reading": "stable / slower on 30m" if s_atr else "rising fast vs prior 30m bars",
+        },
+        {
+            "key": "vwap",
+            "label": "vs VWAP",
+            "pass": bool(s_vwap),
+            "reading": f"dist {vw_dist_pct:.2f}% · {'one-sided hold' if vw_trending else 'near / two-sided'}",
+        },
+        {
+            "key": "range",
+            "label": "30m range",
+            "pass": bool(s_range),
+            "reading": "compressed vs avg" if s_range else ("expanding" if range_expanding else "neutral"),
+        },
+        {
+            "key": "oi",
+            "label": "CE/PE OI",
+            "pass": bool(s_oi),
+            "reading": "both up & balanced" if s_oi else (f"skew {oi_dom}" if oi_dom != "EVEN" else "need both legs rising vs prior poll"),
+        },
+        {
+            "key": "iv",
+            "label": "VIX",
+            "pass": bool(s_iv),
+            "reading": "elevated & calm vs last poll" if s_iv else ("spiking" if iv_rising_fast else "need prior VIX in history"),
+        },
+    ]
+
+    return {
+        "enabled": True,
+        "message": None,
+        "regimeLabel": regime_label,
+        "score": score,
+        "maxScore": 6,
+        "timeframe": "30m",
+        "checks": checks,
+        "metrics": {
+            "adx": round(adx, 2),
+            "atr": round(atr_now, 4),
+            "atrRisingFast": atr_rising_fast,
+            "vwap": round(vwap, 2) if vwap else None,
+            "lastClose": round(last_close, 2),
+            "vwapDistPct": round(vw_dist_pct, 3),
+            "rangeCompressed": range_compressed,
+            "rangeExpanding": range_expanding,
+            "oiDominant": oi_dom,
+            "ceOi": int(round(ce_oi)),
+            "peOi": int(round(pe_oi)),
+            "vix": round(float(vix), 2) if vix is not None else None,
         },
     }

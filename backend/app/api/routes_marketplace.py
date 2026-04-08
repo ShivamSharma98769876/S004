@@ -17,12 +17,17 @@ from app.api.schemas import (
     SubscriptionResponse,
 )
 from app.services.marketplace_service import list_strategies_for_user, upsert_subscription
+from app.services.trades_service import invalidate_recommendation_cache
 
 router = APIRouter(prefix="/marketplace", tags=["marketplace"])
 
 
 class StrategyStatusPayload(BaseModel):
     publish_status: str
+
+
+class StrategyIntentPayload(BaseModel):
+    position_intent: str
 
 
 @router.get("/strategies")
@@ -75,7 +80,76 @@ async def update_subscription(
         mode=mode,
         status=target_status,
     )
+    invalidate_recommendation_cache(user_id)
     return SubscriptionResponse(status="ok", subscription_status=target_status)
+
+
+@router.put("/strategies/{strategy_id}/{version}/intent")
+async def update_strategy_intent(
+    strategy_id: str,
+    version: str,
+    payload: StrategyIntentPayload,
+    user_id: int = Depends(get_user_id),
+) -> dict:
+    await ensure_user(user_id)
+    intent = str(payload.position_intent or "").strip().lower()
+    if intent not in {"long_premium", "short_premium"}:
+        raise HTTPException(status_code=400, detail="position_intent must be long_premium or short_premium")
+    from app.services.marketplace_service import ensure_user_strategy_settings
+
+    await ensure_user_strategy_settings(user_id, strategy_id, version)
+    row = await fetchrow(
+        """
+        SELECT strategy_details_json
+        FROM s004_user_strategy_settings
+        WHERE user_id = $1 AND strategy_id = $2 AND strategy_version = $3
+        """,
+        user_id,
+        strategy_id,
+        version,
+    )
+    details: dict[str, object] = {}
+    raw = row.get("strategy_details_json") if row else None
+    if isinstance(raw, dict):
+        details = dict(raw)
+    elif isinstance(raw, str):
+        try:
+            v = json.loads(raw) if raw else {}
+            details = v if isinstance(v, dict) else {}
+        except json.JSONDecodeError:
+            details = {}
+    # Final-action override only (does not switch scoring model/gates).
+    details["tradeActionIntent"] = intent
+    # Remove legacy override key if present to avoid forcing full short-premium model.
+    if "positionIntent" in details:
+        details.pop("positionIntent", None)
+    await execute(
+        """
+        UPDATE s004_user_strategy_settings
+        SET strategy_details_json = $1::jsonb, updated_at = NOW()
+        WHERE user_id = $2 AND strategy_id = $3 AND strategy_version = $4
+        """,
+        json.dumps(details),
+        user_id,
+        strategy_id,
+        version,
+    )
+    # Remove stale generated rows from previous intent so next cycle regenerates
+    # side/target/SL consistently with the new strategy intent.
+    await execute(
+        """
+        DELETE FROM s004_trade_recommendations
+        WHERE user_id = $1
+          AND strategy_id = $2
+          AND strategy_version = $3
+          AND status = 'GENERATED'
+        """,
+        user_id,
+        strategy_id,
+        version,
+    )
+    invalidate_recommendation_cache(user_id)
+    return {"status": "ok", "strategy_id": strategy_id, "version": version, "position_intent": intent}
 
 
 @router.get("/strategies/{strategy_id}/{version}/details")

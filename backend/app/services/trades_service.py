@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
+import math
 import os
 import time
 from datetime import date, datetime, timedelta, timezone
@@ -39,6 +41,8 @@ from app.services.option_chain_zerodha import (
     fetch_option_chain_sync,
     pick_expiry_with_min_calendar_dte,
     pick_primary_expiry_str,
+    resolve_expiry_min_dte_weekday_with_fallback,
+    verify_kite_session_sync,
 )
 from app.services.trendpulse_phase3 import (
     apply_trendpulse_hard_gates,
@@ -53,9 +57,53 @@ from app.services.trendpulse_tier2 import (
 from app.services.trendpulse_z import evaluate_trendpulse_signal
 from app.services.market_micro_snapshot import build_market_context_for_log, entry_snapshot_from_rec_and_market
 from app.services.evaluation_log import append_evaluation_event
+from app.services.sentiment_engine import compute_sentiment_snapshot
 
 _logger = logging.getLogger(__name__)
 _EVAL_IST = ZoneInfo("Asia/Kolkata")
+
+
+def _normalize_sorted_expiries(expiries: list[Any]) -> list[str]:
+    parsed: list[tuple[date, str]] = []
+    seen: set[str] = set()
+    for raw in expiries:
+        label = str(raw or "").strip().upper()
+        if not label:
+            continue
+        try:
+            exp_day = datetime.strptime(label, "%d%b%Y").date()
+        except ValueError:
+            continue
+        if label in seen:
+            continue
+        seen.add(label)
+        parsed.append((exp_day, label))
+    parsed.sort(key=lambda x: x[0])
+    return [lbl for _, lbl in parsed]
+
+
+def _pick_expiry_from_provider_list(
+    expiries: list[Any],
+    *,
+    min_dte_calendar_days: int,
+    nifty_weekly_expiry_weekday: int | None,
+) -> str | None:
+    normalized = _normalize_sorted_expiries(expiries)
+    if not normalized:
+        return None
+    if int(min_dte_calendar_days) <= 0:
+        return normalized[0]
+    try:
+        wd = int(nifty_weekly_expiry_weekday) if nifty_weekly_expiry_weekday is not None else None
+    except (TypeError, ValueError):
+        wd = None
+    today_ist = datetime.now(_EVAL_IST).date()
+    return resolve_expiry_min_dte_weekday_with_fallback(
+        normalized,
+        today_ist,
+        min_dte_days=int(min_dte_calendar_days),
+        weekday=wd,
+    )
 
 
 def _slim_candidate_for_evaluation_log(r: dict[str, Any]) -> dict[str, Any]:
@@ -82,6 +130,9 @@ def _slim_candidate_for_evaluation_log(r: dict[str, Any]) -> dict[str, Any]:
         "ema21": r.get("ema21"),
         "vwap": r.get("vwap"),
         "rsi": r.get("rsi"),
+        "buildup": r.get("buildup"),
+        "flow_rank_score": r.get("flow_rank_score"),
+        "flow_pin_penalized": r.get("flow_pin_penalized"),
     }
 
 
@@ -149,50 +200,34 @@ def _emit_evaluation_snapshot(
 
 
 async def _get_kite_for_user(user_id: int) -> KiteConnect | None:
-    row = await fetchrow(
-        "SELECT credentials_json FROM s004_user_master_settings WHERE user_id = $1",
-        user_id,
-    )
-    if not row:
-        return None
-    cred = row.get("credentials_json")
-    if isinstance(cred, str):
-        try:
-            cred = json.loads(cred)
-        except json.JSONDecodeError:
-            return None
-    if not isinstance(cred, dict):
-        return None
-    api_key = str(cred.get("apiKey", "")).strip()
-    access_token = str(cred.get("accessToken", "")).strip()
-    if not api_key or not access_token:
-        return None
-    kite = KiteConnect(api_key=api_key)
-    kite.set_access_token(access_token)
-    return kite
+    """User-scoped Zerodha Kite only (no server env fallback)."""
+    from app.services import broker_accounts as ba
+
+    return await ba.user_zerodha_kite(user_id, env_fallback=False)
 
 
 async def _get_kite_for_any_user() -> KiteConnect | None:
-    """Get Kite from any user who has credentials (prefer ADMIN). Used to generate shared recommendations."""
-    rows = await fetch(
-        """
-        SELECT m.user_id FROM s004_user_master_settings m
-        JOIN s004_users u ON u.id = m.user_id
-        WHERE m.credentials_json IS NOT NULL
-        ORDER BY CASE WHEN u.role = 'ADMIN' THEN 0 ELSE 1 END, m.user_id
-        LIMIT 5
-        """
-    )
-    for r in rows or []:
-        kite = await _get_kite_for_user(int(r["user_id"]))
-        if kite:
-            return kite
-    return None
+    """Platform shared Zerodha only (admin paper pool)."""
+    from app.services import broker_accounts as ba
+
+    return await ba.platform_shared_zerodha_kite()
+
+
+async def get_kite_for_quotes_with_source(user_id: int) -> tuple[KiteConnect | None, str]:
+    """Compatibility helper: returns Kite client only when resolved provider is Zerodha."""
+    from app.services.broker_runtime import ZerodhaProvider, resolve_broker_context
+
+    ctx = await resolve_broker_context(user_id, mode="PAPER")
+    provider = ctx.market_data
+    if isinstance(provider, ZerodhaProvider):
+        return provider.kite, ctx.source
+    return None, ctx.source
 
 
 async def get_kite_for_quotes(user_id: int) -> KiteConnect | None:
-    """Return Shared API (Admin's Kite) for quotes/LTP. Per policy: users without valid broker connection use Shared API for Paper; only Live execution requires user's own connection."""
-    return await _get_kite_for_any_user()
+    """Quotes/LTP: user's Zerodha vault; else admin platform-shared Zerodha; no env/pool default."""
+    kite, _ = await get_kite_for_quotes_with_source(user_id)
+    return kite
 
 
 _REC_DETAILS_CACHE: dict[int, dict[str, dict]] = {}
@@ -222,12 +257,41 @@ def _enrich_recommendation_item_from_storage(item: dict[str, Any], user_id: int)
         item.update(merged)
     return item
 _REC_CACHE_TS: dict[int, float] = {}
+# Serialize ensure_recommendations per user so 20s UI polls cannot overlap a slow chain fetch (Kite 429 / zero rows / cleared GENERATED).
+_REC_ENSURE_LOCKS: dict[int, asyncio.Lock] = {}
+
+
+def _ensure_lock_for(user_id: int) -> asyncio.Lock:
+    lk = _REC_ENSURE_LOCKS.get(user_id)
+    if lk is None:
+        lk = asyncio.Lock()
+        _REC_ENSURE_LOCKS[user_id] = lk
+    return lk
+
+
+# Chain/regen cadence: UI copy, API refresh_interval_sec, ensure_recommendations throttle, and auto-execute poll (main.py).
+RECOMMENDATION_ENGINE_REFRESH_SEC = 20
 
 
 def invalidate_recommendation_cache(user_id: int) -> None:
     """Clear recommendation cache for user so next run uses fresh strategy params from saved settings."""
     _REC_CACHE_TS.pop(user_id, None)
     _REC_DETAILS_CACHE.pop(user_id, None)
+
+
+def _stable_recommendation_id(
+    user_id: int,
+    strategy_id: str,
+    strategy_version: str,
+    symbol: str,
+    side: str,
+) -> str:
+    """Deterministic id per (user, strategy, symbol, side). Rank is not part of the key so re-sorting does not rotate ids."""
+    sym = str(symbol or "").strip().upper()
+    sd = str(side or "").strip().upper()
+    key = f"{user_id}|{strategy_id}|{strategy_version}|{sym}|{sd}"
+    h = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+    return f"rec-{h}"
 
 
 async def invalidate_recommendation_cache_for_strategy(strategy_id: str, strategy_version: str) -> None:
@@ -269,15 +333,19 @@ def _failed_conditions(
     *,
     rsi_min: float = 50,
     rsi_max: float = 75,
+    volume_ok: bool | None = None,
+    volume_min_ratio: float | None = None,
 ) -> str:
-    """Build human-readable list of failed conditions. Uses actual strategy thresholds. Crossover and volume spike are relaxed (not shown as failures)."""
+    """Build human-readable list of failed conditions. Uses actual strategy thresholds. Crossover is not shown."""
     failed: list[str] = []
     if not primary_ok:
-        failed.append("Primary(close<=VWAP)")
+        failed.append("Premium below VWAP")
     if not ema_ok:
-        failed.append("EMA9<=EMA21")
+        failed.append("EMA not bullish (9≤21)")
     if not rsi_ok:
-        failed.append(f"RSI not in {rsi_min:.0f}-{rsi_max:.0f}")
+        failed.append(f"RSI outside {rsi_min:.0f}–{rsi_max:.0f}")
+    if volume_ok is False and volume_min_ratio is not None:
+        failed.append(f"Vol < {float(volume_min_ratio):.2f}× avg")
     return "PASS" if not failed else "; ".join(failed)
 
 
@@ -291,6 +359,12 @@ def _failed_conditions_short_leg(
     leg_score_mode: str = "",
     rsi_below_for_weak: float = 50.0,
     rsi_direct_band: bool = False,
+    rsi_require_decreasing: bool = False,
+    rsi_zone_or_reversal: bool = False,
+    rsi_reversal_falling_bars: int = 0,
+    rsi_soft_zone_low: float = 20.0,
+    rsi_soft_zone_high: float = 45.0,
+    rsi_reversal_from_rsi: float = 70.0,
 ) -> str:
     """Bearish-style checks on option LTP series (short premium): LTP below VWAP, EMA9 below EMA21, RSI rule per leg score mode."""
     failed: list[str] = []
@@ -299,7 +373,27 @@ def _failed_conditions_short_leg(
     if not ema_ok:
         failed.append("EMA9 not below EMA21 (want premium weakness)")
     if not rsi_ok:
-        if rsi_direct_band:
+        if (
+            rsi_zone_or_reversal
+            and (leg_score_mode or "").strip().lower() == "three_factor"
+        ):
+            zlo, zhi = float(rsi_soft_zone_low), float(rsi_soft_zone_high)
+            if zlo > zhi:
+                zlo, zhi = zhi, zlo
+            nfb = int(rsi_reversal_falling_bars)
+            if nfb >= 2:
+                failed.append(
+                    f"RSI not in {zlo:.0f}-{zhi:.0f} nor strictly falling over last {nfb} bars (zone_or_reversal)"
+                )
+            else:
+                failed.append(
+                    f"RSI not in {zlo:.0f}-{zhi:.0f} nor reversal from ≥{float(rsi_reversal_from_rsi):.0f} "
+                    "(zone_or_reversal)"
+                )
+        elif rsi_require_decreasing and (leg_score_mode or "").strip().lower() == "three_factor":
+            rb = float(rsi_below_for_weak)
+            failed.append(f"RSI not falling vs prior bar and below {rb:.0f} (three_factor)")
+        elif rsi_direct_band:
             failed.append(f"RSI not in {rsi_min:.0f}-{rsi_max:.0f} (direct leg band)")
         elif (leg_score_mode or "").strip().lower() == "three_factor":
             rb = float(rsi_below_for_weak)
@@ -328,6 +422,267 @@ def _effective_strike_min_volume(
     if datetime.now(_EVAL_IST).hour >= int(early_session_end_hour_ist):
         return bv
     return min(bv, ev)
+
+
+def _parse_flow_ranking_cfg(raw: Any) -> dict[str, Any] | None:
+    """Optional long-premium strike ranking using OI/volume/ΔOI + landing-style flow tilt."""
+    if not isinstance(raw, dict):
+        return None
+    en = raw.get("enabled", False)
+    if isinstance(en, str):
+        en = en.strip().lower() in {"1", "true", "yes"}
+    elif en is not None and not isinstance(en, bool):
+        en = str(en).strip().lower() in {"1", "true", "yes"}
+    if not bool(en):
+        return None
+    uct = raw.get("useChainFlowTilt", True)
+    if isinstance(uct, str):
+        uct = uct.strip().lower() in {"1", "true", "yes"}
+    pin_raw = raw.get("pinPenaltyOnExpiryDay", False)
+    if isinstance(pin_raw, str):
+        pin_on = pin_raw.strip().lower() in {"1", "true", "yes"}
+    else:
+        pin_on = bool(pin_raw)
+    return {
+        "use_chain_flow_tilt": bool(uct),
+        "tilt_weight": float(raw.get("tiltWeight", 0.22)),
+        "percentile_oi_weight": float(raw.get("percentileOiWeight", 1.0)),
+        "percentile_vol_weight": float(raw.get("percentileVolWeight", 1.0)),
+        "oi_chg_scale_weight": float(raw.get("oiChgScaleWeight", 0.12)),
+        "long_buildup_bonus": float(raw.get("longBuildupBonus", 0.28)),
+        "short_covering_bonus": float(raw.get("shortCoveringBonus", 0.24)),
+        "pin_penalty_on_expiry_day": pin_on,
+        "pin_max_distance_pts": float(raw.get("pinMaxDistanceFromSpot", 150)),
+        "pin_oi_dominance_ratio": float(raw.get("pinOiDominanceRatio", 1.2)),
+        "pin_penalty_weight": float(raw.get("pinPenaltyWeight", 0.18)),
+    }
+
+
+def _chain_leg_oi_float(leg: dict[str, Any] | None) -> float:
+    if not leg:
+        return 0.0
+    try:
+        return float(leg.get("oi") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _pin_wall_strikes_from_chain(
+    chain: list[dict[str, Any]],
+    *,
+    dominance_ratio: float,
+) -> tuple[int | None, int | None]:
+    """
+    Top CE and top PE strikes by OI in this chain window.
+    A wing counts as a "wall" only if top_oi >= ratio * second_oi (ratio <= 1.01 → top always).
+    """
+    ce: list[tuple[int, float]] = []
+    pe: list[tuple[int, float]] = []
+    for row in chain:
+        try:
+            st = int(float(row.get("strike") or 0))
+        except (TypeError, ValueError):
+            continue
+        if st <= 0:
+            continue
+        coi = _chain_leg_oi_float(row.get("call") if isinstance(row.get("call"), dict) else None)
+        poi = _chain_leg_oi_float(row.get("put") if isinstance(row.get("put"), dict) else None)
+        ce.append((st, coi))
+        pe.append((st, poi))
+
+    def _wall(rows: list[tuple[int, float]]) -> int | None:
+        if not rows:
+            return None
+        ordered = sorted(rows, key=lambda x: x[1], reverse=True)
+        top_s, top_o = ordered[0]
+        if top_o <= 0:
+            return None
+        rdom = float(dominance_ratio)
+        if len(ordered) < 2 or rdom <= 1.01:
+            return top_s
+        second_o = ordered[1][1]
+        if second_o <= 0:
+            return top_s
+        return top_s if top_o >= rdom * second_o else None
+
+    return (_wall(ce), _wall(pe))
+
+
+def _percentile_rank_map(rows: list[dict[str, Any]], attr: str) -> dict[int, float]:
+    """Highest metric → 1.0; keys are id(row)."""
+    if not rows:
+        return {}
+    if len(rows) == 1:
+        return {id(rows[0]): 1.0}
+
+    def metric(r: dict[str, Any]) -> float:
+        try:
+            return float(r.get(attr) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    ordered = sorted(rows, key=metric, reverse=True)
+    n = len(ordered)
+    denom = float(n - 1)
+    return {id(r): (n - 1 - i) / denom for i, r in enumerate(ordered)}
+
+
+def _apply_long_premium_flow_ranking(
+    recs: list[dict[str, Any]],
+    chain: list[dict[str, Any]],
+    chain_payload: dict[str, Any],
+    cfg: dict[str, Any],
+    *,
+    expiry_date: date | None = None,
+) -> dict[str, Any]:
+    """Set flow_rank_score on each rec; return metadata for evaluation / chain snapshot."""
+    if not recs or not cfg:
+        return {}
+    try:
+        pcr = chain_payload.get("pcr")
+        pcr_vol = chain_payload.get("pcrVol")
+        spot_raw = chain_payload.get("spotChgPct")
+        spot_chg = float(spot_raw) if spot_raw is not None else 0.0
+        sent = compute_sentiment_snapshot(
+            chain_payload={"chain": chain, "pcr": pcr, "pcrVol": pcr_vol},
+            spot_chg_pct=spot_chg,
+            trendpulse_signal=None,
+        )
+        oi = sent.get("optionsIntel") or {}
+        tilt = str(oi.get("modelOptionTilt") or "NEUTRAL").strip().upper()
+        blend = float(oi.get("flowBlendScore") or 0.0)
+    except Exception:
+        tilt, blend = "NEUTRAL", 0.0
+
+    ce_list = [r for r in recs if str(r.get("option_type") or "").upper() == "CE"]
+    pe_list = [r for r in recs if str(r.get("option_type") or "").upper() == "PE"]
+    pct_oi_ce = _percentile_rank_map(ce_list, "oi")
+    pct_oi_pe = _percentile_rank_map(pe_list, "oi")
+    pct_vol_ce = _percentile_rank_map(ce_list, "volume")
+    pct_vol_pe = _percentile_rank_map(pe_list, "volume")
+
+    tw = float(cfg.get("tilt_weight", 0.22))
+    wo = float(cfg.get("percentile_oi_weight", 1.0))
+    wv = float(cfg.get("percentile_vol_weight", 1.0))
+    wc = float(cfg.get("oi_chg_scale_weight", 0.12))
+    wb = float(cfg.get("long_buildup_bonus", 0.28))
+    wsc = float(cfg.get("short_covering_bonus", 0.24))
+    use_tilt = bool(cfg.get("use_chain_flow_tilt", True))
+
+    for r in recs:
+        opt = str(r.get("option_type") or "").upper()
+        wing = 0.0
+        if use_tilt:
+            if tilt == "CE":
+                wing = 1.0 if opt == "CE" else -0.35
+            elif tilt == "PE":
+                wing = 1.0 if opt == "PE" else -0.35
+        if opt == "CE":
+            p_oi = pct_oi_ce.get(id(r), 0.5)
+            p_vol = pct_vol_ce.get(id(r), 0.5)
+        elif opt == "PE":
+            p_oi = pct_oi_pe.get(id(r), 0.5)
+            p_vol = pct_vol_pe.get(id(r), 0.5)
+        else:
+            p_oi = p_vol = 0.5
+        try:
+            och = float(r.get("oi_chg_pct") or 0.0)
+        except (TypeError, ValueError):
+            och = 0.0
+        och_term = math.tanh(och / 20.0)
+        bu = str(r.get("buildup") or "").strip()
+        if bu == "Long Buildup":
+            bun = wb
+        elif bu == "Short Covering":
+            bun = wsc
+        else:
+            bun = 0.0
+        fr = tw * wing + wo * p_oi + wv * p_vol + wc * och_term + bun
+        r["flow_rank_score"] = round(fr, 4)
+
+    pin_note: dict[str, Any] = {"active": False}
+    if (
+        cfg.get("pin_penalty_on_expiry_day")
+        and expiry_date is not None
+        and chain
+    ):
+        today_ist = datetime.now(_EVAL_IST).date()
+        dte = (expiry_date - today_ist).days
+        pin_note["dte_ist"] = dte
+        if dte == 0:
+            spot = float(chain_payload.get("spot") or 0.0)
+            ratio = float(cfg.get("pin_oi_dominance_ratio", 1.2))
+            dist_max = float(cfg.get("pin_max_distance_pts", 150))
+            pw = float(cfg.get("pin_penalty_weight", 0.18))
+            ce_wall, pe_wall = _pin_wall_strikes_from_chain(chain, dominance_ratio=ratio)
+            pin_note.update(
+                {
+                    "active": True,
+                    "ce_wall_strike": ce_wall,
+                    "pe_wall_strike": pe_wall,
+                    "max_dist_pts": dist_max,
+                    "penalty": pw,
+                }
+            )
+            for r in recs:
+                opt = str(r.get("option_type") or "").upper()
+                try:
+                    stk = int(r.get("strike") or 0)
+                except (TypeError, ValueError):
+                    continue
+                wall = ce_wall if opt == "CE" else pe_wall if opt == "PE" else None
+                if wall is None or stk != wall or spot <= 0:
+                    continue
+                if abs(float(stk) - spot) > dist_max:
+                    continue
+                r["flow_rank_score"] = round(float(r["flow_rank_score"]) - pw, 4)
+                r["flow_pin_penalized"] = True
+
+    return {
+        "flow_ranking": {
+            "enabled": True,
+            "landing_flow_tilt": tilt,
+            "flow_blend_score": round(blend, 4),
+            "pin_expiry_soft_penalty": pin_note,
+        }
+    }
+
+
+def _long_premium_rec_sort_key(r: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        -int(r.get("score") or 0),
+        -float(r.get("flow_rank_score") or 0.0),
+        -float(r.get("volume_spike_ratio") or 0.0),
+        -float(r.get("oi_chg_pct") or 0.0),
+        float(r.get("delta_distance") or 0.0),
+        abs(int(r.get("distance_to_atm") or 0)),
+    )
+
+
+def _short_premium_eligible_sort_key(
+    r: dict[str, Any],
+    *,
+    rsi_decreasing_rank: bool = False,
+) -> tuple[Any, ...]:
+    """Rank short-premium legs: score/confidence first; optional RSI-momentum (prior bar → now) when decreasing mode."""
+    head: tuple[Any, ...] = (
+        -int(r.get("score") or 0),
+        -float(r.get("confidence_score") or 0.0),
+    )
+    mid: tuple[Any, ...] = (
+        (-float(r.get("short_premium_rsi_drop") or 0.0),)
+        if rsi_decreasing_rank
+        else ()
+    )
+    tail: tuple[Any, ...] = (
+        -int(r.get("oi") or 0),
+        -float(r.get("volume_spike_ratio") or 0.0),
+        -float(r.get("oi_chg_pct") or 0.0),
+        float(r.get("delta_distance") or 0.0),
+        abs(int(r.get("distance_to_atm") or 0)),
+        float(r.get("gamma") or 0.0),
+    )
+    return head + mid + tail
 
 
 def _deep_merge_strategy_details(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
@@ -510,6 +865,8 @@ def _build_short_leg_diagnostics(
     score_threshold: int | float,
     ivr_min_threshold: float,
     ivr_leg_max_threshold: float,
+    short_premium_ivr_min_ce: float | None = None,
+    short_premium_ivr_min_pe: float | None = None,
     short_ce_delta_min: float,
     short_ce_delta_max: float,
     short_pe_delta_min: float,
@@ -523,7 +880,14 @@ def _build_short_leg_diagnostics(
     short_premium_leg_score_mode: str = "",
     short_premium_rsi_below: float = 50.0,
     short_premium_rsi_direct_band: bool = False,
+    short_premium_rsi_decreasing: bool = False,
+    short_premium_rsi_zone_or_reversal: bool = False,
+    short_premium_rsi_reversal_falling_bars: int = 0,
+    short_premium_rsi_soft_zone_low: float = 20.0,
+    short_premium_rsi_soft_zone_high: float = 45.0,
+    short_premium_rsi_reversal_from_rsi: float = 70.0,
     max_rows: int = 48,
+    score_max: int = 5,
 ) -> list[dict[str, Any]]:
     """
     One row per option leg: OTM-step window unless short_premium_delta_only_strikes (then delta band only).
@@ -599,14 +963,19 @@ def _build_short_leg_diagnostics(
                     blockers.append("spot_regime_bearish_needs_CE")
                 elif spot_regime not in ("bullish", "bearish"):
                     blockers.append(f"spot_regime_unset_or_mixed(regime={spot_regime!r})")
-            if ivr_min_threshold > 0 or ivr_leg_max_threshold > 0:
+            eff_ivr_min = float(ivr_min_threshold)
+            if opt_type == "CE" and short_premium_ivr_min_ce is not None:
+                eff_ivr_min = float(short_premium_ivr_min_ce)
+            elif opt_type == "PE" and short_premium_ivr_min_pe is not None:
+                eff_ivr_min = float(short_premium_ivr_min_pe)
+            if eff_ivr_min > 0 or ivr_leg_max_threshold > 0:
                 if ivr is None:
                     blockers.append("IVR=null")
                 else:
                     try:
                         ivf = float(ivr)
-                        if ivr_min_threshold > 0 and ivf < float(ivr_min_threshold):
-                            blockers.append(f"IVR<{ivr_min_threshold} (got {ivf:.1f})")
+                        if eff_ivr_min > 0 and ivf < eff_ivr_min:
+                            blockers.append(f"IVR<{eff_ivr_min} (got {ivf:.1f})")
                         if ivr_leg_max_threshold > 0 and ivf > float(ivr_leg_max_threshold):
                             blockers.append(f"IVR>{ivr_leg_max_threshold} (got {ivf:.1f})")
                     except (TypeError, ValueError):
@@ -635,28 +1004,59 @@ def _build_short_leg_diagnostics(
                 elif spot_regime == "bearish" and opt_type == "CE" and spot_bear < st_int:
                     blockers.append(f"spot_bearish_score {spot_bear} < {st_int}")
             leg_ok = leg_sig
+            if leg.get("shortPremiumExpansionBlocked"):
+                blockers.append("expansion_phase_block(RSI high + LTP>VWAP)")
+            if leg.get("shortPremiumVwapDistanceBlocked"):
+                blockers.append("VWAP_weakness_distance_below_min_pct")
+            if leg.get("shortPremiumMomentumBlocked"):
+                blockers.append("momentum_below_shortPremiumMinMomentumPoints")
+            if leg.get("shortPremiumGhostBlocked"):
+                blockers.append("ghost_timing_insufficient_RSI_drop_from_prior")
             if not leg_ok:
-                detail = _failed_conditions_short_leg(
-                    bool(leg.get("primaryOk")),
-                    bool(leg.get("emaOk")),
-                    bool(leg.get("rsiOk")),
-                    rsi_min=rsi_min,
-                    rsi_max=rsi_max,
-                    leg_score_mode=short_premium_leg_score_mode,
-                    rsi_below_for_weak=short_premium_rsi_below,
-                    rsi_direct_band=short_premium_rsi_direct_band,
+                _enrich_blocked = bool(
+                    leg.get("shortPremiumExpansionBlocked")
+                    or leg.get("shortPremiumVwapDistanceBlocked")
+                    or leg.get("shortPremiumMomentumBlocked")
+                    or leg.get("shortPremiumGhostBlocked")
                 )
-                if detail != "PASS":
-                    blockers.append(f"leg_conditions: {detail}")
-                else:
-                    blockers.append(
-                        f"leg_composite_score_low(leg_score={leg_score}, need>={st_int})"
+                if not _enrich_blocked:
+                    detail = _failed_conditions_short_leg(
+                        bool(leg.get("primaryOk")),
+                        bool(leg.get("emaOk")),
+                        bool(leg.get("rsiOk")),
+                        rsi_min=rsi_min,
+                        rsi_max=rsi_max,
+                        leg_score_mode=short_premium_leg_score_mode,
+                        rsi_below_for_weak=short_premium_rsi_below,
+                        rsi_direct_band=short_premium_rsi_direct_band,
+                        rsi_require_decreasing=short_premium_rsi_decreasing,
+                        rsi_zone_or_reversal=short_premium_rsi_zone_or_reversal,
+                        rsi_reversal_falling_bars=short_premium_rsi_reversal_falling_bars,
+                        rsi_soft_zone_low=short_premium_rsi_soft_zone_low,
+                        rsi_soft_zone_high=short_premium_rsi_soft_zone_high,
+                        rsi_reversal_from_rsi=short_premium_rsi_reversal_from_rsi,
                     )
+                    if detail != "PASS":
+                        blockers.append(f"leg_conditions: {detail}")
+                    else:
+                        blockers.append(
+                            f"leg_composite_score_low(leg_score={leg_score}, need>={st_int})"
+                        )
             sym = str(leg.get("tradingsymbol") or "").strip() or _compact_option_symbol(
                 instrument, expiry_str, strike, opt_type
             )
             non_liq = [b for b in blockers if not b.startswith("strict_liquidity")]
             vol_ratio = float(leg.get("volumeSpikeRatio") or 0.0)
+            smax = max(1, int(score_max))
+            if srm == "ema_cross_vwap":
+                eff_score_for_conf = min(smax, max(st_int, leg_score))
+            else:
+                eff_score_for_conf = int(spot_bull if opt_type == "PE" else spot_bear)
+            conf_denom = smax
+            base_conf = (eff_score_for_conf / conf_denom) * 100
+            vol_bonus = max(0.0, min(19.0, (vol_ratio - 1.0) * 10))
+            confidence_score = min(99.0, round(base_conf + vol_bonus, 2))
+            trade_eligible = len(blockers) == 0
             out.append(
                 {
                     "symbol": sym,
@@ -678,6 +1078,8 @@ def _build_short_leg_diagnostics(
                     "regime_sell_ce": rsce,
                     "leg_score": leg_score,
                     "leg_signal_eligible": leg_sig,
+                    "trade_eligible": trade_eligible,
+                    "confidence_score": confidence_score,
                     "ema_crossover_ok": bool(leg.get("emaCrossoverOk")),
                     "blockers": "; ".join(blockers) if blockers else "—",
                     "would_pass_non_liquidity_gates": len(non_liq) == 0,
@@ -688,6 +1090,7 @@ def _build_short_leg_diagnostics(
 
 async def _get_live_candidates(
     kite: KiteConnect | None,
+    market_provider: Any | None,
     max_strike_distance: int,
     score_threshold: int = 3,
     score_max: int = 5,
@@ -705,6 +1108,7 @@ async def _get_live_candidates(
     rsi_max: float = 75,
     volume_min_ratio: float = 1.5,
     position_intent: str = "long_premium",
+    execution_action_intent: str = "long_premium",
     ivr_min_threshold: float = 0.0,
     ivr_leg_max_threshold: float = 0.0,
     strike_delta_min_abs: float = 0.29,
@@ -728,18 +1132,43 @@ async def _get_live_candidates(
     short_premium_leg_score_mode: str = "",
     short_premium_rsi_below: float = 50.0,
     short_premium_rsi_direct_band: bool = False,
+    short_premium_rsi_decreasing: bool = False,
     short_premium_ivr_skew_min: float = 5.0,
     short_premium_pcr_bonus_vs_chain: bool = True,
     short_premium_pcr_chain_epsilon: float = 0.0,
     short_premium_pcr_min_for_sell_ce: Any = None,
     short_premium_pcr_max_for_sell_pe: Any = None,
+    short_premium_expansion_block_rsi: float = 0.0,
+    short_premium_vwap_weakness_min_pct: float = 0.0,
+    short_premium_min_momentum_points: int = 0,
+    short_premium_ghost_rsi_drop_pts: float = 0.0,
+    short_premium_rsi_zone_or_reversal: bool = False,
+    short_premium_rsi_soft_zone_low: float = 20.0,
+    short_premium_rsi_soft_zone_high: float = 45.0,
+    short_premium_rsi_reversal_from_rsi: float = 70.0,
+    short_premium_rsi_reversal_falling_bars: int = 0,
+    short_premium_vwap_eligible_buffer_pct: float = 0.0,
+    short_premium_three_factor_require_ltp_below_vwap: bool = True,
+    short_premium_ivr_min_ce: float | None = None,
+    short_premium_ivr_min_pe: float | None = None,
     require_rsi_for_eligible: bool = False,
     long_premium_spot_align: bool = False,
     min_volume_early_session: int | None = None,
     early_session_end_hour_ist: int = 0,
+    flow_ranking: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     instrument = "NIFTY"
-    if min_dte_calendar_days > 0:
+    if market_provider is not None:
+        try:
+            expiries, _src = await market_provider.expiries(instrument)
+        except Exception:
+            expiries = []
+        expiry_str = _pick_expiry_from_provider_list(
+            expiries,
+            min_dte_calendar_days=min_dte_calendar_days,
+            nifty_weekly_expiry_weekday=nifty_weekly_expiry_weekday,
+        )
+    elif min_dte_calendar_days > 0:
         expiry_str = pick_expiry_with_min_calendar_dte(
             kite,
             instrument,
@@ -755,6 +1184,7 @@ async def _get_live_candidates(
     except ValueError:
         expiry_date = date.today()
     use_short = str(position_intent).strip().lower() == "short_premium"
+    action_short = str(execution_action_intent or position_intent).strip().lower() == "short_premium"
     if short_premium_delta_only_strikes is None:
         short_premium_delta_only_strikes = bool(short_premium_delta_vix_bands) if use_short else False
     else:
@@ -804,6 +1234,8 @@ async def _get_live_candidates(
         indicator_params["shortPremiumRsiBelow"] = float(short_premium_rsi_below)
         if short_premium_rsi_direct_band:
             indicator_params["shortPremiumRsiDirectBand"] = True
+        if short_premium_rsi_decreasing:
+            indicator_params["shortPremiumRsiDecreasing"] = True
         indicator_params["shortPremiumIvrSkewMin"] = float(short_premium_ivr_skew_min)
         indicator_params["shortPremiumPcrBonusVsChain"] = bool(short_premium_pcr_bonus_vs_chain)
         indicator_params["shortPremiumPcrChainEpsilon"] = float(short_premium_pcr_chain_epsilon)
@@ -811,6 +1243,27 @@ async def _get_live_candidates(
             indicator_params["shortPremiumPcrMinForSellCe"] = short_premium_pcr_min_for_sell_ce
         if short_premium_pcr_max_for_sell_pe is not None:
             indicator_params["shortPremiumPcrMaxForSellPe"] = short_premium_pcr_max_for_sell_pe
+        if float(short_premium_expansion_block_rsi or 0) > 0:
+            indicator_params["shortPremiumExpansionBlockRsi"] = float(short_premium_expansion_block_rsi)
+        if float(short_premium_vwap_weakness_min_pct or 0) > 0:
+            indicator_params["shortPremiumVwapWeaknessMinPct"] = float(short_premium_vwap_weakness_min_pct)
+        if int(short_premium_min_momentum_points or 0) > 0:
+            indicator_params["shortPremiumMinMomentumPoints"] = int(short_premium_min_momentum_points)
+        if float(short_premium_ghost_rsi_drop_pts or 0) > 0:
+            indicator_params["shortPremiumGhostRsiDropPts"] = float(short_premium_ghost_rsi_drop_pts)
+        if short_premium_rsi_zone_or_reversal:
+            indicator_params["shortPremiumRsiZoneOrReversal"] = True
+            indicator_params["shortPremiumRsiSoftZoneLow"] = float(short_premium_rsi_soft_zone_low)
+            indicator_params["shortPremiumRsiSoftZoneHigh"] = float(short_premium_rsi_soft_zone_high)
+            indicator_params["shortPremiumRsiReversalFromRsi"] = float(short_premium_rsi_reversal_from_rsi)
+            _rfb = max(0, min(20, int(short_premium_rsi_reversal_falling_bars or 0)))
+            if _rfb > 0:
+                indicator_params["shortPremiumRsiReversalFallingBars"] = _rfb
+        _vwbuf = float(short_premium_vwap_eligible_buffer_pct or 0)
+        if _vwbuf > 0:
+            indicator_params["shortPremiumVwapEligibleBufferPct"] = min(3.0, _vwbuf)
+        if not short_premium_three_factor_require_ltp_below_vwap:
+            indicator_params["shortPremiumThreeFactorRequireLtpBelowVwapForEligible"] = False
     if ema_crossover_max_candles is not None:
         indicator_params["max_candles_since_cross"] = ema_crossover_max_candles
     if adx_min_threshold is not None:
@@ -825,16 +1278,25 @@ async def _get_live_candidates(
         early_session_vol=min_volume_early_session,
         early_session_end_hour_ist=int(early_session_end_hour_ist or 0),
     )
-    chain_payload = await asyncio.to_thread(
-        fetch_option_chain_sync,
-        kite,
-        instrument,
-        expiry_str,
-        chain_half_width,
-        chain_half_width,
-        score_threshold,
-        indicator_params if indicator_params else None,
-    )
+    if market_provider is not None:
+        chain_payload = await market_provider.option_chain(
+            instrument,
+            expiry_str,
+            chain_half_width,
+            chain_half_width,
+            True,
+        )
+    else:
+        chain_payload = await asyncio.to_thread(
+            fetch_option_chain_sync,
+            kite,
+            instrument,
+            expiry_str,
+            chain_half_width,
+            chain_half_width,
+            score_threshold,
+            indicator_params if indicator_params else None,
+        )
     chain = chain_payload.get("chain", [])
     spot = float(chain_payload.get("spot") or 0.0)
     if not chain or spot <= 0:
@@ -888,6 +1350,8 @@ async def _get_live_candidates(
             score_threshold=score_threshold,
             ivr_min_threshold=ivr_min_threshold,
             ivr_leg_max_threshold=ivr_leg_max_threshold,
+            short_premium_ivr_min_ce=short_premium_ivr_min_ce,
+            short_premium_ivr_min_pe=short_premium_ivr_min_pe,
             short_ce_delta_min=ce_d_lo,
             short_ce_delta_max=ce_d_hi,
             short_pe_delta_min=pe_d_lo,
@@ -901,7 +1365,16 @@ async def _get_live_candidates(
             short_premium_leg_score_mode=str(short_premium_leg_score_mode or ""),
             short_premium_rsi_below=float(short_premium_rsi_below or 50),
             short_premium_rsi_direct_band=bool(short_premium_rsi_direct_band),
+            short_premium_rsi_decreasing=bool(short_premium_rsi_decreasing),
+            short_premium_rsi_zone_or_reversal=bool(short_premium_rsi_zone_or_reversal),
+            short_premium_rsi_reversal_falling_bars=max(
+                0, min(20, int(short_premium_rsi_reversal_falling_bars or 0))
+            ),
+            short_premium_rsi_soft_zone_low=float(short_premium_rsi_soft_zone_low or 20),
+            short_premium_rsi_soft_zone_high=float(short_premium_rsi_soft_zone_high or 45),
+            short_premium_rsi_reversal_from_rsi=float(short_premium_rsi_reversal_from_rsi or 70),
             max_rows=diag_max,
+            score_max=int(score_max),
         )
     step = 50
     atm = round(spot / step) * step
@@ -955,13 +1428,18 @@ async def _get_live_candidates(
                 ivr_ok = True
                 delta_ok = True
                 if use_short:
-                    if ivr_min_threshold > 0 or ivr_leg_max_threshold > 0:
+                    eff_ivr_min = float(ivr_min_threshold)
+                    if opt_type == "CE" and short_premium_ivr_min_ce is not None:
+                        eff_ivr_min = float(short_premium_ivr_min_ce)
+                    elif opt_type == "PE" and short_premium_ivr_min_pe is not None:
+                        eff_ivr_min = float(short_premium_ivr_min_pe)
+                    if eff_ivr_min > 0 or ivr_leg_max_threshold > 0:
                         if ivr is None:
                             ivr_ok = False
                         else:
                             try:
                                 ivf = float(ivr)
-                                if ivr_min_threshold > 0 and ivf < float(ivr_min_threshold):
+                                if eff_ivr_min > 0 and ivf < eff_ivr_min:
                                     ivr_ok = False
                                 if ivr_leg_max_threshold > 0 and ivf > float(ivr_leg_max_threshold):
                                     ivr_ok = False
@@ -999,8 +1477,8 @@ async def _get_live_candidates(
                         else:
                             try:
                                 ivf = float(ivr)
-                                if ivr_min_threshold > 0 and ivf < float(ivr_min_threshold):
-                                    parts.append(f"IVR<{ivr_min_threshold} (got {ivf:.1f})")
+                                if eff_ivr_min > 0 and ivf < eff_ivr_min:
+                                    parts.append(f"IVR<{eff_ivr_min} (got {ivf:.1f})")
                                 if ivr_leg_max_threshold > 0 and ivf > float(ivr_leg_max_threshold):
                                     parts.append(f"IVR>{ivr_leg_max_threshold} (got {ivf:.1f})")
                             except (TypeError, ValueError):
@@ -1035,27 +1513,50 @@ async def _get_live_candidates(
                             else "Strike regime (EMA cross + LTP<VWAP on this leg) not satisfied"
                         )
                     if not leg_ok:
-                        leg_detail = _failed_conditions_short_leg(
-                            bool(leg.get("primaryOk")),
-                            bool(leg.get("emaOk")),
-                            bool(leg.get("rsiOk")),
-                            rsi_min=rsi_min,
-                            rsi_max=rsi_max,
-                            leg_score_mode=str(short_premium_leg_score_mode or ""),
-                            rsi_below_for_weak=float(short_premium_rsi_below or 50),
-                            rsi_direct_band=bool(short_premium_rsi_direct_band),
-                        )
-                        if leg_detail != "PASS":
-                            parts.append(leg_detail)
+                        enrich: list[str] = []
+                        if leg.get("shortPremiumExpansionBlocked"):
+                            enrich.append("expansion_phase_block(RSI above shortPremiumExpansionBlockRsi and LTP>VWAP)")
+                        if leg.get("shortPremiumVwapDistanceBlocked"):
+                            enrich.append("VWAP_weakness_distance_below_shortPremiumVwapWeaknessMinPct")
+                        if leg.get("shortPremiumMomentumBlocked"):
+                            enrich.append("momentum_factors_below_shortPremiumMinMomentumPoints")
+                        if leg.get("shortPremiumGhostBlocked"):
+                            enrich.append("ghost_timing(RSI drop from prior bar < shortPremiumGhostRsiDropPts)")
+                        if enrich:
+                            parts.append("; ".join(enrich))
                         else:
-                            parts.append(
-                                f"Option premium composite score {leg_score} < {int(score_threshold)} "
-                                "(crossover/volume vs thresholds)"
+                            leg_detail = _failed_conditions_short_leg(
+                                bool(leg.get("primaryOk")),
+                                bool(leg.get("emaOk")),
+                                bool(leg.get("rsiOk")),
+                                rsi_min=rsi_min,
+                                rsi_max=rsi_max,
+                                leg_score_mode=str(short_premium_leg_score_mode or ""),
+                                rsi_below_for_weak=float(short_premium_rsi_below or 50),
+                                rsi_direct_band=bool(short_premium_rsi_direct_band),
+                                rsi_require_decreasing=bool(short_premium_rsi_decreasing),
+                                rsi_zone_or_reversal=bool(short_premium_rsi_zone_or_reversal),
+                                rsi_reversal_falling_bars=int(short_premium_rsi_reversal_falling_bars or 0),
+                                rsi_soft_zone_low=float(short_premium_rsi_soft_zone_low or 20),
+                                rsi_soft_zone_high=float(short_premium_rsi_soft_zone_high or 45),
+                                rsi_reversal_from_rsi=float(short_premium_rsi_reversal_from_rsi or 70),
                             )
+                            if leg_detail != "PASS":
+                                parts.append(leg_detail)
+                            else:
+                                parts.append(
+                                    f"Option premium composite score {leg_score} < {int(score_threshold)} "
+                                    "(crossover/volume vs thresholds)"
+                                )
                     failed_msg = "PASS" if signal_eligible else "; ".join(parts)
-                    side = "SELL"
-                    target_price = round(max(0.05, ltp * 0.75), 2)
-                    stop_loss_price = round(ltp * 1.35, 2)
+                    if action_short:
+                        side = "SELL"
+                        target_price = round(max(0.05, ltp * 0.75), 2)
+                        stop_loss_price = round(ltp * 1.35, 2)
+                    else:
+                        side = "BUY"
+                        target_price = round(ltp * 1.08, 2)
+                        stop_loss_price = round(ltp * 0.94, 2)
                     gamma_val = float(
                         compute_gamma_from_ltp(spot, float(strike), expiry_date, ltp, opt_type)
                     )
@@ -1076,15 +1577,22 @@ async def _get_live_candidates(
                             signal_eligible = False
                         elif opt_type == "PE" and sr_spot != "bearish":
                             signal_eligible = False
-                    side = "BUY"
-                    target_price = round(ltp * 1.08, 2)
-                    stop_loss_price = round(ltp * 0.94, 2)
+                    if action_short:
+                        side = "SELL"
+                        target_price = round(max(0.05, ltp * 0.92), 2)
+                        stop_loss_price = round(ltp * 1.06, 2)
+                    else:
+                        side = "BUY"
+                        target_price = round(ltp * 1.08, 2)
+                        stop_loss_price = round(ltp * 0.94, 2)
                     failed_msg = _failed_conditions(
                         bool(leg.get("primaryOk")),
                         bool(leg.get("emaOk")),
                         bool(leg.get("rsiOk")),
                         rsi_min=rsi_min,
                         rsi_max=rsi_max,
+                        volume_ok=bool(leg.get("volumeOk")) if include_volume_in_leg_score else None,
+                        volume_min_ratio=float(volume_min_ratio) if include_volume_in_leg_score else None,
                     )
                     if long_premium_spot_align and leg_chain_eligible and not signal_eligible:
                         sr_spot = spot_regime
@@ -1117,6 +1625,18 @@ async def _get_live_candidates(
                 symbol = str(leg.get("tradingsymbol") or "").strip() or _compact_option_symbol(
                     instrument, expiry_str, strike, opt_type
                 )
+                leg_rsi = float(leg.get("rsi") or 0.0)
+                rsi_prev_leg: float | None = None
+                short_premium_rsi_drop = 0.0
+                rp_raw = leg.get("rsiPrev")
+                if rp_raw is not None:
+                    try:
+                        pv = float(rp_raw)
+                        rsi_prev_leg = round(pv, 2)
+                        short_premium_rsi_drop = round(max(0.0, pv - leg_rsi), 4)
+                    except (TypeError, ValueError):
+                        rsi_prev_leg = None
+                        short_premium_rsi_drop = 0.0
                 recs.append(
                     {
                         "instrument": instrument,
@@ -1130,7 +1650,9 @@ async def _get_live_candidates(
                         "vwap": float(leg.get("vwap") or 0.0),
                         "ema9": float(leg.get("ema9") or 0.0),
                         "ema21": float(leg.get("ema21") or 0.0),
-                        "rsi": float(leg.get("rsi") or 0.0),
+                        "rsi": leg_rsi,
+                        "rsi_prev": rsi_prev_leg,
+                        "short_premium_rsi_drop": short_premium_rsi_drop,
                         "ivr": _leg_iv_optional(leg),
                         "volume": volume,
                         "avg_volume": float(leg.get("avgVolume") or 0.0),
@@ -1145,11 +1667,12 @@ async def _get_live_candidates(
                         "failed_conditions": failed_msg,
                         "spot_price": round(spot, 2),
                         "timeframe": "3m",
-                        "refresh_interval_sec": 30,
+                        "refresh_interval_sec": RECOMMENDATION_ENGINE_REFRESH_SEC,
                         "distance_to_atm": distance_to_atm,
                         "strike": strike,
                         "oi": oi,
                         "oi_chg_pct": oi_chg_pct,
+                        "buildup": str(leg.get("buildup") or "—"),
                         "delta": delta,
                         "delta_distance": delta_distance,
                         "option_type": opt_type,
@@ -1158,21 +1681,18 @@ async def _get_live_candidates(
                 )
         if recs:
             break
+    flow_meta: dict[str, Any] = {}
+    if not use_short and recs and flow_ranking:
+        flow_meta = _apply_long_premium_flow_ranking(
+            recs, chain, chain_payload, flow_ranking, expiry_date=expiry_date
+        )
     # Snapshot before long eligible cap / short gamma trim — used for evaluation JSONL.
     scanned_before_rank = list(recs)
     if not use_short and recs:
         cap_l = max(1, int(max_strike_recommendations))
         elig_l = [r for r in recs if r.get("signal_eligible")]
         if len(elig_l) > cap_l:
-            elig_l.sort(
-                key=lambda x: (
-                    -int(x.get("score") or 0),
-                    -float(x.get("volume_spike_ratio") or 0.0),
-                    -float(x.get("oi_chg_pct") or 0.0),
-                    x["delta_distance"],
-                    abs(x["distance_to_atm"]),
-                )
-            )
+            elig_l.sort(key=_long_premium_rec_sort_key)
             keep_ids = {id(r) for r in elig_l[:cap_l]}
             note_tail = f"eligible_cap_per_refresh(max={cap_l})"
             for r in recs:
@@ -1180,44 +1700,39 @@ async def _get_live_candidates(
                     r["signal_eligible"] = False
                     prev = str(r.get("failed_conditions") or "PASS")
                     r["failed_conditions"] = note_tail if prev == "PASS" else f"{prev}; {note_tail}"
+    _sp_rank_rsi = bool(short_premium_rsi_decreasing)
     if use_short and select_strike_by_min_gamma and recs:
         eligible_recs = [r for r in recs if r.get("signal_eligible")]
         if eligible_recs:
             eligible_recs.sort(
-                key=lambda x: (
-                    float(x.get("gamma") or 0.0),
-                    x["delta_distance"],
-                    abs(x["distance_to_atm"]),
+                key=lambda rr: _short_premium_eligible_sort_key(
+                    rr, rsi_decreasing_rank=_sp_rank_rsi
                 )
             )
             cap = max(1, int(max_strike_recommendations))
             recs = eligible_recs[:cap]
         else:
             recs.sort(
-                key=lambda x: (
-                    -x["score"],
-                    -x["volume_spike_ratio"],
-                    -x["oi_chg_pct"],
-                    x["delta_distance"],
-                    abs(x["distance_to_atm"]),
+                key=lambda rr: _short_premium_eligible_sort_key(
+                    rr, rsi_decreasing_rank=_sp_rank_rsi
                 )
             )
-    else:
+    elif use_short:
         recs.sort(
-            key=lambda x: (
-                -x["score"],
-                -x["volume_spike_ratio"],
-                -x["oi_chg_pct"],
-                x["delta_distance"],
-                abs(x["distance_to_atm"]),
+            key=lambda rr: _short_premium_eligible_sort_key(
+                rr, rsi_decreasing_rank=_sp_rank_rsi
             )
         )
+    else:
+        recs.sort(key=_long_premium_rec_sort_key)
     snap = _chain_eval_meta(
         expiry_str=expiry_str,
         expiry_date=expiry_date,
         chain_len=len(chain),
         short_leg_diagnostics=short_diag if use_short else None,
     )
+    if flow_meta:
+        snap.update(flow_meta)
     if use_short:
         snap["short_premium_delta_abs"] = short_delta_gate_note
         snap["short_delta_ce_lo"] = ce_d_lo
@@ -1243,11 +1758,12 @@ async def _get_live_candidates(
 
 async def _get_live_candidates_trendpulse_z(
     kite: KiteConnect | None,
+    market_provider: Any | None,
     max_strike_distance: int,
     score_params: dict[str, Any],
 ) -> list[dict[str, Any]]:
     """Long CE/PE from PS_z vs VS_z cross + HTF bias; strike filters match rule-based long premium."""
-    if kite is None:
+    if market_provider is None and kite is None:
         return []
     tpc = score_params.get("trendpulse_config") or {}
     if not isinstance(tpc, dict):
@@ -1263,8 +1779,12 @@ async def _get_live_candidates_trendpulse_z(
     htf_es = int(tpc.get("htfEmaSlow", 34))
     iv_rank_max = float(tpc.get("ivRankMaxPercentile", 70.0))
 
-    st = await asyncio.to_thread(fetch_index_candles_sync, kite, "NIFTY", st_int, days)
-    htf = await asyncio.to_thread(fetch_index_candles_sync, kite, "NIFTY", htf_int, days)
+    if market_provider is not None:
+        st = await market_provider.index_candles("NIFTY", st_int, days)
+        htf = await market_provider.index_candles("NIFTY", htf_int, days)
+    else:
+        st = await asyncio.to_thread(fetch_index_candles_sync, kite, "NIFTY", st_int, days)
+        htf = await asyncio.to_thread(fetch_index_candles_sync, kite, "NIFTY", htf_int, days)
     ev = evaluate_trendpulse_signal(
         st,
         htf,
@@ -1300,7 +1820,17 @@ async def _get_live_candidates_trendpulse_z(
     delta_hi = float(tpc.get("deltaMaxAbs", 0.50))
     ext_min = float(tpc.get("extrinsicShareMin", 0.25))
     # minDteCalendarDays > 0: IST calendar DTE >= threshold; optional NIFTY weekly expiry weekday (default Tue).
-    if min_dte_cal > 0:
+    if market_provider is not None:
+        try:
+            expiries, _src = await market_provider.expiries(instrument)
+        except Exception:
+            expiries = []
+        expiry_str = _pick_expiry_from_provider_list(
+            expiries,
+            min_dte_calendar_days=min_dte_cal,
+            nifty_weekly_expiry_weekday=nifty_expiry_weekday,
+        )
+    elif min_dte_cal > 0:
         expiry_str = pick_expiry_with_min_calendar_dte(
             kite,
             instrument,
@@ -1323,16 +1853,25 @@ async def _get_live_candidates_trendpulse_z(
         indicator_params["adx_period"] = adx_period
         indicator_params["adx_min_threshold"] = float(adx_min_threshold)
 
-    chain_payload = await asyncio.to_thread(
-        fetch_option_chain_sync,
-        kite,
-        instrument,
-        expiry_str,
-        max_strike_distance,
-        max_strike_distance,
-        score_threshold,
-        indicator_params,
-    )
+    if market_provider is not None:
+        chain_payload = await market_provider.option_chain(
+            instrument,
+            expiry_str,
+            max_strike_distance,
+            max_strike_distance,
+            True,
+        )
+    else:
+        chain_payload = await asyncio.to_thread(
+            fetch_option_chain_sync,
+            kite,
+            instrument,
+            expiry_str,
+            max_strike_distance,
+            max_strike_distance,
+            score_threshold,
+            indicator_params,
+        )
     chain = chain_payload.get("chain", [])
     spot = float(chain_payload.get("spot") or 0.0)
     if not chain or spot <= 0:
@@ -1474,7 +2013,7 @@ async def _get_live_candidates_trendpulse_z(
                 "failed_conditions": fc,
                 "spot_price": round(spot, 2),
                 "timeframe": tf_label,
-                "refresh_interval_sec": 30,
+                "refresh_interval_sec": RECOMMENDATION_ENGINE_REFRESH_SEC,
                 "distance_to_atm": distance_to_atm,
                 "oi": oi,
                 "oi_chg_pct": float(leg.get("oiChgPct") or 0.0),
@@ -1513,6 +2052,7 @@ async def _get_live_candidates_trendpulse_z(
 
 async def _get_live_candidates_heuristic(
     kite: "KiteConnect | None",
+    market_provider: Any | None,
     max_strike_distance: int,
     score_threshold: float = 3.0,
     score_max: float = 5.0,
@@ -1532,7 +2072,18 @@ async def _get_live_candidates_heuristic(
 ) -> list[dict]:
     """Generate recommendations using multi-heuristic weighted scoring + optional strike/DTE/joint-OI enhancements."""
     instrument = "NIFTY"
-    expiry_str = pick_primary_expiry_str(kite, instrument)
+    if market_provider is not None:
+        try:
+            expiries, _src = await market_provider.expiries(instrument)
+        except Exception:
+            expiries = []
+        expiry_str = _pick_expiry_from_provider_list(
+            expiries,
+            min_dte_calendar_days=0,
+            nifty_weekly_expiry_weekday=None,
+        )
+    else:
+        expiry_str = pick_primary_expiry_str(kite, instrument)
     if not expiry_str:
         return []
     try:
@@ -1544,16 +2095,25 @@ async def _get_live_candidates_heuristic(
         "rsi_max": float(rsi_max),
         "volume_min_ratio": 0.8,
     }
-    chain_payload = await asyncio.to_thread(
-        fetch_option_chain_sync,
-        kite,
-        instrument,
-        expiry_str,
-        max_strike_distance,
-        max_strike_distance,
-        2,
-        indicator_params,
-    )
+    if market_provider is not None:
+        chain_payload = await market_provider.option_chain(
+            instrument,
+            expiry_str,
+            max_strike_distance,
+            max_strike_distance,
+            True,
+        )
+    else:
+        chain_payload = await asyncio.to_thread(
+            fetch_option_chain_sync,
+            kite,
+            instrument,
+            expiry_str,
+            max_strike_distance,
+            max_strike_distance,
+            2,
+            indicator_params,
+        )
     chain = chain_payload.get("chain", [])
     spot = float(chain_payload.get("spot") or 0.0)
     spot_chg_pct = chain_payload.get("spotChgPct")
@@ -1707,7 +2267,7 @@ async def _get_live_candidates_heuristic(
                         "heuristic_reasons": extra_reasons,
                         "spot_price": round(spot, 2),
                         "timeframe": "3m",
-                        "refresh_interval_sec": 30,
+                        "refresh_interval_sec": RECOMMENDATION_ENGINE_REFRESH_SEC,
                         "distance_to_atm": distance_to_atm,
                         "oi": oi,
                         "oi_chg_pct": oi_chg_pct,
@@ -1756,7 +2316,8 @@ async def get_strategy_score_params(
         strategy_id,
         strategy_version,
     )
-    details = _parse_details(catalog_row.get("strategy_details_json") if catalog_row else None)
+    catalog_details = _parse_details(catalog_row.get("strategy_details_json") if catalog_row else None)
+    details = dict(catalog_details)
     if user_id is not None:
         user_row = await fetchrow(
             """
@@ -1834,9 +2395,17 @@ async def get_strategy_score_params(
     _stp = details.get("scoreThresholdPE")
     score_threshold_pe = float(_stp) if isinstance(_stp, (int, float)) else None
 
-    position_intent = str(details.get("positionIntent", "long_premium")).strip().lower()
+    catalog_position_intent = str(catalog_details.get("positionIntent", "long_premium")).strip().lower()
+    if catalog_position_intent not in ("long_premium", "short_premium"):
+        catalog_position_intent = "long_premium"
+    position_intent = catalog_position_intent
+    execution_action_intent = str(
+        details.get("tradeActionIntent", details.get("positionIntent", position_intent))
+    ).strip().lower()
     if position_intent not in ("long_premium", "short_premium"):
         position_intent = "long_premium"
+    if execution_action_intent not in ("long_premium", "short_premium"):
+        execution_action_intent = position_intent
     ivr_min_threshold = (
         float(ivr_cfg["minThreshold"]) if isinstance(ivr_cfg.get("minThreshold"), (int, float)) else 0.0
     )
@@ -1909,6 +2478,7 @@ async def get_strategy_score_params(
     result: dict[str, Any] = {
         "strategy_type": strategy_type,
         "position_intent": position_intent,
+        "execution_action_intent": execution_action_intent,
         "ivr_min_threshold": ivr_min_threshold,
         "ivr_leg_max_threshold": _num_float(ivr_cfg.get("maxLegThreshold"), 0.0),
         "strike_delta_min_abs": strike_delta_min_abs,
@@ -1982,6 +2552,10 @@ async def get_strategy_score_params(
         result["short_premium_rsi_direct_band"] = (
             bool(_srdb) if isinstance(_srdb, bool) else str(_srdb or "").strip().lower() in {"1", "true", "yes"}
         )
+        _srdc = strike_cfg.get("shortPremiumRsiDecreasing")
+        result["short_premium_rsi_decreasing"] = (
+            bool(_srdc) if isinstance(_srdc, bool) else str(_srdc or "").strip().lower() in {"1", "true", "yes"}
+        )
         result["short_premium_ivr_skew_min"] = _num_float(strike_cfg.get("shortPremiumIvrSkewMin"), 5.0)
         _pvc = strike_cfg.get("shortPremiumPcrBonusVsChain", True)
         if isinstance(_pvc, str):
@@ -1991,6 +2565,52 @@ async def get_strategy_score_params(
         result["short_premium_pcr_chain_epsilon"] = _num_float(strike_cfg.get("shortPremiumPcrChainEpsilon"), 0.0)
         result["short_premium_pcr_min_for_sell_ce"] = strike_cfg.get("shortPremiumPcrMinForSellCe")
         result["short_premium_pcr_max_for_sell_pe"] = strike_cfg.get("shortPremiumPcrMaxForSellPe")
+        result["short_premium_expansion_block_rsi"] = _num_float(
+            strike_cfg.get("shortPremiumExpansionBlockRsi"), 0.0
+        )
+        result["short_premium_vwap_weakness_min_pct"] = _num_float(
+            strike_cfg.get("shortPremiumVwapWeaknessMinPct"), 0.0
+        )
+        result["short_premium_min_momentum_points"] = _num_int(
+            strike_cfg.get("shortPremiumMinMomentumPoints"), 0
+        )
+        result["short_premium_ghost_rsi_drop_pts"] = _num_float(
+            strike_cfg.get("shortPremiumGhostRsiDropPts"), 0.0
+        )
+        _szor = strike_cfg.get("shortPremiumRsiZoneOrReversal")
+        result["short_premium_rsi_zone_or_reversal"] = (
+            bool(_szor) if isinstance(_szor, bool) else str(_szor or "").strip().lower() in {"1", "true", "yes"}
+        )
+        result["short_premium_rsi_soft_zone_low"] = _num_float(
+            strike_cfg.get("shortPremiumRsiSoftZoneLow"), 20.0
+        )
+        result["short_premium_rsi_soft_zone_high"] = _num_float(
+            strike_cfg.get("shortPremiumRsiSoftZoneHigh"), 45.0
+        )
+        result["short_premium_rsi_reversal_from_rsi"] = _num_float(
+            strike_cfg.get("shortPremiumRsiReversalFromRsi"), 70.0
+        )
+        result["short_premium_rsi_reversal_falling_bars"] = max(
+            0, min(20, _num_int(strike_cfg.get("shortPremiumRsiReversalFallingBars"), 0))
+        )
+        result["short_premium_vwap_eligible_buffer_pct"] = max(
+            0.0, min(3.0, _num_float(strike_cfg.get("shortPremiumVwapEligibleBufferPct"), 0.0))
+        )
+        _tfvw = strike_cfg.get("shortPremiumThreeFactorRequireLtpBelowVwapForEligible")
+        if _tfvw is None:
+            result["short_premium_three_factor_require_ltp_below_vwap"] = True
+        else:
+            result["short_premium_three_factor_require_ltp_below_vwap"] = (
+                bool(_tfvw) if isinstance(_tfvw, bool) else str(_tfvw).strip().lower() in {"1", "true", "yes"}
+            )
+        if strike_cfg.get("shortPremiumIvrMinCe") is not None:
+            result["short_premium_ivr_min_ce"] = _num_float(strike_cfg.get("shortPremiumIvrMinCe"), 0.0)
+        else:
+            result["short_premium_ivr_min_ce"] = None
+        if strike_cfg.get("shortPremiumIvrMinPe") is not None:
+            result["short_premium_ivr_min_pe"] = _num_float(strike_cfg.get("shortPremiumIvrMinPe"), 0.0)
+        else:
+            result["short_premium_ivr_min_pe"] = None
     result["require_rsi_for_eligible"] = bool(details.get("requireRsiForEligible", False))
     result["long_premium_spot_align"] = bool(details.get("longPremiumSpotAlign", False))
     _mve = strike_cfg.get("minVolumeEarlySession")
@@ -2001,7 +2621,14 @@ async def get_strategy_score_params(
     except (TypeError, ValueError):
         result["min_volume_early_session"] = None
     result["early_session_end_hour_ist"] = _num_int(strike_cfg.get("earlySessionEndHourIST"), 0)
+    result["flow_ranking"] = _parse_flow_ranking_cfg(strike_cfg.get("flowRanking"))
     return result
+
+
+async def get_score_params_for_active_subscription(user_id: int) -> dict[str, Any]:
+    """Catalog + merged user settings for the user's ACTIVE subscription (one helper for list/GET paths)."""
+    sid, ver = await _get_user_strategy(user_id)
+    return await get_strategy_score_params(sid, ver, user_id)
 
 
 async def _get_user_strategy(user_id: int) -> tuple[str, str]:
@@ -2091,12 +2718,30 @@ async def _get_all_active_strategies() -> list[tuple[str, str]]:
     return [(str(r["strategy_id"]), str(r["strategy_version"])) for r in rows or []]
 
 
-async def ensure_recommendations(user_id: int, kite: KiteConnect | None = None) -> None:
+async def ensure_recommendations(user_id: int, kite: KiteConnect | None = None) -> bool:
     """Generate recommendations for all users subscribed to the strategy. Uses fallback Kite if user has none.
-    Admin: generates for ALL active strategies so Trades screen shows recommendations from every strategy."""
+    Admin: generates for ALL active strategies so Trades screen shows recommendations from every strategy.
+
+    Returns True if a full run executed (option chain + evaluation), False if skipped due to throttle."""
+    # Fast path: do not wait on the per-user lock when a refresh just ran (avoids piling HTTP polls behind a slow chain).
     now_ts = time.time()
-    if _REC_CACHE_TS.get(user_id) and (now_ts - _REC_CACHE_TS[user_id]) < 25:
-        return
+    last = _REC_CACHE_TS.get(user_id)
+    if last is not None and (now_ts - last) < RECOMMENDATION_ENGINE_REFRESH_SEC:
+        return False
+
+    lock = _ensure_lock_for(user_id)
+    async with lock:
+        now_ts = time.time()
+        last = _REC_CACHE_TS.get(user_id)
+        if last is not None and (now_ts - last) < RECOMMENDATION_ENGINE_REFRESH_SEC:
+            return False
+
+        await _ensure_recommendations_locked(user_id, kite)
+        return True
+
+
+async def _ensure_recommendations_locked(user_id: int, kite: KiteConnect | None) -> None:
+    from app.services.broker_runtime import ZerodhaProvider, resolve_broker_context
 
     is_admin = await _is_admin(user_id)
     if is_admin:
@@ -2107,7 +2752,34 @@ async def ensure_recommendations(user_id: int, kite: KiteConnect | None = None) 
         sid, ver = await _get_user_strategy(user_id)
         strategy_list = [(sid, ver)]
 
-    kite = kite or await _get_kite_for_any_user()
+    broker_ctx = await resolve_broker_context(user_id, mode="PAPER")
+    market_provider = broker_ctx.market_data
+    using_zerodha_path = market_provider is None or isinstance(market_provider, ZerodhaProvider)
+    if using_zerodha_path:
+        if kite is None and isinstance(market_provider, ZerodhaProvider):
+            kite = market_provider.kite
+        kite = kite or await _get_kite_for_any_user()
+    else:
+        # Broker-agnostic mode: when an active non-Zerodha market provider exists,
+        # do not inject a Zerodha/Kite fallback dependency.
+        kite = None
+    kite_live_ok = False
+    if kite is not None:
+        try:
+            kite_live_ok = bool(await asyncio.to_thread(verify_kite_session_sync, kite))
+        except Exception:
+            kite_live_ok = False
+    if not kite_live_ok:
+        kite = None
+    if market_provider is None and kite is None:
+        _logger.info(
+            "ensure_recommendations: skip refresh user_id=%s — no live market-data session (source=%s broker=%s)",
+            user_id,
+            broker_ctx.source,
+            broker_ctx.broker_code,
+        )
+        _REC_CACHE_TS[user_id] = time.time()
+        return
     max_strike_distance = await _get_user_max_strike_distance(user_id)
 
     for strategy_id, strategy_version in strategy_list:
@@ -2129,7 +2801,7 @@ async def ensure_recommendations(user_id: int, kite: KiteConnect | None = None) 
                 strategy_version,
             )
             for uid in subscribed_users:
-                _REC_CACHE_TS[uid] = now_ts
+                _REC_CACHE_TS[uid] = time.time()
             continue
 
         strategy_type = score_params.get("strategy_type", "rule-based")
@@ -2138,6 +2810,9 @@ async def ensure_recommendations(user_id: int, kite: KiteConnect | None = None) 
         ivr_max_threshold = score_params.get("ivr_max_threshold", 20.0)
         ivr_bonus = score_params.get("ivr_bonus", 0)
         position_intent = str(score_params.get("position_intent", "long_premium"))
+        execution_action_intent = str(
+            score_params.get("execution_action_intent", position_intent)
+        )
         ivr_min_threshold = float(score_params.get("ivr_min_threshold", 0.0))
         ivr_leg_max_threshold = float(score_params.get("ivr_leg_max_threshold", 0.0))
         strike_delta_min_abs = float(score_params.get("strike_delta_min_abs", 0.29))
@@ -2168,6 +2843,7 @@ async def ensure_recommendations(user_id: int, kite: KiteConnect | None = None) 
         long_premium_spot_align = bool(score_params.get("long_premium_spot_align", False))
         min_volume_early_session = score_params.get("min_volume_early_session")
         early_session_end_hour_ist = int(score_params.get("early_session_end_hour_ist", 0) or 0)
+        flow_ranking = score_params.get("flow_ranking")
 
         generated_rows: list[dict] = []
         scanned_for_log: list[dict] | None = None
@@ -2176,19 +2852,20 @@ async def ensure_recommendations(user_id: int, kite: KiteConnect | None = None) 
         fetch_error: str | None = None
         try:
             if strategy_type == "trendpulse-z":
-                if kite is None:
+                if market_provider is None and kite is None:
                     fetch_failed = True
                     generated_rows = []
-                    fetch_error = "Zerodha session required (kite is None)"
+                    fetch_error = "index-candle capable market-data session unavailable"
                     _logger.warning(
-                        "ensure_recommendations: skip refresh for %s %s — TrendPulse Z needs a Zerodha session "
-                        "(connect Kite under Settings for admin or any user).",
+                        "ensure_recommendations: skip refresh for %s %s — TrendPulse Z currently needs "
+                        "a broker market-data session with index candles.",
                         strategy_id,
                         strategy_version,
                     )
                 else:
                     generated_rows = await _get_live_candidates_trendpulse_z(
                         kite,
+                        market_provider,
                         max_strike_distance,
                         score_params,
                     )
@@ -2202,6 +2879,7 @@ async def ensure_recommendations(user_id: int, kite: KiteConnect | None = None) 
                     enhancement_cfg = HeuristicEnhancementConfig.from_dict(raw_enh)
                 generated_rows = await _get_live_candidates_heuristic(
                     kite,
+                    market_provider,
                     max_strike_distance,
                     score_threshold=float(score_threshold),
                     score_max=float(score_max),
@@ -2222,6 +2900,7 @@ async def ensure_recommendations(user_id: int, kite: KiteConnect | None = None) 
             else:
                 generated_rows, scanned_for_log, chain_meta = await _get_live_candidates(
                     kite,
+                    market_provider,
                     max_strike_distance,
                     score_threshold=int(score_threshold),
                     score_max=score_max,
@@ -2239,6 +2918,7 @@ async def ensure_recommendations(user_id: int, kite: KiteConnect | None = None) 
                     rsi_max=rsi_max,
                     volume_min_ratio=volume_min_ratio,
                     position_intent=position_intent,
+                    execution_action_intent=execution_action_intent,
                     ivr_min_threshold=ivr_min_threshold,
                     ivr_leg_max_threshold=ivr_leg_max_threshold,
                     strike_delta_min_abs=strike_delta_min_abs,
@@ -2276,6 +2956,9 @@ async def ensure_recommendations(user_id: int, kite: KiteConnect | None = None) 
                     short_premium_rsi_direct_band=bool(
                         score_params.get("short_premium_rsi_direct_band", False)
                     ),
+                    short_premium_rsi_decreasing=bool(
+                        score_params.get("short_premium_rsi_decreasing", False)
+                    ),
                     short_premium_ivr_skew_min=float(score_params.get("short_premium_ivr_skew_min", 5)),
                     short_premium_pcr_bonus_vs_chain=bool(
                         score_params.get("short_premium_pcr_bonus_vs_chain", True)
@@ -2289,12 +2972,51 @@ async def ensure_recommendations(user_id: int, kite: KiteConnect | None = None) 
                     short_premium_pcr_max_for_sell_pe=score_params.get(
                         "short_premium_pcr_max_for_sell_pe"
                     ),
+                    short_premium_expansion_block_rsi=float(
+                        score_params.get("short_premium_expansion_block_rsi") or 0
+                    ),
+                    short_premium_vwap_weakness_min_pct=float(
+                        score_params.get("short_premium_vwap_weakness_min_pct") or 0
+                    ),
+                    short_premium_min_momentum_points=int(
+                        score_params.get("short_premium_min_momentum_points") or 0
+                    ),
+                    short_premium_ghost_rsi_drop_pts=float(
+                        score_params.get("short_premium_ghost_rsi_drop_pts") or 0
+                    ),
+                    short_premium_rsi_zone_or_reversal=bool(
+                        score_params.get("short_premium_rsi_zone_or_reversal", False)
+                    ),
+                    short_premium_rsi_soft_zone_low=float(
+                        score_params.get("short_premium_rsi_soft_zone_low", 20) or 20
+                    ),
+                    short_premium_rsi_soft_zone_high=float(
+                        score_params.get("short_premium_rsi_soft_zone_high", 45) or 45
+                    ),
+                    short_premium_rsi_reversal_from_rsi=float(
+                        score_params.get("short_premium_rsi_reversal_from_rsi", 70) or 70
+                    ),
+                    short_premium_rsi_reversal_falling_bars=max(
+                        0,
+                        min(20, int(score_params.get("short_premium_rsi_reversal_falling_bars", 0) or 0)),
+                    ),
+                    short_premium_vwap_eligible_buffer_pct=float(
+                        score_params.get("short_premium_vwap_eligible_buffer_pct", 0) or 0
+                    ),
+                    short_premium_three_factor_require_ltp_below_vwap=bool(
+                        score_params.get("short_premium_three_factor_require_ltp_below_vwap", True)
+                    ),
+                    short_premium_ivr_min_ce=score_params.get("short_premium_ivr_min_ce"),
+                    short_premium_ivr_min_pe=score_params.get("short_premium_ivr_min_pe"),
                     require_rsi_for_eligible=require_rsi_for_eligible,
                     long_premium_spot_align=long_premium_spot_align,
                     min_volume_early_session=min_volume_early_session
                     if type(min_volume_early_session) is int
                     else None,
                     early_session_end_hour_ist=early_session_end_hour_ist,
+                    flow_ranking=flow_ranking
+                    if isinstance(flow_ranking, dict)
+                    else None,
                 )
         except Exception as exc:
             fetch_failed = True
@@ -2302,7 +3024,14 @@ async def ensure_recommendations(user_id: int, kite: KiteConnect | None = None) 
             scanned_for_log = None
             chain_meta = {}
             fetch_error = str(exc)
-            _logger.warning(
+            err_l = fetch_error.lower()
+            expected_market_data_gap = (
+                "live zerodha session required" in err_l
+                or "live zerodha connection is required" in err_l
+                or "broker market-data session" in err_l
+            )
+            log_fn = _logger.info if expected_market_data_gap else _logger.warning
+            log_fn(
                 "ensure_recommendations failed strategy=%s version=%s: %s",
                 strategy_id,
                 strategy_version,
@@ -2325,11 +3054,11 @@ async def ensure_recommendations(user_id: int, kite: KiteConnect | None = None) 
 
         if fetch_failed:
             for uid in subscribed_users:
-                _REC_CACHE_TS[uid] = now_ts
+                _REC_CACHE_TS[uid] = time.time()
             continue
 
         if not generated_rows:
-            _logger.info(
+            _logger.debug(
                 "ensure_recommendations: zero candidates strategy=%s version=%s — clearing stale GENERATED rows",
                 strategy_id,
                 strategy_version,
@@ -2345,19 +3074,34 @@ async def ensure_recommendations(user_id: int, kite: KiteConnect | None = None) 
                     strategy_version,
                 )
                 invalidate_recommendation_cache(uid)
-                _REC_CACHE_TS[uid] = now_ts
+                _REC_CACHE_TS[uid] = time.time()
             continue
 
         for uid in subscribed_users:
+            new_ids = list(
+                dict.fromkeys(
+                    _stable_recommendation_id(
+                        int(uid),
+                        str(strategy_id),
+                        str(strategy_version),
+                        str(rec["symbol"]),
+                        str(rec["side"]),
+                    )
+                    for rec in generated_rows
+                )
+            )
             await execute(
                 """
                 DELETE FROM s004_trade_recommendations
                 WHERE user_id = $1 AND strategy_id = $2 AND strategy_version = $3 AND status = 'GENERATED'
+                  AND NOT (recommendation_id = ANY($4::text[]))
                 """,
                 uid,
                 strategy_id,
                 strategy_version,
+                new_ids,
             )
+            invalidate_recommendation_cache(int(uid))
 
         for rank_idx, rec in enumerate(generated_rows, start=1):
             rec_details = {
@@ -2365,6 +3109,8 @@ async def ensure_recommendations(user_id: int, kite: KiteConnect | None = None) 
                 "ema9": rec["ema9"],
                 "ema21": rec["ema21"],
                 "rsi": rec["rsi"],
+                "rsi_prev": rec.get("rsi_prev"),
+                "short_premium_rsi_drop": rec.get("short_premium_rsi_drop"),
                 "ivr": rec.get("ivr"),
                 "volume": rec["volume"],
                 "avg_volume": rec["avg_volume"],
@@ -2387,9 +3133,19 @@ async def ensure_recommendations(user_id: int, kite: KiteConnect | None = None) 
                 "gamma": rec.get("gamma"),
                 "oi": rec.get("oi"),
                 "option_type": rec.get("option_type"),
+                "oi_chg_pct": rec.get("oi_chg_pct"),
+                "buildup": rec.get("buildup"),
+                "flow_rank_score": rec.get("flow_rank_score"),
+                "flow_pin_penalized": rec.get("flow_pin_penalized"),
             }
             for uid in subscribed_users:
-                rec_id = f"rec-{uuid4().hex[:10]}"
+                rec_id = _stable_recommendation_id(
+                    int(uid),
+                    str(strategy_id),
+                    str(strategy_version),
+                    str(rec["symbol"]),
+                    str(rec["side"]),
+                )
                 await execute(
                     """
                     INSERT INTO s004_trade_recommendations (
@@ -2398,7 +3154,23 @@ async def ensure_recommendations(user_id: int, kite: KiteConnect | None = None) 
                         details_json
                     )
                     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'TREND_SNAP','GENERATED',NOW(),$15::jsonb)
-                    ON CONFLICT (recommendation_id) DO NOTHING
+                    ON CONFLICT (recommendation_id) DO UPDATE SET
+                        strategy_id = EXCLUDED.strategy_id,
+                        strategy_version = EXCLUDED.strategy_version,
+                        user_id = EXCLUDED.user_id,
+                        instrument = EXCLUDED.instrument,
+                        expiry = EXCLUDED.expiry,
+                        symbol = EXCLUDED.symbol,
+                        side = EXCLUDED.side,
+                        entry_price = EXCLUDED.entry_price,
+                        target_price = EXCLUDED.target_price,
+                        stop_loss_price = EXCLUDED.stop_loss_price,
+                        confidence_score = EXCLUDED.confidence_score,
+                        rank_value = EXCLUDED.rank_value,
+                        score = EXCLUDED.score,
+                        details_json = EXCLUDED.details_json,
+                        updated_at = NOW()
+                    WHERE s004_trade_recommendations.status = 'GENERATED'
                     """,
                     rec_id,
                     strategy_id,
@@ -2421,7 +3193,7 @@ async def ensure_recommendations(user_id: int, kite: KiteConnect | None = None) 
                 _REC_DETAILS_CACHE[uid][rec_id] = rec_details
 
         for uid in subscribed_users:
-            _REC_CACHE_TS[uid] = now_ts
+            _REC_CACHE_TS[uid] = time.time()
 
 
 async def _get_user_strategy_params(user_id: int) -> dict:
@@ -2492,8 +3264,12 @@ async def execute_recommendation(
         recommendation_id,
         user_id,
     )
-    if not rec or rec["status"] != "GENERATED":
-        raise ValueError("Recommendation not found or already processed.")
+    if not rec:
+        raise ValueError(
+            "Recommendation not found. Refresh the Trades or Dashboard list — ids rotate after each chain refresh."
+        )
+    if rec["status"] != "GENERATED":
+        raise ValueError("Recommendation already processed.")
 
     mode = mode.upper()
     if mode not in ("PAPER", "LIVE"):
@@ -2629,6 +3405,20 @@ async def execute_recommendation(
         WHERE recommendation_id = $1
         """,
         recommendation_id,
+    )
+
+    from app.services.trade_chain_snapshot_service import schedule_entry_chain_snapshot
+
+    schedule_entry_chain_snapshot(
+        trade_ref=trade_ref,
+        user_id=user_id,
+        recommendation_id=recommendation_id,
+        strategy_id=str(rec["strategy_id"]),
+        strategy_version=str(rec["strategy_version"]),
+        mode=mode,
+        symbol=str(rec["symbol"]),
+        instrument=str(rec["instrument"]),
+        expiry=str(rec["expiry"]),
     )
 
     return {"trade_ref": trade_ref, "order_ref": order_ref}
@@ -2813,20 +3603,21 @@ async def _audit_generated_evaluations(
         if signal_eligible is None and score_val is not None:
             signal_eligible = score_val >= score_threshold
         reasons: list[str] = []
-        if conf < min_confidence_line:
-            reasons.append(f"confidence_{round(conf, 2)}_below_{min_confidence_line}")
-        if score_val is None:
-            reasons.append("score_missing")
-        elif score_val < auto_thresh:
-            reasons.append("below_auto_trade_score_threshold")
-        if signal_eligible is not True:
-            reasons.append("signal_not_eligible_vs_display_threshold")
-        eligible = (
-            conf >= min_confidence_line
-            and score_val is not None
-            and score_val >= auto_thresh
-            and signal_eligible is True
+        eligible = row_meets_auto_execute_score_bar(
+            item,
+            min_score=auto_thresh,
+            score_threshold=score_threshold,
+            min_confidence=min_confidence_line,
         )
+        if not eligible:
+            if conf < min_confidence_line:
+                reasons.append(f"confidence_{round(conf, 2)}_below_{min_confidence_line}")
+            if score_val is None:
+                reasons.append("score_missing")
+            elif score_val < auto_thresh:
+                reasons.append("below_auto_trade_score_threshold")
+            if signal_eligible is not True:
+                reasons.append("signal_not_eligible_vs_display_threshold")
         evaluations.append(
             {
                 "recommendation_id": rec_id,
@@ -2855,7 +3646,31 @@ async def _audit_generated_evaluations(
 
 async def run_auto_execute_cycle() -> None:
     """Run auto-execute for all users with engine_running=true. Respects Trade Start/End from Settings. Picks trades with score >= threshold, Eligible=Yes, confidence>=80."""
+    async def _chain_eod_maint() -> None:
+        try:
+            from app.services.strategy_eod_report_service import maybe_run_strategy_eod_reports
+            from app.services.trade_chain_snapshot_service import maybe_purge_chain_snapshots
+
+            await maybe_purge_chain_snapshots()
+            await maybe_run_strategy_eod_reports()
+        except Exception:
+            _logger.warning("chain snapshot / EOD maintenance failed", exc_info=True)
+
+    try:
+        asyncio.create_task(_chain_eod_maint())
+    except RuntimeError:
+        try:
+            asyncio.get_event_loop().create_task(_chain_eod_maint())
+        except Exception:
+            _logger.debug("could not schedule chain/EOD maintenance", exc_info=True)
+
     if (await get_platform_trading_paused())[0]:
+        try:
+            from app.services.trade_chain_snapshot_service import schedule_chain_snapshot_sample_cycle
+
+            schedule_chain_snapshot_sample_cycle()
+        except Exception:
+            _logger.debug("chain snapshot sample cycle skipped (paused)", exc_info=True)
         return
     kite_shared = await _get_kite_for_any_user()
     market_ctx: dict[str, Any] = {}
@@ -2913,8 +3728,10 @@ async def run_auto_execute_cycle() -> None:
             )
             continue
         if mode == "LIVE":
-            kite_user = await _get_kite_for_user(user_id)
-            if not kite_user:
+            from app.services.broker_runtime import resolve_broker_context
+
+            live_ctx = await resolve_broker_context(user_id, mode="LIVE")
+            if not live_ctx.execution:
                 await _maybe_insert_auto_execute_decision_log(
                     user_id=user_id,
                     mode=mode,
@@ -3052,6 +3869,22 @@ async def run_auto_execute_cycle() -> None:
                         market_snapshot=market_ctx,
                     )
                     executed_ids.append(str(rec["recommendation_id"]))
+                except ValueError as ex:
+                    if "already have an open" in str(ex):
+                        _logger.debug(
+                            "auto_execute: skip recommendation_id=%s symbol=%s (open position exists)",
+                            rec.get("recommendation_id"),
+                            rec.get("symbol"),
+                        )
+                    else:
+                        _logger.warning(
+                            "auto_execute: execute_recommendation failed user_id=%s mode=%s recommendation_id=%s symbol=%s",
+                            user_id,
+                            mode,
+                            rec.get("recommendation_id"),
+                            rec.get("symbol"),
+                            exc_info=True,
+                        )
                 except Exception:
                     _logger.warning(
                         "auto_execute: execute_recommendation failed user_id=%s mode=%s recommendation_id=%s symbol=%s",
@@ -3091,6 +3924,105 @@ async def run_auto_execute_cycle() -> None:
                 mode,
             )
 
+    try:
+        from app.services.trade_chain_snapshot_service import schedule_chain_snapshot_sample_cycle
+
+        schedule_chain_snapshot_sample_cycle()
+    except Exception:
+        _logger.debug("chain snapshot sample cycle schedule skipped", exc_info=True)
+
+
+def row_meets_auto_execute_score_bar(
+    r: dict[str, Any],
+    *,
+    min_score: float,
+    score_threshold: float,
+    min_confidence: float,
+) -> bool:
+    """Score / signal / confidence gates shared by auto-execute and GET /recommendations?eligible_only (SIGNALS)."""
+    sc = r.get("score")
+    if sc is None:
+        return False
+    try:
+        sv = float(sc)
+    except (TypeError, ValueError):
+        return False
+    try:
+        conf = float(r.get("confidence_score") or 0)
+    except (TypeError, ValueError):
+        conf = 0.0
+    if conf < float(min_confidence):
+        return False
+    sig = r.get("signal_eligible")
+    if sig is None:
+        sig = sv >= float(score_threshold)
+    if sig is not True:
+        return False
+    return sv >= float(min_score)
+
+
+async def filter_rows_auto_execute_aligned(
+    user_id: int,
+    rows: list[dict[str, Any]],
+    *,
+    all_strategies: bool,
+    min_confidence: float = 80.0,
+    strategy_score_params: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Keep rows that pass the same score/signal/confidence bar as auto-execute (per-row strategy params when all_strategies).
+
+    When ``strategy_score_params`` is set and ``all_strategies`` is False, reuse it and skip an extra DB round-trip.
+    """
+    if not rows:
+        return []
+    params_cache: dict[tuple[str, str], tuple[float, float]] = {}
+
+    async def _thresh(sid: str, ver: str) -> tuple[float, float]:
+        k = (sid, ver)
+        if k not in params_cache:
+            try:
+                p = await get_strategy_score_params(sid, ver, user_id)
+                params_cache[k] = (
+                    float(p["auto_trade_score_threshold"]),
+                    float(p.get("score_threshold", 3)),
+                )
+            except Exception:
+                params_cache[k] = (4.0, 3.0)
+        return params_cache[k]
+
+    out: list[dict[str, Any]] = []
+    if not all_strategies:
+        if strategy_score_params is not None:
+            auto_t = float(strategy_score_params["auto_trade_score_threshold"])
+            disp_t = float(strategy_score_params.get("score_threshold", 3))
+        else:
+            sid_u, ver_u = await _get_user_strategy(user_id)
+            auto_t, disp_t = await _thresh(sid_u, ver_u)
+        for r in rows:
+            if row_meets_auto_execute_score_bar(
+                r,
+                min_score=auto_t,
+                score_threshold=disp_t,
+                min_confidence=min_confidence,
+            ):
+                out.append(r)
+        return out
+
+    for r in rows:
+        sid = str(r.get("strategy_id") or "").strip()
+        ver = str(r.get("strategy_version") or "").strip()
+        if not sid or not ver:
+            continue
+        auto_t, disp_t = await _thresh(sid, ver)
+        if row_meets_auto_execute_score_bar(
+            r,
+            min_score=auto_t,
+            score_threshold=disp_t,
+            min_confidence=min_confidence,
+        ):
+            out.append(r)
+    return out
+
 
 async def get_auto_execute_eligible_recommendations(
     user_id: int,
@@ -3098,14 +4030,23 @@ async def get_auto_execute_eligible_recommendations(
     min_confidence: float = 80.0,
     min_score: int | None = None,
 ) -> list[dict]:
-    """Return recommendations that meet auto-execute criteria: score >= autoTradeScoreThreshold, Eligible=Yes (or inferred from score>=threshold), confidence>=80."""
+    """Return recommendations that meet auto-execute criteria: score >= autoTradeScoreThreshold, Eligible=Yes (or inferred from score>=threshold), confidence>=80.
+    Skips symbols that already have an open trade (same rule as execute_recommendation)."""
     strategy_id, strategy_version = await _get_user_strategy(user_id)
     score_params = await get_strategy_score_params(strategy_id, strategy_version, user_id)
-    auto_thresh = score_params["auto_trade_score_threshold"]
+    auto_thresh = float(score_params["auto_trade_score_threshold"])
     score_threshold = float(score_params.get("score_threshold", 3))
     if min_score is None:
         min_score = auto_thresh
     min_score_val = float(min_score)
+    open_rows = await fetch(
+        """
+        SELECT symbol FROM s004_live_trades
+        WHERE user_id = $1 AND current_state <> 'EXIT'
+        """,
+        user_id,
+    )
+    symbols_with_open = {str(row["symbol"]) for row in open_rows if row.get("symbol")}
     rows = await list_recommendations_for_user(
         user_id=user_id,
         status="GENERATED",
@@ -3115,19 +4056,19 @@ async def get_auto_execute_eligible_recommendations(
         limit=50,
         offset=0,
     )
+    kite = await get_kite_for_quotes(user_id)
+    rows = await filter_recommendations_short_delta_band_only(user_id, kite, rows)
     eligible: list[dict] = []
     for r in rows:
-        score = r.get("score")
-        if score is None:
+        sym = r.get("symbol")
+        if sym is not None and str(sym) in symbols_with_open:
             continue
-        try:
-            score_val = float(score)
-        except (TypeError, ValueError):
-            continue
-        signal_eligible = r.get("signal_eligible")
-        if signal_eligible is None:
-            signal_eligible = score_val >= score_threshold
-        if score_val >= min_score_val and signal_eligible is True:
+        if row_meets_auto_execute_score_bar(
+            r,
+            min_score=min_score_val,
+            score_threshold=score_threshold,
+            min_confidence=min_confidence,
+        ):
             r["mode"] = mode
             eligible.append(r)
     return eligible
@@ -3156,13 +4097,42 @@ async def filter_recommendations_short_delta_band_only(
     """
     if not rows:
         return rows
-    vix: Any = None
-    if kite is not None:
+    keys_ordered: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for r in rows:
+        sid = str(r.get("strategy_id") or "").strip()
+        ver = str(r.get("strategy_version") or "").strip()
+        if sid and ver:
+            k = (sid, ver)
+            if k not in seen:
+                seen.add(k)
+                keys_ordered.append(k)
+
+    async def _load_params(k: tuple[str, str]) -> tuple[tuple[str, str], dict[str, Any]]:
         try:
-            vix = await asyncio.to_thread(_vix_from_quote, kite)
+            return k, await get_strategy_score_params(k[0], k[1], user_id)
         except Exception:
-            vix = None
+            _logger.exception(
+                "filter_recommendations_short_delta_band_only: get_strategy_score_params failed sid=%s ver=%s",
+                k[0],
+                k[1],
+            )
+            return k, {}
+
     params_cache: dict[tuple[str, str], dict[str, Any]] = {}
+    if keys_ordered:
+        loaded = await asyncio.gather(*[_load_params(k) for k in keys_ordered])
+        for k, sp in loaded:
+            params_cache[k] = sp
+
+    any_short = any(
+        str(sp.get("position_intent", "")).strip().lower() == "short_premium" for sp in params_cache.values()
+    )
+    if not any_short:
+        return rows
+
+    _vix_unset = object()
+    vix: Any = _vix_unset
     out: list[dict[str, Any]] = []
     for r in rows:
         sid = str(r.get("strategy_id") or "").strip()
@@ -3171,20 +4141,33 @@ async def filter_recommendations_short_delta_band_only(
             out.append(r)
             continue
         key = (sid, ver)
-        if key not in params_cache:
-            try:
-                params_cache[key] = await get_strategy_score_params(sid, ver, user_id)
-            except Exception:
-                _logger.exception(
-                    "filter_recommendations_short_delta_band_only: get_strategy_score_params failed sid=%s ver=%s",
-                    sid,
-                    ver,
-                )
-                params_cache[key] = {}
-        sp = params_cache[key]
+        sp = params_cache.get(key, {})
         if str(sp.get("position_intent", "")).strip().lower() != "short_premium":
             out.append(r)
             continue
+        if vix is _vix_unset:
+            if kite is not None:
+                try:
+                    vix_timeout = max(
+                        0.3,
+                        min(
+                            3.0,
+                            float(
+                                os.getenv(
+                                    "S004_RECOMMENDATIONS_VIX_TIMEOUT_SEC",
+                                    "1.2",
+                                )
+                            ),
+                        ),
+                    )
+                    vix = await asyncio.wait_for(
+                        asyncio.to_thread(_vix_from_quote, kite),
+                        timeout=vix_timeout,
+                    )
+                except Exception:
+                    vix = None
+            else:
+                vix = None
         d_lo_abs = float(sp.get("strike_delta_min_abs", 0.29))
         d_hi_abs = float(sp.get("strike_delta_max_abs", 0.35))
         bands = sp.get("short_premium_delta_vix_bands")

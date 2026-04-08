@@ -1,9 +1,9 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import AdminGuard from "@/components/AdminGuard";
 import AppFrame from "@/components/AppFrame";
-import { getAuthHeaders } from "@/lib/api_client";
+import { getAuthHeaders, postTradesRefreshCycle } from "@/lib/api_client";
 import { formatDateTimeIST } from "@/lib/datetime_ist";
 
 type BuildupType = "Long Buildup" | "Short Buildup" | "Short Covering" | "Long Unwinding" | "—";
@@ -50,6 +50,11 @@ type OptionChainResponse = {
   from_cache?: boolean;
   cached_at?: string;
   using_live_broker?: boolean;
+  broker_session_ok?: boolean;
+  credentials_present?: boolean;
+  active_broker?: string | null;
+  market_data_quote_source?: string | null;
+  session_hint?: string | null;
 };
 
 type IndicesSpot = { spot: number; spotChgPct: number };
@@ -84,7 +89,7 @@ export default function AnalyticsPage() {
   const [strikesUp, setStrikesUp] = useState(10);
   const [strikesDown, setStrikesDown] = useState(10);
 
-  const [refreshSeconds, setRefreshSeconds] = useState(15);
+  const [refreshSeconds, setRefreshSeconds] = useState(30);
   const [requireLiveBroker, setRequireLiveBroker] = useState(false);
   const [recentWindowFetches, setRecentWindowFetches] = useState(10);
   const [indicesData, setIndicesData] = useState<IndicesData | null>(null);
@@ -96,6 +101,10 @@ export default function AnalyticsPage() {
   const [brokerSessionOk, setBrokerSessionOk] = useState<boolean | null>(null);
   const [credentialsPresent, setCredentialsPresent] = useState<boolean | null>(null);
   const [expirySource, setExpirySource] = useState<string | null>(null);
+  const [sessionHint, setSessionHint] = useState<string | null>(null);
+  const [marketDataQuoteSource, setMarketDataQuoteSource] = useState<string | null>(null);
+  const [lastRefreshAt, setLastRefreshAt] = useState<string | null>(null);
+  const chainInFlightRef = useRef(false);
 
   const sortedChain = useMemo(() => {
     const c = data?.chain ?? [];
@@ -110,9 +119,19 @@ export default function AnalyticsPage() {
   const fetchChain = useCallback(
     async (showSpinner = true) => {
       if (!expiry) return;
+      if (chainInFlightRef.current) return;
+      chainInFlightRef.current = true;
       if (showSpinner) setLoading(true);
       setError(null);
       try {
+        try {
+          await Promise.race([
+            postTradesRefreshCycle(),
+            new Promise((resolve) => window.setTimeout(resolve, 700)),
+          ]);
+        } catch {
+          /* still load chain */
+        }
         const params = new URLSearchParams({
           instrument,
           expiry,
@@ -123,12 +142,12 @@ export default function AnalyticsPage() {
         const json = await res.json();
         if (!res.ok) {
           if (res.status === 429) {
-            setRateLimitMessage(json?.detail || "Kite rate limit. Showing previous data.");
+            setRateLimitMessage(json?.detail || "Market data rate limit. Showing previous data.");
           } else if (res.status === 401) {
             setError(
               typeof json?.detail === "string"
                 ? json.detail
-                : "Zerodha session invalid. Reconnect in Settings."
+                : "Market data session invalid. Check Settings → Brokers, then refresh."
             );
             setBrokerSessionOk(false);
           } else {
@@ -137,10 +156,16 @@ export default function AnalyticsPage() {
           return;
         }
         setData(json);
+        setLastRefreshAt(json?.updated ?? new Date().toISOString());
         setRateLimitMessage(json.from_cache ? "Showing cached data (rate limited)." : null);
+        if (typeof json.broker_session_ok === "boolean") setBrokerSessionOk(json.broker_session_ok);
+        if (typeof json.credentials_present === "boolean") setCredentialsPresent(json.credentials_present);
+        if (typeof json.session_hint === "string") setSessionHint(json.session_hint);
+        if (typeof json.market_data_quote_source === "string") setMarketDataQuoteSource(json.market_data_quote_source);
       } catch (e) {
         setError(e instanceof Error ? e.message : "Network error");
       } finally {
+        chainInFlightRef.current = false;
         if (showSpinner) setLoading(false);
       }
     },
@@ -177,6 +202,8 @@ export default function AnalyticsPage() {
             broker_session_ok?: boolean;
             credentials_present?: boolean;
             expiry_source?: string;
+            session_hint?: string;
+            market_data_quote_source?: string;
           } | null
         ) => {
         if (cancelled) return;
@@ -186,6 +213,8 @@ export default function AnalyticsPage() {
           setBrokerSessionOk(false);
           setCredentialsPresent(null);
           setExpirySource(null);
+          setSessionHint(null);
+          setMarketDataQuoteSource(null);
           return;
         }
         const list = Array.isArray(json.expiries) ? json.expiries : [];
@@ -194,6 +223,8 @@ export default function AnalyticsPage() {
         setBrokerSessionOk(typeof json.broker_session_ok === "boolean" ? json.broker_session_ok : false);
         setCredentialsPresent(typeof json.credentials_present === "boolean" ? json.credentials_present : null);
         setExpirySource(json.expiry_source ?? null);
+        setSessionHint(typeof json.session_hint === "string" ? json.session_hint : null);
+        setMarketDataQuoteSource(typeof json.market_data_quote_source === "string" ? json.market_data_quote_source : null);
       }
       )
       .catch(() => {
@@ -245,6 +276,11 @@ export default function AnalyticsPage() {
         title="Option Chain Analytics"
         subtitle="NiftyAlgo-style live option chain with expiries, Greeks, buildup, and market strip."
       >
+      <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: "0.6rem" }}>
+        <span className="summary-label">
+          Last refresh: {lastRefreshAt ? formatDateTimeIST(lastRefreshAt, "—", { seconds: true }) : "—"}
+        </span>
+      </div>
       <section className="analytics-market-strip panel-accent-chain">
         <div className="market-strip-label">NSE MARKET</div>
         <div className="market-strip-items">
@@ -277,26 +313,31 @@ export default function AnalyticsPage() {
 
       {rateLimitMessage && <div className="notice warning">{rateLimitMessage}</div>}
       {error && <div className="notice error">{error}</div>}
-      {requireLiveBroker && brokerSessionOk === false && (
+      {requireLiveBroker && brokerSessionOk === false && sessionHint && (
+        <div className="notice error" role="alert">
+          {sessionHint}
+        </div>
+      )}
+      {requireLiveBroker && brokerSessionOk === false && !sessionHint && (
         <div className="notice error" role="alert">
           {credentialsPresent === false
-            ? "Zerodha API key or access token is not saved. Open Settings → Zerodha and connect before live option chain data can load."
-            : "Zerodha session is not valid (access tokens expire daily). Open Settings, reconnect Kite, then refresh this page."}
+            ? "No market-data credentials resolved for option chain (Zerodha). Connect under Settings → Brokers or use admin shared Zerodha for paper."
+            : "Market data session is not valid. Reconnect Zerodha under Settings → Brokers, then refresh."}
         </div>
       )}
       {requireLiveBroker && brokerSessionOk && expirySource === "estimated_weeklies" && (
         <div className="notice warning">
-          Using estimated weekly dates for expiry — real NFO dates could not be loaded. If this persists, reconnect Zerodha in Settings.
+          Using estimated weekly dates for expiry — real NFO dates could not be loaded. If this persists, fix the Zerodha market-data session under Settings → Brokers.
         </div>
       )}
       {requireLiveBroker && brokerSessionOk && expirySource === "zerodha_nfo" && (
         <div className="notice warning">
-          Expiries loaded from Zerodha NFO. OI/Volume change columns use the last {recentWindowFetches} in-memory fetches only.
+          Expiries loaded from broker NFO. OI/Volume change columns use the last {recentWindowFetches} in-memory fetches only.
         </div>
       )}
       {!requireLiveBroker && (
         <div className="notice info">
-          Live broker not required (OPTION_CHAIN_REQUIRE_LIVE=0). Chain may use synthetic data when Kite is unavailable.
+          Live market data not required (OPTION_CHAIN_REQUIRE_LIVE=0). Chain may use synthetic data when Zerodha quotes are unavailable.
         </div>
       )}
 
@@ -345,8 +386,23 @@ export default function AnalyticsPage() {
           {loading ? "Refreshing..." : "Refresh"}
         </button>
         {brokerSessionOk !== null && (
-          <span className={`chip ${brokerSessionOk ? "chip-status-active" : "chip-status-paused"}`} title="Validated via Kite profile()">
-            Zerodha API: {brokerSessionOk ? "Session OK" : "Not connected"}
+          <span
+            className={`chip ${brokerSessionOk ? "chip-status-active" : "chip-status-paused"}`}
+            title={sessionHint || "Zerodha Kite used for indices and option chain market data"}
+          >
+            Market data
+            {marketDataQuoteSource === "user_zerodha"
+              ? " (your Zerodha)"
+              : marketDataQuoteSource === "user_fyers"
+                ? " (your FYERS)"
+              : marketDataQuoteSource === "platform_shared"
+                ? " (shared Zerodha)"
+              : marketDataQuoteSource === "platform_only_unavailable"
+                ? " (admin shared — unavailable)"
+                : marketDataQuoteSource === "pool_or_env"
+                  ? " (server)"
+                  : ""}
+            : {brokerSessionOk ? "OK" : "unavailable"}
           </span>
         )}
         {data?.using_live_broker === false && brokerSessionOk && (

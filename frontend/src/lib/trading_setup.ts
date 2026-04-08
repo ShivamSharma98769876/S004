@@ -9,6 +9,8 @@ export type MasterSetup = {
   mode: TradeMode;
   maxTrades: number;
   dailyLossLimit: number;
+  /** Backend: zerodha | fyers | null */
+  activeBroker?: string | null;
   /** "connected" = Admin direct Kite, "shared" = using shared API, "none" = unavailable */
   kiteStatus?: "connected" | "shared" | "none";
 };
@@ -53,6 +55,7 @@ export type StrategyDetails = {
   indicators?: Record<string, unknown>;
   scoreThreshold?: number;
   scoreDescription?: string;
+  positionIntent?: "long_premium" | "short_premium";
   [key: string]: unknown;
 };
 

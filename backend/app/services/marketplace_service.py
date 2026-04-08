@@ -12,8 +12,8 @@ def _strategy_explainer(strategy_id: str, display_name: str, description: str) -
     if "trendsnap" in sid or "trendsnap" in name:
         return (
             "TrendSnap Momentum enters option trades when short-term momentum confirms direction "
-            "with price-action continuation and risk checks; exits are managed using SL, target, "
-            "and breakeven rules from your settings."
+            "with price-action continuation and risk checks; eligible strikes rank using the same CE/PE flow read as "
+            "the landing page plus OI, volume, and OI change. Exits use SL, target, and breakeven rules from your settings."
         )
     if "ivr-trend-short" in sid or "ivr trend short" in name:
         return (
@@ -32,6 +32,18 @@ def _strategy_explainer(strategy_id: str, display_name: str, description: str) -
             "then prioritizes higher-confidence entries."
         )
     return description or "Strategy logic configured by admin with runtime risk controls from settings."
+
+
+def _parse_details(raw: object) -> dict:
+    if isinstance(raw, dict):
+        return dict(raw)
+    if isinstance(raw, str):
+        try:
+            v = json.loads(raw)
+            return v if isinstance(v, dict) else {}
+        except Exception:
+            return {}
+    return {}
 
 
 async def list_strategies_for_user(
@@ -68,6 +80,7 @@ async def list_strategies_for_user(
             c.display_name,
             COALESCE(c.description, '') AS description,
             c.strategy_details_json,
+            us.strategy_details_json AS user_strategy_details_json,
             c.risk_profile,
             c.publish_status,
             COALESCE((c.performance_snapshot->>'pnl_30d')::numeric, 0) AS pnl_30d,
@@ -76,6 +89,8 @@ async def list_strategies_for_user(
         FROM s004_strategy_catalog c
         LEFT JOIN s004_strategy_subscriptions s
             ON s.user_id = $1 AND s.strategy_id = c.strategy_id AND s.strategy_version = c.version
+        LEFT JOIN s004_user_strategy_settings us
+            ON us.user_id = $1 AND us.strategy_id = c.strategy_id AND us.strategy_version = c.version
         WHERE {where_sql}
         ORDER BY {order_col} {order_dir}, c.updated_at DESC
         LIMIT ${argn} OFFSET ${argn + 1}
@@ -89,12 +104,10 @@ async def list_strategies_for_user(
         row_status = str(r["subscription_status"])
         if status and row_status != status.upper():
             continue
-        details = r.get("strategy_details_json")
-        if isinstance(details, str):
-            try:
-                details = json.loads(details) if details else None
-            except Exception:
-                details = None
+        details = _parse_details(r.get("strategy_details_json")) or None
+        user_details = _parse_details(r.get("user_strategy_details_json"))
+        pi_raw = str(user_details.get("tradeActionIntent") or user_details.get("positionIntent") or "").strip().lower()
+        position_intent = pi_raw if pi_raw in {"long_premium", "short_premium"} else "long_premium"
         out.append(
             {
                 "strategy_id": r["strategy_id"],
@@ -106,6 +119,7 @@ async def list_strategies_for_user(
                 "risk_profile": r["risk_profile"],
                 "status": row_status,
                 "publish_status": r["publish_status"],
+                "position_intent": position_intent,
                 # Reset marketplace performance counters for fresh runtime.
                 "pnl_30d": 0.0,
                 "win_rate": 0.0,
@@ -202,4 +216,26 @@ async def upsert_subscription(
         status,
     )
     if status == "ACTIVE":
+        # Only one ACTIVE row per (user, strategy_id): otherwise _get_user_strategy can pick an older
+        # version via ORDER BY user_strategy_settings.updated_at and recommendations/logs stay on stale JSON.
+        await execute(
+            """
+            UPDATE s004_strategy_subscriptions
+            SET status = 'PAUSED', updated_at = NOW()
+            WHERE user_id = $1 AND strategy_id = $2 AND strategy_version <> $3 AND status = 'ACTIVE'
+            """,
+            user_id,
+            strategy_id,
+            strategy_version,
+        )
+        await execute(
+            """
+            UPDATE s004_user_strategy_settings
+            SET updated_at = NOW()
+            WHERE user_id = $1 AND strategy_id = $2 AND strategy_version = $3
+            """,
+            user_id,
+            strategy_id,
+            strategy_version,
+        )
         await ensure_user_strategy_settings(user_id, strategy_id, strategy_version)

@@ -6,7 +6,7 @@ import json
 from typing import Any
 
 import asyncpg
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from kiteconnect import KiteConnect
 from pydantic import BaseModel
 
@@ -52,8 +52,31 @@ DEFAULT_STRATEGY_DETAILS = {
     "scoreThreshold": 3,
     "scoreMax": 4,
     "autoTradeScoreThreshold": 4,
+    "positionIntent": "long_premium",
     "scoreDescription": "Primary: close must be above VWAP. Score 0-4: VWAP, EMA9>EMA21, RSI 50-75, volume>1.02x avg. No crossover or IVR points. BUY CE/PE when score >= 3.",
 }
+
+
+def _deep_merge_strategy_details(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = dict(base)
+    for k, v in overlay.items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _deep_merge_strategy_details(out[k], v)  # type: ignore[index]
+        else:
+            out[k] = v
+    return out
+
+
+def _parse_strategy_details(raw: Any) -> dict[str, Any]:
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, dict) else {}
+        except json.JSONDecodeError:
+            return {}
+    if isinstance(raw, dict):
+        return dict(raw)
+    return {}
 
 
 class ZerodhaConnectPayload(BaseModel):
@@ -210,8 +233,9 @@ async def get_settings(
 
     cred = _credentials_from_row(master["credentials_json"])
 
-    # Prefer strategy_details from catalog (source of truth); fall back to user override or default
-    raw_details = None
+    # Effective strategy_details = default + catalog + user override (user wins).
+    catalog_details: dict[str, Any] = {}
+    user_details: dict[str, Any] = {}
     catalog_row = await fetchrow(
         """
         SELECT strategy_details_json FROM s004_strategy_catalog
@@ -221,18 +245,10 @@ async def get_settings(
         strategy["strategy_version"],
     )
     if catalog_row:
-        raw_details = catalog_row.get("strategy_details_json")
-    if raw_details is None:
-        raw_details = strategy.get("strategy_details_json")
-    if isinstance(raw_details, str):
-        try:
-            strategy_details = json.loads(raw_details) if raw_details else DEFAULT_STRATEGY_DETAILS
-        except json.JSONDecodeError:
-            strategy_details = DEFAULT_STRATEGY_DETAILS
-    elif isinstance(raw_details, dict):
-        strategy_details = {**DEFAULT_STRATEGY_DETAILS, **raw_details}
-    else:
-        strategy_details = DEFAULT_STRATEGY_DETAILS
+        catalog_details = _parse_strategy_details(catalog_row.get("strategy_details_json"))
+    user_details = _parse_strategy_details(strategy.get("strategy_details_json"))
+    strategy_details = _deep_merge_strategy_details(DEFAULT_STRATEGY_DETAILS, catalog_details)
+    strategy_details = _deep_merge_strategy_details(strategy_details, user_details)
 
     # Non-admins cannot keep LIVE in DB without approved_live (avoids UI/API mismatch).
     appr = await fetchrow(
@@ -255,6 +271,9 @@ async def get_settings(
             effective_mode,
         )
 
+    from app.services.broker_accounts import get_active_broker_code
+
+    active_broker = await get_active_broker_code(user_id)
     return SettingsResponse(
         master={
             "goLive": master["go_live"],
@@ -265,6 +284,7 @@ async def get_settings(
             "mode": effective_mode,
             "maxTrades": master["max_parallel_trades"],
             "dailyLossLimit": float(master["max_loss_day"]),
+            "activeBroker": active_broker,
         },
         credentials={
             "apiKey": cred.get("apiKey", ""),
@@ -323,7 +343,11 @@ async def get_settings(
 
 
 @router.post("/zerodha/connect")
-async def connect_zerodha(payload: ZerodhaConnectPayload, user_id: int = Depends(get_user_id)) -> dict[str, Any]:
+async def connect_zerodha(
+    payload: ZerodhaConnectPayload,
+    request: Request,
+    user_id: int = Depends(get_user_id),
+) -> dict[str, Any]:
     await ensure_user(user_id)
     master = await fetchrow(
         """
@@ -377,17 +401,44 @@ async def connect_zerodha(payload: ZerodhaConnectPayload, user_id: int = Depends
     cred["apiSecret"] = api_secret
     cred["requestToken"] = request_token
     cred["accessToken"] = access_token
-    await execute(
-        """
-        UPDATE s004_user_master_settings
-        SET broker_connected = TRUE,
-            credentials_json = $2::jsonb,
-            updated_at = NOW()
-        WHERE user_id = $1
-        """,
-        user_id,
-        json.dumps(cred),
+    from app.services import broker_accounts as ba
+
+    client_ip = request.client.host if request.client else None
+    await ba.log_broker_audit(
+        actor_user_id=user_id,
+        subject_user_id=user_id,
+        broker_code=ba.BROKER_ZERODHA,
+        action="CONNECT",
+        client_ip=client_ip,
+        meta={"generated_access_token": generated},
     )
+    if ba.fernet_key_configured():
+        vault = await ba.load_merged_vault(user_id)
+        vault[ba.BROKER_ZERODHA] = {
+            "apiKey": api_key,
+            "apiSecret": api_secret,
+            "accessToken": access_token,
+        }
+        await ba.save_user_vault(
+            user_id,
+            vault,
+            active_broker=ba.BROKER_ZERODHA,
+            broker_connected=True,
+            sync_credentials_json=True,
+        )
+    else:
+        await execute(
+            """
+            UPDATE s004_user_master_settings
+            SET broker_connected = TRUE,
+                credentials_json = $2::jsonb,
+                active_broker_code = 'zerodha',
+                updated_at = NOW()
+            WHERE user_id = $1
+            """,
+            user_id,
+            json.dumps(cred),
+        )
     return {
         "status": "connected",
         "brokerConnected": True,
@@ -398,7 +449,10 @@ async def connect_zerodha(payload: ZerodhaConnectPayload, user_id: int = Depends
 
 
 @router.post("/zerodha/disconnect")
-async def disconnect_zerodha(user_id: int = Depends(get_user_id)) -> dict[str, Any]:
+async def disconnect_zerodha(
+    request: Request,
+    user_id: int = Depends(get_user_id),
+) -> dict[str, Any]:
     await ensure_user(user_id)
     master = await fetchrow(
         """
@@ -410,20 +464,57 @@ async def disconnect_zerodha(user_id: int = Depends(get_user_id)) -> dict[str, A
     if master is None:
         raise HTTPException(status_code=404, detail="Master settings not found.")
 
+    from app.services import broker_accounts as ba
+
     cred = _credentials_from_row(master["credentials_json"])
     cred["accessToken"] = ""
-    await execute(
-        """
-        UPDATE s004_user_master_settings
-        SET broker_connected = FALSE,
-            credentials_json = $2::jsonb,
-            updated_at = NOW()
-        WHERE user_id = $1
-        """,
+    row_prev = await fetchrow(
+        "SELECT active_broker_code FROM s004_user_master_settings WHERE user_id = $1",
         user_id,
-        json.dumps(cred),
     )
-    return {"status": "disconnected", "brokerConnected": False}
+    prev_active = str(row_prev.get("active_broker_code") or "").strip().lower() if row_prev else ""
+    vault = await ba.load_merged_vault(user_id)
+    if ba.BROKER_ZERODHA in vault:
+        vault[ba.BROKER_ZERODHA] = {"apiKey": "", "apiSecret": "", "accessToken": ""}
+    f = vault.get(ba.BROKER_FYERS) if isinstance(vault.get(ba.BROKER_FYERS), dict) else {}
+    has_f = bool(str(f.get("accessToken") or "").strip())
+    if prev_active == ba.BROKER_ZERODHA:
+        next_active = ba.BROKER_FYERS if has_f else None
+    else:
+        next_active = prev_active or None
+    client_ip = request.client.host if request.client else None
+    await ba.log_broker_audit(
+        actor_user_id=user_id,
+        subject_user_id=user_id,
+        broker_code=ba.BROKER_ZERODHA,
+        action="DISCONNECT",
+        client_ip=client_ip,
+        meta={},
+    )
+    if ba.fernet_key_configured():
+        await ba.save_user_vault(
+            user_id,
+            vault,
+            active_broker=next_active,
+            broker_connected=has_f,
+            sync_credentials_json=True,
+        )
+    else:
+        await execute(
+            """
+            UPDATE s004_user_master_settings
+            SET broker_connected = $3,
+                credentials_json = $2::jsonb,
+                active_broker_code = $4,
+                updated_at = NOW()
+            WHERE user_id = $1
+            """,
+            user_id,
+            json.dumps(cred),
+            has_f,
+            next_active,
+        )
+    return {"status": "disconnected", "brokerConnected": has_f, "activeBroker": next_active}
 
 
 @router.put("")

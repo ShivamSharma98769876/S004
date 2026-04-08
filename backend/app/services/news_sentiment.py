@@ -206,31 +206,37 @@ async def compute_news_sentiment_snapshot(*, force_refresh: bool = False) -> dic
     feed_errors: list[str] = []
     timeout = httpx.Timeout(12.0, connect=5.0)
     async with httpx.AsyncClient(timeout=timeout, headers=_HTTP_HEADERS) as client:
-        for url in urls:
-            try:
-                chunk = await _fetch_one_feed(client, url, per_feed)
-                for it in chunk:
-                    it["_feed"] = url
-                items_raw.extend(chunk)
-            except Exception as ex:  # noqa: BLE001 — aggregate errors for UI
-                msg = f"{type(ex).__name__}: {ex}"
+        # Fetch feeds concurrently so decision-snapshot latency is bounded by slowest feed, not sum of all feeds.
+        feed_results = await asyncio.gather(
+            *(_fetch_one_feed(client, url, per_feed) for url in urls),
+            return_exceptions=True,
+        )
+        for url, res in zip(urls, feed_results):
+            if isinstance(res, BaseException):
+                msg = f"{type(res).__name__}: {res}"
                 feed_errors.append(f"{url[:48]}… {msg}" if len(url) > 48 else f"{url}: {msg}")
+                continue
+            chunk = res
+            for it in chunk:
+                it["_feed"] = url
+            items_raw.extend(chunk)
 
         # Built-in fallbacks when defaults yield nothing (e.g. regional blocking).
         if not items_raw and not (os.environ.get("NEWS_RSS_URLS") or "").strip():
-            for url in _FALLBACK_FEEDS:
-                if url in urls:
-                    continue
-                try:
-                    chunk = await _fetch_one_feed(client, url, per_feed)
-                    for it in chunk:
-                        it["_feed"] = url
-                    items_raw.extend(chunk)
-                    if items_raw:
-                        break
-                except Exception as ex:  # noqa: BLE001
-                    msg = f"{type(ex).__name__}: {ex}"
+            f_urls = [u for u in _FALLBACK_FEEDS if u not in urls]
+            fb_results = await asyncio.gather(
+                *(_fetch_one_feed(client, url, per_feed) for url in f_urls),
+                return_exceptions=True,
+            )
+            for url, res in zip(f_urls, fb_results):
+                if isinstance(res, BaseException):  # noqa: BLE001
+                    msg = f"{type(res).__name__}: {res}"
                     feed_errors.append(f"fallback {url[:40]}… {msg}" if len(url) > 40 else f"fallback {url}: {msg}")
+                    continue
+                chunk = res
+                for it in chunk:
+                    it["_feed"] = url
+                items_raw.extend(chunk)
 
     # de-dupe by title
     seen: set[str] = set()

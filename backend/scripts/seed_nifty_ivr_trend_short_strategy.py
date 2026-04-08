@@ -17,7 +17,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 STRATEGY_ID = "strat-nifty-ivr-trend-short"
-STRATEGY_VERSION = "1.1.0"
+STRATEGY_VERSION = "1.2.0"
 
 STRATEGY_DETAILS: dict = {
     "strategyType": "rule-based",
@@ -26,8 +26,9 @@ STRATEGY_DETAILS: dict = {
     "description": (
         "NIFTY short premium. Per-leg regime on option LTP: fresh EMA9 cross below EMA21 within emaCrossover.maxCandlesSinceCross "
         "and last close < leg VWAP for both sell-CE and sell-PE (symmetric). If both legs qualify at one strike, the more recent "
-        "cross wins. VIX→delta via shortPremiumDeltaVixBands; leg RSI band via indicators.rsi when shortPremiumRsiDirectBand. "
-        "Per-strike chain IVR in [ivr.minThreshold, maxLegThreshold]. No ADX; no min OI/volume when both are 0."
+        "cross wins. VIX→delta via shortPremiumDeltaVixBands; leg RSI when shortPremiumRsiDecreasing: RSI < shortPremiumRsiBelow "
+        "and RSI strictly below prior-bar leg RSI (same period as indicators.rsi). Per-strike chain IVR in [ivr.minThreshold, maxLegThreshold]. "
+        "No ADX; no min OI/volume when both are 0."
     ),
     "spotRegimeMode": "ema_cross_vwap",
     "spotRegimeSatisfiedScore": 5,
@@ -40,19 +41,19 @@ STRATEGY_DETAILS: dict = {
         },
         "emaCrossover": {
             "bonus": 0,
-            "maxCandlesSinceCross": 5,
-            "description": "Fresh cross within this many candles on the leg LTP series (default 5 if unset).",
+            "maxCandlesSinceCross": 8,
+            "description": "Fresh cross within this many candles on the leg LTP series.",
         },
         "ivr": {
-            "minThreshold": 55,
+            "minThreshold": 40,
             "maxLegThreshold": 100,
             "description": "Per-strike chain IVR must be between minThreshold and maxLegThreshold (inclusive).",
         },
         "rsi": {
             "period": 14,
-            "min": 65,
+            "min": 0,
             "max": 100,
-            "description": "Option-leg RSI (on LTP series). With shortPremiumRsiDirectBand=true, leg RSI must lie in [min, max] (overbought band).",
+            "description": "Option-leg RSI on LTP series (period). With shortPremiumRsiDecreasing=true and three_factor, leg RSI must be < shortPremiumRsiBelow and falling vs the prior bar.",
         },
         "vwap": {
             "description": (
@@ -85,25 +86,26 @@ STRATEGY_DETAILS: dict = {
             },
         },
         "shortPremiumDeltaOnlyStrikes": True,
-        "shortPremiumRsiDirectBand": True,
+        "shortPremiumRsiDirectBand": False,
+        "shortPremiumRsiDecreasing": True,
         "minDteCalendarDays": 2,
         "niftyWeeklyExpiryWeekday": "TUE",
         "selectStrikeByMinGamma": True,
-        "maxStrikeRecommendations": 1,
+        "maxStrikeRecommendations": 3,
         "shortPremiumAsymmetricDatm": False,
         "shortPremiumCeMinSteps": 2,
         "shortPremiumCeMaxSteps": 4,
         "shortPremiumPeMinSteps": -4,
         "shortPremiumPeMaxSteps": 2,
         "shortPremiumLegScoreMode": "three_factor",
-        "shortPremiumRsiBelow": 50,
+        "shortPremiumRsiBelow": 80,
         "shortPremiumIvrSkewMin": 5,
         "shortPremiumPcrBonusVsChain": True,
         "shortPremiumPcrChainEpsilon": 0,
         "description": (
             "India VIX first; delta-only strike ladder. VIX>17 → CE +0.29..+0.35, PE -0.35..-0.29; "
             "VIX≤17 → CE +0.33..+0.40, PE -0.40..-0.33. Regime: same for CE/PE — fresh EMA9<EMA21 cross + LTP<VWAP on leg. "
-            "shortPremiumRsiDirectBand: leg RSI in indicators.rsi min–max (65–100). IVR band on chain ivr. "
+            "shortPremiumRsiDecreasing: leg RSI < shortPremiumRsiBelow (80) and falling vs prior bar. IVR band on chain ivr. "
             "±strikes/side floor 12 (env S004_SHORT_PREMIUM_DELTA_ONLY_STRIKES_EACH_SIDE). DTE≥2; Tue weekly; min gamma; three_factor + skew/PCR."
         ),
     },
@@ -112,7 +114,8 @@ STRATEGY_DETAILS: dict = {
     "autoTradeScoreThreshold": 4,
     "scoreDescription": (
         "Symmetric sell CE/PE: regimeSellPe/Ce = fresh EMA9 cross below EMA21 + LTP < leg VWAP (tie-break if both). "
-        "Leg RSI in [indicators.rsi.min, max] when shortPremiumRsiDirectBand. Leg IVR in [ivr.minThreshold, maxLegThreshold]. "
+        "Leg RSI below shortPremiumRsiBelow and decreasing vs prior bar when shortPremiumRsiDecreasing. "
+        "Leg IVR in [ivr.minThreshold, maxLegThreshold]. "
         "three_factor technical up to 3 points + skew/PCR bonuses. Auto-trade at autoTradeScoreThreshold."
     ),
 }
@@ -193,7 +196,7 @@ async def main() -> None:
             STRATEGY_ID,
             STRATEGY_VERSION,
             "Nifty IVR Trend Short",
-            "NIFTY naked short premium: per-strike leg regime (EMA9/21 cross + LTP vs leg VWAP), chain IVR 40–65, "
+            "NIFTY naked short premium: per-strike leg regime (EMA9/21 cross + LTP vs leg VWAP), chain IVR 40–100, "
             "VIX-based delta bands. High risk; margin required.",
             "HIGH",
             "ADMIN",
