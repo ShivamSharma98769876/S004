@@ -37,7 +37,7 @@ SELECT
     '{"win_rate_30d": 61.2, "pnl_30d": 12450.25}'::jsonb,
     '{
       "displayName": "TrendSnap Momentum",
-      "description": "Four-factor option read on the latest candle: close above VWAP (required gate), EMA9 above EMA21, RSI 50-75, volume above 1.02x average. RSI must be in band for eligibility (not score-only). NIFTY spot trend must align: bullish for CE, bearish for PE. Strike choice ranks eligible legs by score then by option flow (aligned with landing CE/PE tilt), OI/volume depth, OI change, and Long Buildup. Early session uses relaxed min contract volume until 10:00 IST. Exits use SL, target, and breakeven from Settings.",
+      "description": "Four-factor option read on the latest candle: close above VWAP (required gate), EMA9 above EMA21, RSI ≥ 50 (no 75 cap), volume above 1.0x average. RSI must be in band for eligibility (not score-only). NIFTY spot trend must align: bullish for CE, bearish for PE. Strike choice ranks eligible legs by score then by option flow (aligned with landing CE/PE tilt), OI/volume depth, OI change, and Long Buildup. Early session uses relaxed min contract volume until 10:30 IST. Exits use SL, target, and breakeven from Settings.",
       "requireRsiForEligible": true,
       "longPremiumSpotAlign": true,
       "includeEmaCrossoverInScore": false,
@@ -46,15 +46,16 @@ SELECT
         "ema": {"fast": 9, "slow": 21, "description": "EMA9 strictly above EMA21 adds one point."},
         "emaCrossover": {"bonus": 0, "maxCandlesSinceCross": 10, "description": "Not counted in score; metadata only."},
         "ivr": {"bonus": 0, "maxThreshold": 20, "description": "IVR for reference on the chain; no score bonus."},
-        "rsi": {"period": 14, "min": 50, "max": 75, "description": "RSI between 50 and 75 adds one point."},
+        "rsi": {"period": 14, "min": 50, "max": 100, "description": "RSI at or above 50 adds one point (upper band relaxed)."},
         "vwap": {"description": "Latest candle close strictly above VWAP is the primary gate and first point."},
-        "volumeSpike": {"minRatio": 1.02, "description": "Volume strictly above 1.02x recent average adds one point."}
+        "volumeSpike": {"minRatio": 1.0, "description": "Volume strictly above 1.0x recent average adds one point."}
       },
       "strikeSelection": {
         "minOi": 5000,
         "minVolume": 300,
         "minVolumeEarlySession": 120,
         "earlySessionEndHourIST": 10,
+        "earlySessionEndMinuteIST": 30,
         "maxStrikeRecommendations": 2,
         "maxOtmSteps": 3,
         "deltaPreferredCE": 0.45,
@@ -79,7 +80,7 @@ SELECT
       "scoreThreshold": 3,
       "scoreMax": 4,
       "autoTradeScoreThreshold": 4,
-      "scoreDescription": "Primary: latest option close must be above VWAP (otherwise no signal). Score 0-4: +1 VWAP pass, +1 EMA9 above EMA21, +1 RSI 50-75, +1 volume above 1.02x average. No crossover or IVR points. Eligible BUY when score >= 3 AND RSI in 50-75 AND NIFTY spot regime matches leg (bullish/CE, bearish/PE). Among ties, strikes rank by flow (landing-style CE/PE tilt, OI/vol percentiles, OI change, Long Buildup). Auto-execute still requires autoTradeScoreThreshold."
+      "scoreDescription": "Primary: latest option close must be above VWAP (otherwise no signal). Score 0-4: +1 VWAP pass, +1 EMA9 above EMA21, +1 RSI ≥ 50, +1 volume above 1.0x average. No crossover or IVR points. Eligible BUY when score >= 3 AND RSI ≥ 50 AND NIFTY spot regime matches leg (bullish/CE, bearish/PE). Among ties, strikes rank by flow (landing-style CE/PE tilt, OI/vol percentiles, OI change, Long Buildup). Auto-execute still requires autoTradeScoreThreshold."
     }'::jsonb,
     u.id
 FROM s004_users u
@@ -295,15 +296,15 @@ SELECT
       "strategyType": "rule-based",
       "positionIntent": "short_premium",
       "displayName": "Nifty IVR Trend Short",
-      "description": "NIFTY short premium. Per-leg regime on option LTP: fresh EMA9 cross below EMA21 within emaCrossover.maxCandlesSinceCross and last close < leg VWAP for both sell-CE and sell-PE (symmetric). If both legs qualify at one strike, the more recent cross wins. VIX→delta via shortPremiumDeltaVixBands; leg RSI when shortPremiumRsiDecreasing. Per-strike chain IVR in [ivr.minThreshold, maxLegThreshold]. Strike liquidity: minOi 3000, minVolume 200.",
+      "description": "NIFTY short premium. Per-leg regime on option LTP: fresh EMA9 cross below EMA21 and premium-weakness context with relaxed VWAP eligibility buffer. VIX→delta via widened shortPremiumDeltaVixBands. Leg RSI uses shortPremiumRsiBelow without mandatory falling-vs-prior bar. Per-strike chain IVR in [ivr.minThreshold, maxLegThreshold]. Strike liquidity: minOi 3000, minVolume 200.",
       "spotRegimeMode": "ema_cross_vwap",
       "spotRegimeSatisfiedScore": 5,
       "includeVolumeInLegScore": false,
       "indicators": {
         "ema": {"fast": 9, "slow": 21, "description": "EMA9 vs EMA21 on each option leg LTP series; regime uses a fresh crossover on that leg."},
-        "emaCrossover": {"bonus": 0, "maxCandlesSinceCross": 8, "description": "Fresh cross within this many candles on the leg LTP series."},
+        "emaCrossover": {"bonus": 0, "maxCandlesSinceCross": 10, "description": "Fresh cross within this many candles on the leg LTP series."},
         "ivr": {"minThreshold": 45, "maxLegThreshold": 100, "description": "Per-strike chain IVR must be between minThreshold and maxLegThreshold (inclusive)."},
-        "rsi": {"period": 14, "min": 0, "max": 100, "description": "Option-leg RSI on LTP series (period). With shortPremiumRsiDecreasing=true and three_factor, leg RSI must be < shortPremiumRsiBelow and falling vs the prior bar."},
+        "rsi": {"period": 14, "min": 0, "max": 100, "description": "Option-leg RSI on LTP series (period). Leg RSI must be below shortPremiumRsiBelow; falling-vs-prior bar is optional via shortPremiumRsiDecreasing."},
         "vwap": {"description": "Leg last close vs leg VWAP: required LTP close < VWAP for both sell-PE and sell-CE regime paths (spotRegimeMode ema_cross_vwap)."}
       },
       "strikeSelection": {
@@ -317,21 +318,24 @@ SELECT
         "shortPremiumDeltaVixBands": {
           "threshold": 17,
           "vixAbove": {
-            "deltaMinCE": 0.29,
-            "deltaMaxCE": 0.35,
-            "deltaMinPE": -0.35,
-            "deltaMaxPE": -0.29
-          },
-          "vixAtOrBelow": {
-            "deltaMinCE": 0.33,
+            "deltaMinCE": 0.25,
             "deltaMaxCE": 0.40,
             "deltaMinPE": -0.40,
-            "deltaMaxPE": -0.33
+            "deltaMaxPE": -0.25
+          },
+          "vixAtOrBelow": {
+            "deltaMinCE": 0.25,
+            "deltaMaxCE": 0.40,
+            "deltaMinPE": -0.40,
+            "deltaMaxPE": -0.25
           }
         },
         "shortPremiumDeltaOnlyStrikes": true,
         "shortPremiumRsiDirectBand": false,
-        "shortPremiumRsiDecreasing": true,
+        "shortPremiumRsiDecreasing": false,
+        "shortPremiumVwapEligibleBufferPct": 0.75,
+        "shortPremiumEmaEligibleBufferPct": 0.3,
+        "shortPremiumThreeFactorRequireLtpBelowVwapForEligible": false,
         "minDteCalendarDays": 2,
         "niftyWeeklyExpiryWeekday": "TUE",
         "selectStrikeByMinGamma": true,
@@ -342,16 +346,16 @@ SELECT
         "shortPremiumPeMinSteps": -4,
         "shortPremiumPeMaxSteps": 2,
         "shortPremiumLegScoreMode": "three_factor",
-        "shortPremiumRsiBelow": 80,
+        "shortPremiumRsiBelow": 85,
         "shortPremiumIvrSkewMin": 5,
         "shortPremiumPcrBonusVsChain": true,
         "shortPremiumPcrChainEpsilon": 0,
-        "description": "India VIX first; delta-only strike ladder. Min OI 3000 and min volume 200 per strike. VIX>17 → CE +0.29..+0.35, PE -0.35..-0.29; VIX≤17 → wider bands. IVR min 45 (per-strike). Regime: fresh EMA9<EMA21 + LTP<VWAP. RSI decreasing <80. Auto at score ≥4. ±strikes/side floor 12 (env). DTE≥2; Tue weekly; min gamma; three_factor + skew/PCR."
+        "description": "India VIX first; delta-only strike ladder. Min OI 3000 and min volume 200 per strike. VIX bands widened to CE +0.25..+0.40 / PE -0.40..-0.25. IVR min 45 (per-strike). Regime keeps EMA weakness with relaxed VWAP eligibility buffer (shortPremiumVwapEligibleBufferPct) and no mandatory RSI decreasing check. Auto at score ≥3.5. ±strikes/side floor 12 (env). DTE≥2; Tue weekly; min gamma; three_factor + skew/PCR."
       },
       "scoreThreshold": 3,
       "scoreMax": 5,
-      "autoTradeScoreThreshold": 4,
-      "scoreDescription": "Symmetric sell CE/PE: regimeSellPe/Ce = fresh EMA9 cross below EMA21 + LTP < leg VWAP (tie-break if both). Leg RSI below shortPremiumRsiBelow and decreasing vs prior bar when shortPremiumRsiDecreasing. Leg IVR in [ivr.minThreshold, maxLegThreshold]. three_factor technical up to 3 points + skew/PCR bonuses. Auto-trade at autoTradeScoreThreshold."
+      "autoTradeScoreThreshold": 3.5,
+      "scoreDescription": "Symmetric sell CE/PE with widened VIX delta bands. Regime uses EMA weakness and relaxed VWAP eligibility buffer; RSI must be below shortPremiumRsiBelow without mandatory decreasing filter. Leg IVR in [ivr.minThreshold, maxLegThreshold]. three_factor technical up to 3 points + skew/PCR bonuses. Auto-trade at autoTradeScoreThreshold."
     }'::jsonb,
     u.id
 FROM s004_users u
@@ -515,15 +519,10 @@ SELECT
     50000
 FROM s004_users u
 WHERE u.username IN ('admin', 'trader1')
-ON CONFLICT (user_id) DO UPDATE
-SET mode = EXCLUDED.mode,
-    max_parallel_trades = EXCLUDED.max_parallel_trades,
-    max_trades_day = EXCLUDED.max_trades_day,
-    max_profit_day = EXCLUDED.max_profit_day,
-    max_loss_day = EXCLUDED.max_loss_day,
-    initial_capital = EXCLUDED.initial_capital,
-    max_investment_per_trade = EXCLUDED.max_investment_per_trade,
-    updated_at = NOW();
+  AND NOT EXISTS (
+    SELECT 1 FROM s004_user_master_settings m WHERE m.user_id = u.id
+  );
+-- Seed only missing master rows; never touch existing (re-seed must not reset daily caps / limits).
 
 INSERT INTO s004_user_strategy_settings (
     user_id,
@@ -568,21 +567,11 @@ SELECT
     3
 FROM s004_users u
 WHERE u.username IN ('admin', 'trader1')
-ON CONFLICT (user_id, strategy_id, strategy_version) DO UPDATE
-SET lots = EXCLUDED.lots,
-    lot_size = EXCLUDED.lot_size,
-    max_strike_distance_atm = EXCLUDED.max_strike_distance_atm,
-    max_premium = EXCLUDED.max_premium,
-    min_premium = EXCLUDED.min_premium,
-    min_entry_strength_pct = EXCLUDED.min_entry_strength_pct,
-    sl_type = EXCLUDED.sl_type,
-    sl_points = EXCLUDED.sl_points,
-    breakeven_trigger_pct = EXCLUDED.breakeven_trigger_pct,
-    target_points = EXCLUDED.target_points,
-    trailing_sl_points = EXCLUDED.trailing_sl_points,
-    timeframe = EXCLUDED.timeframe,
-    trade_start = EXCLUDED.trade_start,
-    trade_end = EXCLUDED.trade_end,
-    enabled_indices = EXCLUDED.enabled_indices,
-    auto_pause_after_losses = EXCLUDED.auto_pause_after_losses,
-    updated_at = NOW();
+  AND NOT EXISTS (
+    SELECT 1
+    FROM s004_user_strategy_settings s
+    WHERE s.user_id = u.id
+      AND s.strategy_id = 'strat-trendsnap-momentum'
+      AND s.strategy_version = '1.0.0'
+  );
+-- Seed only missing strategy rows for TrendSnap 1.0.0; never overwrite saved SL/target/window.

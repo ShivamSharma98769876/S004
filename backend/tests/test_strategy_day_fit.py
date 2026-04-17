@@ -19,6 +19,9 @@ def test_position_intent_defaults_long() -> None:
 def test_strategy_kind() -> None:
     assert strategy_kind({"strategyType": "trendpulse-z"}) == "trendpulse_z"
     assert strategy_kind({"strategyType": "heuristic-voting"}) == "heuristic_voting"
+    assert strategy_kind({"strategyType": "supertrend-trail"}) == "supertrend_trail"
+    assert strategy_kind({"strategyType": "stochastic-bnf"}) == "stochastic_bnf"
+    assert strategy_kind({"strategyType": "ps-vs-mtf"}) == "ps_vs_mtf"
     assert strategy_kind({}) == "rule_based"
 
 

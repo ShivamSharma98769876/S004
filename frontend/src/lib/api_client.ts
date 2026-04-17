@@ -5,6 +5,9 @@ const API_BASE = typeof window !== "undefined" ? "" : (process.env.NEXT_PUBLIC_A
 const AUTH_KEY = "s004.auth";
 const DEFAULT_API_TIMEOUT_MS = 20_000;
 
+/** Live/paper execute may wait on broker APIs (e.g. Zerodha); keep above default list timeout. */
+export const API_TIMEOUT_EXECUTE_MS = 90_000;
+
 export type AuthUser = {
   user_id: number;
   username: string;
@@ -20,7 +23,16 @@ export function getAuth(): AuthUser | null {
     const raw = window.localStorage.getItem(AUTH_KEY);
     if (!raw) return null;
     const parsed = JSON.parse(raw) as AuthUser;
-    if (parsed?.user_id && parsed?.username && parsed?.role) return parsed as AuthUser;
+    const uid = parsed?.user_id;
+  if (
+    uid != null &&
+    Number.isFinite(Number(uid)) &&
+    Number(uid) > 0 &&
+    parsed?.username &&
+    parsed?.role
+  ) {
+    return parsed as AuthUser;
+  }
   } catch {
     /* ignore */
   }
@@ -75,19 +87,26 @@ export async function apiJson<T>(
   }
   const suffix = qs.size ? `?${qs.toString()}` : "";
   const userId = getCurrentUserId();
+  if (userId <= 0) {
+    throw new Error("Not signed in. Open /login and sign in again so settings save to your account.");
+  }
   let res: Response;
   let timeoutId: ReturnType<typeof setTimeout> | null = null;
   const controller = new AbortController();
+  const explicitTimeoutMs = options?.timeoutMs;
   const timeoutMsRaw = Number(
-    options?.timeoutMs ?? process.env.NEXT_PUBLIC_API_TIMEOUT_MS ?? DEFAULT_API_TIMEOUT_MS,
+    explicitTimeoutMs ?? process.env.NEXT_PUBLIC_API_TIMEOUT_MS ?? DEFAULT_API_TIMEOUT_MS,
   );
+  const maxAllowedMs =
+    explicitTimeoutMs != null && Number.isFinite(Number(explicitTimeoutMs)) ? 120_000 : 60_000;
   const timeoutMs = Number.isFinite(timeoutMsRaw)
-    ? Math.max(2000, Math.min(60000, timeoutMsRaw))
+    ? Math.max(2000, Math.min(maxAllowedMs, timeoutMsRaw))
     : DEFAULT_API_TIMEOUT_MS;
   timeoutId = setTimeout(() => controller.abort(), timeoutMs);
   try {
     res = await fetch(`${API_BASE}${path}${suffix}`, {
       method,
+      cache: "no-store",
       headers: {
         "Content-Type": "application/json",
         "X-User-Id": String(userId),
@@ -144,4 +163,65 @@ export async function postTradesRefreshCycle(): Promise<{
     recommendation_engine_run: boolean;
     engine_provider?: "fyers" | "zerodha" | "none";
   }>("/api/trades/refresh-cycle", "POST");
+}
+
+export type ObservabilityTradeMarker = {
+  kind: string;
+  time: number;
+  tradeRef: string;
+  symbol: string;
+  mode: string;
+  side: string | null;
+  price: number;
+};
+
+export type ObservabilitySeriesBase = {
+  ok?: boolean;
+  reason?: string;
+  times?: number[];
+  [key: string]: unknown;
+};
+
+/** SuperTrend Trail: same bar as `evaluate_supertrend_trail_signal` (last closed candle in series). */
+export type ObservabilitySignalBar = {
+  ok?: boolean;
+  reason?: string | null;
+  direction?: string | null;
+  close?: number | null;
+  closePrev?: number | null;
+  emaFast?: number | null;
+  emaSlow?: number | null;
+  emaFastPrev?: number | null;
+  emaSlowPrev?: number | null;
+};
+
+export type ObservabilityPanel = {
+  kind: "stochastic_bnf" | "supertrend_trail" | "ps_vs_mtf";
+  strategyId: string;
+  strategyVersion: string;
+  displayName: string;
+  instrument: string;
+  interval: string;
+  series: ObservabilitySeriesBase;
+  markers: ObservabilityTradeMarker[];
+  optionVwap?: { time: number; value: number }[];
+  optionSymbol?: string | null;
+  signalBar?: ObservabilitySignalBar;
+};
+
+export type ObservabilitySnapshot = {
+  fetchedAt: number;
+  brokerSource: string;
+  panels: ObservabilityPanel[];
+  error?: string;
+};
+
+export async function fetchObservabilitySnapshot(refresh?: boolean): Promise<ObservabilitySnapshot> {
+  return apiJson<ObservabilitySnapshot>(
+    "/api/observability/snapshot",
+    "GET",
+    undefined,
+    refresh ? { refresh: "true" } : undefined,
+    { timeoutMs: 90_000 },
+  );
 }

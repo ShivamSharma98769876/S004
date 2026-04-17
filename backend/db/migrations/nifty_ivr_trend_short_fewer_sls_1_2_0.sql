@@ -22,7 +22,7 @@ SET
     '200'::jsonb,
     true
   ),
-  description = 'NIFTY naked short premium: symmetric CE/PE (EMA9 cross below EMA21 + LTP<VWAP on leg), chain IVR 45–100, leg RSI <80 and falling vs prior bar, VIX delta bands. Min OI 3k / volume 200 per strike. High risk; margin required.',
+  description = 'NIFTY naked short premium: symmetric CE/PE with widened VIX delta bands and relaxed RSI/VWAP entry filters. Chain IVR 45–100. Min OI 3k / volume 200 per strike. High risk; margin required.',
   updated_at = NOW()
 WHERE strategy_id = 'strat-nifty-ivr-trend-short'
   AND version = '1.2.0';

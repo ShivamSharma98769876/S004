@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import AppFrame from "@/components/AppFrame";
 import {
   DEFAULT_TRADING_SETUP,
@@ -10,7 +10,7 @@ import {
   type TradeMode,
   type TradingSetup,
 } from "@/lib/trading_setup";
-import { apiJson, isAdmin, postTradesRefreshCycle } from "@/lib/api_client";
+import { API_TIMEOUT_EXECUTE_MS, apiJson, isAdmin, postTradesRefreshCycle } from "@/lib/api_client";
 import { backendInstantMs, formatClockNowIST, formatTimeIST } from "@/lib/datetime_ist";
 
 type ClosedTrade = {
@@ -224,11 +224,12 @@ type BackendTrade = {
   manual_execute?: boolean | null;
   score?: number | null;
   confidence_score?: number | null;
+  quote_source?: "live" | "fallback" | null;
 };
 
 /** Panel copy is strategy-agnostic; active plan name lives in the dashboard status strip. */
 const STRATEGY_SIGNALS_SUBTITLE =
-  "Same entry bar as auto-execute: score ≥ autoTradeScoreThreshold, confidence ≥ 80, and signal eligible (inferred from score if needed). Inside short-premium delta band. Each ~30s tick refreshes the option chain first, then open positions and signals load from that snapshot. Scope: your active subscription (admins: all strategies, like Trades).";
+  "Same entry bar as auto-execute: score ≥ autoTradeScoreThreshold, confidence ≥ 80, and signal eligible (inferred from score if needed). Inside short-premium delta band. Engine refresh ~20s (chain + recommendations); signal list re-read ~10s (same cadence as open-position LTP poll). Scope: your active subscription (admins: all strategies, like Trades).";
 
 const STRATEGY_SIGNALS_EMPTY =
   "No eligible strikes right now. When the engine marks a strike as eligible, it appears here. Auto-execute also uses this feed.";
@@ -356,6 +357,7 @@ export default function DashboardPage() {
     displayName: string;
     positionIntent?: "long_premium" | "short_premium";
   } | null>(null);
+  const openLtpPollInFlightRef = useRef(false);
 
   const refreshSignalsAndOpen = useCallback(async () => {
     setSignalExecuteError(null);
@@ -365,12 +367,13 @@ export default function DashboardPage() {
       } catch {
         /* still load lists */
       }
+      const sigLimit = isAdmin() ? 24 : 8;
       const [recs, open] = await Promise.all([
         apiJson<SignalRecommendation[]>("/api/trades/recommendations", "GET", undefined, {
           status: "GENERATED",
           sort_by: "rank",
           sort_dir: "asc",
-          limit: 8,
+          limit: sigLimit,
           offset: 0,
           eligible_only: "true",
           ensure_refresh: "false",
@@ -401,7 +404,7 @@ export default function DashboardPage() {
           status: "GENERATED",
           sort_by: "rank",
           sort_dir: "asc",
-          limit: 24,
+          limit: isAdmin() ? 32 : 24,
           offset: 0,
           eligible_only: "true",
           ensure_refresh: "false",
@@ -410,11 +413,17 @@ export default function DashboardPage() {
         const row = fresh.find((r) => String(r.symbol || "").replace(/\s+/g, "").toUpperCase() === symKey);
         const idToUse = row?.recommendation_id ?? recommendationId;
         setSignals(fresh);
-        await apiJson("/api/trades/execute", "POST", {
-          recommendation_id: idToUse,
-          mode,
-          quantity: 1,
-        });
+        await apiJson(
+          "/api/trades/execute",
+          "POST",
+          {
+            recommendation_id: idToUse,
+            mode,
+            quantity: 1,
+          },
+          undefined,
+          { timeoutMs: API_TIMEOUT_EXECUTE_MS },
+        );
         setOptimisticOpenKeys((prev) => new Set(prev).add(`${symbol}|${mode}`));
         await refreshSignalsAndOpen();
       } catch (e) {
@@ -440,8 +449,10 @@ export default function DashboardPage() {
   }, []);
 
   useEffect(() => {
-    /** One cadence: chain/engine first, then dashboard summary + open + signals from the same snapshot. */
-    const SYNC_POLL_MS = 30_000;
+    /** Engine/chain refresh aligned with backend RECOMMENDATION_ENGINE_REFRESH_SEC (~20s); signal rows poll at LTP cadence (~10s). */
+    const ENGINE_SYNC_POLL_MS = 20_000;
+    const SIGNAL_LIST_POLL_MS = 10_000;
+    const OPEN_LTP_POLL_MS = 10_000;
 
     const applyEngine = (
       engine: {
@@ -453,6 +464,7 @@ export default function DashboardPage() {
         kiteStatus?: "connected" | "shared" | "none";
         platformApiOnline?: boolean;
         maxTradesDay?: number;
+        maxParallelTrades?: number;
         activeStrategy?: {
           strategyId: string;
           strategyVersion: string;
@@ -471,6 +483,7 @@ export default function DashboardPage() {
       const eng = engine as {
         platformApiOnline?: boolean;
         maxTradesDay?: number;
+        maxParallelTrades?: number;
         activeStrategy?: {
           strategyId: string;
           strategyVersion: string;
@@ -480,6 +493,14 @@ export default function DashboardPage() {
       };
       const mode: TradeMode =
         engine.mode === "LIVE" || engine.mode === "PAPER" ? engine.mode : prev.master.mode;
+      const maxParallel =
+        eng.maxParallelTrades != null && Number.isFinite(eng.maxParallelTrades)
+          ? eng.maxParallelTrades
+          : prev.master.maxTrades;
+      const maxDay =
+        eng.maxTradesDay != null && Number.isFinite(eng.maxTradesDay)
+          ? eng.maxTradesDay
+          : prev.capitalRisk.maxTradesDay;
       const merged: TradingSetup = {
         ...prev,
         master: {
@@ -490,13 +511,18 @@ export default function DashboardPage() {
           sharedApiConnected: sharedApi,
           kiteStatus,
           platformApiOnline: eng.platformApiOnline ?? prev.master.platformApiOnline,
-          maxTrades: eng.maxTradesDay ?? prev.master.maxTrades,
+          maxTrades: maxParallel,
+        },
+        capitalRisk: {
+          ...prev.capitalRisk,
+          maxTradesDay: maxDay,
+          maxParallelTrades: maxParallel,
         },
         strategy: {
           ...prev.strategy,
           ...(eng.activeStrategy
             ? {
-                strategyName: eng.activeStrategy.displayName,
+                strategyName: eng.activeStrategy.strategyId,
                 strategyVersion: eng.activeStrategy.strategyVersion,
               }
             : {}),
@@ -522,6 +548,7 @@ export default function DashboardPage() {
             kiteStatus?: "connected" | "shared" | "none";
             platformApiOnline?: boolean;
             maxTradesDay?: number;
+            maxParallelTrades?: number;
             activeStrategy?: {
               strategyId: string;
               strategyVersion: string;
@@ -542,11 +569,12 @@ export default function DashboardPage() {
 
     const loadSignalsOnly = async () => {
       try {
+        const sigLimit = isAdmin() ? 24 : 8;
         const recs = await apiJson<SignalRecommendation[]>("/api/trades/recommendations", "GET", undefined, {
           status: "GENERATED",
           sort_by: "rank",
           sort_dir: "asc",
-          limit: 8,
+          limit: sigLimit,
           offset: 0,
           eligible_only: "true",
           ensure_refresh: "false",
@@ -555,6 +583,19 @@ export default function DashboardPage() {
         setSignals(recs);
       } catch {
         /* keep existing signals */
+      }
+    };
+
+    const refreshOpenOnly = async () => {
+      if (openLtpPollInFlightRef.current) return;
+      openLtpPollInFlightRef.current = true;
+      try {
+        const o = await apiJson<BackendTrade[]>("/api/trades/open");
+        setOpenTradesRows(o);
+      } catch {
+        /* keep existing open-trades view on transient errors */
+      } finally {
+        openLtpPollInFlightRef.current = false;
       }
     };
 
@@ -568,9 +609,13 @@ export default function DashboardPage() {
     };
 
     void runSyncedTick();
-    const syncT = window.setInterval(() => void runSyncedTick(), SYNC_POLL_MS);
+    const engineT = window.setInterval(() => void runSyncedTick(), ENGINE_SYNC_POLL_MS);
+    const signalT = window.setInterval(() => void loadSignalsOnly(), SIGNAL_LIST_POLL_MS);
+    const openLtpT = window.setInterval(() => void refreshOpenOnly(), OPEN_LTP_POLL_MS);
     return () => {
-      window.clearInterval(syncT);
+      window.clearInterval(engineT);
+      window.clearInterval(signalT);
+      window.clearInterval(openLtpT);
     };
   }, []);
 
@@ -1130,7 +1175,27 @@ export default function DashboardPage() {
                     <td>{t.score != null ? String(t.score) : "—"}</td>
                     <td>{t.confidence_score != null ? Number(t.confidence_score).toFixed(2) : "—"}</td>
                     <td>{Number(t.entry_price).toFixed(2)}</td>
-                    <td>{Number(t.current_price || t.entry_price).toFixed(2)}</td>
+                    <td>
+                      <div className="dash-ltp-cell">
+                        <span>{Number(t.current_price || t.entry_price).toFixed(2)}</span>
+                        <span
+                          className={`dash-quote-source-badge ${
+                            String(t.quote_source || "fallback").toLowerCase() === "live"
+                              ? "is-live"
+                              : "is-fallback"
+                          }`}
+                          title={
+                            String(t.quote_source || "fallback").toLowerCase() === "live"
+                              ? "Live broker quote"
+                              : "Fallback to last known stored price"
+                          }
+                        >
+                          {String(t.quote_source || "fallback").toLowerCase() === "live"
+                            ? "live"
+                            : "fallback"}
+                        </span>
+                      </div>
+                    </td>
                     <td>{t.qty ?? t.quantity ?? 0}</td>
                     <td>{t.stop_loss_price != null ? Number(t.stop_loss_price).toFixed(2) : "--"}</td>
                     <td>{t.target_price != null ? Number(t.target_price).toFixed(2) : "--"}</td>

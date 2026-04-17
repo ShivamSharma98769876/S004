@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import deque
 import math
 import os
+import time
 from datetime import date, datetime, time, timedelta
 import statistics
 from typing import Any
@@ -109,10 +110,13 @@ def _true_range_series(candles: list[dict[str, Any]]) -> list[float]:
     return tr_vals
 
 
-def _adx_from_candles(candles: list[dict[str, Any]], period: int = 14) -> float:
-    """ADX from OHLC candles. Uses close-only TR when high/low unavailable. Returns 0 if insufficient data."""
-    if len(candles) < period + 2:
-        return 0.0
+def adx_series_from_candles(candles: list[dict[str, Any]], period: int = 14) -> list[float]:
+    """Bar-aligned ADX series (same length as ``candles``). Early bars are approximate until the indicator stabilizes."""
+    n = len(candles)
+    if n == 0:
+        return []
+    if n < period + 2:
+        return [0.0] * n
 
     tr_vals = _true_range_series(candles)
     plus_dm: list[float] = []
@@ -152,7 +156,34 @@ def _adx_from_candles(candles: list[dict[str, Any]], period: int = 14) -> float:
         for i in range(len(di_plus))
     ]
     adx_series = _wilder_smooth_list(dx_vals, period)
-    return round(adx_series[-1], 2) if adx_series else 0.0
+    return [round(float(x), 2) for x in adx_series]
+
+
+def _adx_from_candles(candles: list[dict[str, Any]], period: int = 14) -> float:
+    """ADX from OHLC candles. Uses close-only TR when high/low unavailable. Returns 0 if insufficient data."""
+    s = adx_series_from_candles(candles, period)
+    return s[-1] if s else 0.0
+
+
+def running_typical_price_average_series(candles: list[dict[str, Any]]) -> list[float]:
+    """Session running average of typical price; when volume is zero (index), weight each bar equally."""
+    out: list[float] = []
+    num = 0.0
+    den = 0.0
+    for c in candles:
+        h = float(c.get("high") or 0)
+        l_ = float(c.get("low") or 0)
+        cl = float(c.get("close") or 0)
+        v = float(c.get("volume") or 0)
+        tp = (h + l_ + cl) / 3.0 if (h or l_ or cl) else cl
+        if v > 0:
+            num += tp * v
+            den += v
+        else:
+            num += tp
+            den += 1.0
+        out.append(num / den if den > 0 else tp)
+    return out
 
 
 def _vwap_from_candles_equal_bar_weight(candles: list[dict[str, Any]]) -> float:
@@ -202,6 +233,18 @@ def nifty_index_candles_current_session(candles: list[dict[str, Any]]) -> list[d
         out.append((dti, c))
     out.sort(key=lambda x: x[0])
     return [x[1] for x in out]
+
+
+def sorted_candles_chronological(candles: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Parseable IST timestamps only, ascending time — same series order for index signals + observability."""
+    rows: list[tuple[int, dict[str, Any]]] = []
+    for c in candles or []:
+        dti = _parse_candle_time_ist(c)
+        if dti is None:
+            continue
+        rows.append((int(dti.timestamp()), c))
+    rows.sort(key=lambda x: x[0])
+    return [c for _, c in rows]
 
 
 def _vwap_from_candles(candles: list[dict[str, Any]]) -> float:
@@ -355,6 +398,7 @@ def _indicator_pack_from_series_bearish(
     rsi_reversal_from_rsi: float = 70.0,
     rsi_reversal_falling_bars: int = 0,
     vwap_eligible_buffer_pct: float = 0.0,
+    ema_eligible_buffer_pct: float = 0.0,
     three_factor_require_ltp_below_vwap_for_eligible: bool = True,
 ) -> dict[str, Any]:
     """Bearish mirror of _indicator_pack_from_series: price below VWAP, EMA9 < EMA21, RSI on option LTP.
@@ -380,6 +424,9 @@ def _indicator_pack_from_series_bearish(
 
     ``three_factor_require_ltp_below_vwap_for_eligible``: when False and mode is ``three_factor``,
     ``signalEligible`` is ``score >= score_threshold`` only (VWAP weakness still affects the score).
+
+    ``primaryOk`` / ``emaOk`` use the same 2dp-rounded LTP, VWAP line, and EMAs as returned in the
+    payload (matches UI and Reasons text).
     """
     if not ltps:
         return {
@@ -434,9 +481,21 @@ def _indicator_pack_from_series_bearish(
     except (TypeError, ValueError):
         _vbuf = 0.0
     _vbuf = max(0.0, min(3.0, _vbuf))
+    try:
+        _ebuf = float(ema_eligible_buffer_pct)
+    except (TypeError, ValueError):
+        _ebuf = 0.0
+    _ebuf = max(0.0, min(3.0, _ebuf))
     vwap_primary_line = vwap * (1.0 + _vbuf / 100.0) if vwap > 0 else vwap
-    primary_ok = close_now < vwap_primary_line
-    ema_ok = ema9 < ema21
+    ema_bear_line = ema21 * (1.0 + _ebuf / 100.0) if ema21 > 0 else ema21
+    # Pass/fail must use the same rounded values as the UI (avoids "E9<E21" on screen but emaOk false).
+    close_r = round(close_now, 2)
+    vwap_line_r = round(vwap_primary_line, 2)
+    ema9_r = round(ema9, 2)
+    ema21_r = round(ema21, 2)
+    ema_bear_line_r = round(ema_bear_line, 2)
+    primary_ok = close_r < vwap_line_r
+    ema_ok = ema9_r < ema_bear_line_r
     raw_vol_ok = vol_ratio > volume_min_ratio
     rsi_prev_bar: float | None = None
     if len(ltps) >= 4:
@@ -497,11 +556,12 @@ def _indicator_pack_from_series_bearish(
         cross_pts = (1 if ema_crossover else 0) if include_ema_crossover_in_score else 0
         technical = (1 if primary_ok else 0) + (1 if ema_ok else 0) + cross_pts + (1 if rsi_ok else 0) + vol_pts
         score = technical
+    vwap_r = round(vwap, 2)
     return {
-        "ema9": round(ema9, 2),
-        "ema21": round(ema21, 2),
+        "ema9": ema9_r,
+        "ema21": ema21_r,
         "rsi": round(rsi, 2),
-        "vwap": round(vwap, 2),
+        "vwap": vwap_r,
         "avgVolume": float(round(avg_vol, 2)),
         "volumeSpikeRatio": round(vol_ratio, 2),
         "score": score,
@@ -534,46 +594,93 @@ def _max_candles_since_cross_int(raw: Any, default: int = 5) -> int:
 _REGIME_LTP_MIN_LEN = max(9, 21) + 2
 
 
+def _regime_leg_ema_bearish_now(t: list[float]) -> tuple[float, float]:
+    """EMA9 / EMA21 on leg LTP window (same windows as bearish leg pack)."""
+    if len(t) >= 30:
+        seg = t[-30:]
+    else:
+        seg = t
+    return _ema(seg, 9), _ema(seg, 21)
+
+
 def _strike_leg_regime_sell_pe(
     ltps: list[float],
     vols: list[float],
     max_cross_i: int,
+    *,
+    vwap_eligible_buffer_pct: float = 0.0,
+    ema_eligible_buffer_pct: float = 0.0,
 ) -> tuple[bool, int | None]:
-    """Sell PE: same regime geometry as sell CE — fresh EMA9 cross below EMA21; last LTP < leg VWAP."""
-    if len(ltps) < _REGIME_LTP_MIN_LEN:
+    """Sell PE regime: LTP < leg VWAP and either (1) fresh EMA9 cross below EMA21 within max_cross_i bars,
+    or (2) sustained weakness — rounded EMA9 < EMA21 on the last bar (cross may be old or absent).
+    """
+    if len(ltps) < 5:
         return False, None
     n = min(len(ltps), len(vols))
     t = ltps[-n:]
     v = vols[-n:]
     v_sum = sum(max(0.0, x) for x in v)
     vwap = sum(p * max(0.0, vol) for p, vol in zip(t, v)) / v_sum if v_sum > 0 else statistics.mean(t)
-    if not (t[-1] < vwap):
+    buf = max(0.0, float(vwap_eligible_buffer_pct)) / 100.0
+    vwap_ceiling = vwap * (1.0 + buf)
+    if not (round(t[-1], 2) <= round(vwap_ceiling, 2)):
+        return False, None
+    # Warm-up fallback: when recent snapshot history is short, allow current EMA weakness.
+    if len(ltps) < _REGIME_LTP_MIN_LEN:
+        ema9, ema21 = _regime_leg_ema_bearish_now(t)
+        ebuf = max(0.0, float(ema_eligible_buffer_pct)) / 100.0
+        ema_ceiling = ema21 * (1.0 + ebuf)
+        if round(ema9, 2) <= round(ema_ceiling, 2):
+            return True, None
         return False, None
     bb = _bars_since_bearish_cross(t, 9, 21)
-    if bb is None or bb > max_cross_i:
-        return False, bb
-    return True, bb
+    if bb is not None and bb <= max_cross_i:
+        return True, bb
+    ema9, ema21 = _regime_leg_ema_bearish_now(t)
+    ebuf = max(0.0, float(ema_eligible_buffer_pct)) / 100.0
+    ema_ceiling = ema21 * (1.0 + ebuf)
+    if round(ema9, 2) <= round(ema_ceiling, 2):
+        # Tie-break rank: prefer smaller bb when both legs qualify (fresher structure).
+        return True, bb if bb is not None else max_cross_i + 1000
+    return False, bb
 
 
 def _strike_leg_regime_sell_ce(
     ltps: list[float],
     vols: list[float],
     max_cross_i: int,
+    *,
+    vwap_eligible_buffer_pct: float = 0.0,
+    ema_eligible_buffer_pct: float = 0.0,
 ) -> tuple[bool, int | None]:
-    """Sell CE: fresh EMA9 cross below EMA21 on this leg LTP series; last LTP < leg VWAP."""
-    if len(ltps) < _REGIME_LTP_MIN_LEN:
+    """Sell CE regime: same rule as PE — fresh cross within window OR sustained EMA9 < EMA21 with LTP < VWAP."""
+    if len(ltps) < 5:
         return False, None
     n = min(len(ltps), len(vols))
     t = ltps[-n:]
     v = vols[-n:]
     v_sum = sum(max(0.0, x) for x in v)
     vwap = sum(p * max(0.0, vol) for p, vol in zip(t, v)) / v_sum if v_sum > 0 else statistics.mean(t)
-    if not (t[-1] < vwap):
+    buf = max(0.0, float(vwap_eligible_buffer_pct)) / 100.0
+    vwap_ceiling = vwap * (1.0 + buf)
+    if not (round(t[-1], 2) <= round(vwap_ceiling, 2)):
+        return False, None
+    if len(ltps) < _REGIME_LTP_MIN_LEN:
+        ema9, ema21 = _regime_leg_ema_bearish_now(t)
+        ebuf = max(0.0, float(ema_eligible_buffer_pct)) / 100.0
+        ema_ceiling = ema21 * (1.0 + ebuf)
+        if round(ema9, 2) <= round(ema_ceiling, 2):
+            return True, None
         return False, None
     bb = _bars_since_bearish_cross(t, 9, 21)
-    if bb is None or bb > max_cross_i:
-        return False, bb
-    return True, bb
+    if bb is not None and bb <= max_cross_i:
+        return True, bb
+    ema9, ema21 = _regime_leg_ema_bearish_now(t)
+    ebuf = max(0.0, float(ema_eligible_buffer_pct)) / 100.0
+    ema_ceiling = ema21 * (1.0 + ebuf)
+    if round(ema9, 2) <= round(ema_ceiling, 2):
+        return True, bb if bb is not None else max_cross_i + 1000
+    return False, bb
 
 
 def _resolve_regime_sell_pe_ce_at_strike(
@@ -582,18 +689,25 @@ def _resolve_regime_sell_pe_ce_at_strike(
     call_ltps: list[float],
     call_vols: list[float],
     max_cross_i: int,
+    *,
+    vwap_eligible_buffer_pct: float = 0.0,
+    ema_eligible_buffer_pct: float = 0.0,
 ) -> tuple[bool, bool]:
-    """(regimeSellPe, regimeSellCe). If both qualify, keep the side whose cross is more recent (smaller bars-since)."""
-    pe_ok, pb = _strike_leg_regime_sell_pe(put_ltps, put_vols, max_cross_i)
-    ce_ok, cb = _strike_leg_regime_sell_ce(call_ltps, call_vols, max_cross_i)
-    if pe_ok and ce_ok:
-        if pb is not None and cb is not None:
-            if pb < cb:
-                return True, False
-            if cb < pb:
-                return False, True
-            return False, False
-        return False, False
+    """(regimeSellPe, regimeSellCe). Each leg is evaluated independently (no CE-vs-PE mutual exclusion)."""
+    pe_ok, _ = _strike_leg_regime_sell_pe(
+        put_ltps,
+        put_vols,
+        max_cross_i,
+        vwap_eligible_buffer_pct=vwap_eligible_buffer_pct,
+        ema_eligible_buffer_pct=ema_eligible_buffer_pct,
+    )
+    ce_ok, _ = _strike_leg_regime_sell_ce(
+        call_ltps,
+        call_vols,
+        max_cross_i,
+        vwap_eligible_buffer_pct=vwap_eligible_buffer_pct,
+        ema_eligible_buffer_pct=ema_eligible_buffer_pct,
+    )
     return pe_ok, ce_ok
 
 
@@ -624,6 +738,8 @@ def _spot_trend_payload_from_candles(
     vol_min = float(ip.get("volume_min_ratio", 1.5))
     inc_cross = bool(ip.get("include_ema_crossover_in_score", True))
     strict_bull = bool(ip.get("strict_bullish_comparisons", False))
+    long_vwap_margin = float(ip.get("longPremiumVwapMarginPct", 0.0) or 0.0)
+    long_ema_margin = float(ip.get("longPremiumEmaMarginPct", 0.0) or 0.0)
     bull = _indicator_pack_from_series(
         closes,
         vols,
@@ -634,11 +750,14 @@ def _spot_trend_payload_from_candles(
         vol_min,
         include_ema_crossover_in_score=inc_cross,
         strict_bullish_comparisons=strict_bull,
+        long_premium_vwap_margin_pct=long_vwap_margin,
+        long_premium_ema_margin_pct=long_ema_margin,
     )
     leg_mode_spot = str(ip.get("shortPremiumLegScoreMode") or "").strip().lower()
     rsi_below_spot = float(ip.get("shortPremiumRsiBelow", 50) or 50)
     rsi_direct_spot = bool(ip.get("shortPremiumRsiDirectBand"))
     rsi_dec_spot = bool(ip.get("shortPremiumRsiDecreasing"))
+    ema_buf_spot = float(ip.get("shortPremiumEmaEligibleBufferPct", 0.0) or 0.0)
     rsi_zone_or_spot = str(ip.get("shortPremiumRsiZoneOrReversal") or "").strip().lower() in {
         "1",
         "true",
@@ -685,6 +804,7 @@ def _spot_trend_payload_from_candles(
         rsi_soft_zone_high=rsi_zhi_sp,
         rsi_reversal_from_rsi=rsi_rfr_sp,
         rsi_reversal_falling_bars=rsi_rfb_sp,
+        ema_eligible_buffer_pct=ema_buf_spot,
     )
     bs = int(bull["score"])
     be = int(bear["score"])
@@ -709,6 +829,8 @@ def _indicator_pack_from_series(
     *,
     include_ema_crossover_in_score: bool = True,
     strict_bullish_comparisons: bool = False,
+    long_premium_vwap_margin_pct: float = 0.0,
+    long_premium_ema_margin_pct: float = 0.0,
     include_volume_in_score: bool = True,
     require_rsi_for_eligible: bool = False,
 ) -> dict[str, Any]:
@@ -758,9 +880,13 @@ def _indicator_pack_from_series(
     ema9_r = round(ema9, 2)
     ema21_r = round(ema21, 2)
     rsi_r = round(rsi, 2)
+    vwap_margin = max(0.0, min(10.0, float(long_premium_vwap_margin_pct)))
+    ema_margin = max(0.0, min(10.0, float(long_premium_ema_margin_pct)))
+    vwap_gate = round(vwap_r * (1.0 - (vwap_margin / 100.0)), 2)
+    ema_gate = round(ema21_r * (1.0 - (ema_margin / 100.0)), 2)
     if strict_bullish_comparisons:
-        primary_ok = close_r > vwap_r
-        ema_ok = ema9_r > ema21_r
+        primary_ok = close_r > vwap_gate
+        ema_ok = ema9_r > ema_gate
     else:
         primary_ok = close_r >= vwap_r
         ema_ok = ema9_r >= ema21_r
@@ -807,6 +933,8 @@ def _indicator_pack_from_quote_fallback(
     *,
     include_ema_crossover_in_score: bool = True,
     strict_bullish_comparisons: bool = False,
+    long_premium_vwap_margin_pct: float = 0.0,
+    long_premium_ema_margin_pct: float = 0.0,
     include_volume_in_score: bool = True,
     require_rsi_for_eligible: bool = False,
 ) -> dict[str, Any]:
@@ -829,6 +957,8 @@ def _indicator_pack_from_quote_fallback(
         volume_min_ratio,
         include_ema_crossover_in_score=include_ema_crossover_in_score,
         strict_bullish_comparisons=strict_bullish_comparisons,
+        long_premium_vwap_margin_pct=long_premium_vwap_margin_pct,
+        long_premium_ema_margin_pct=long_premium_ema_margin_pct,
         include_volume_in_score=include_volume_in_score,
         require_rsi_for_eligible=require_rsi_for_eligible,
     )
@@ -856,6 +986,7 @@ def _indicator_pack_from_quote_fallback_bearish(
     rsi_reversal_from_rsi: float = 70.0,
     rsi_reversal_falling_bars: int = 0,
     vwap_eligible_buffer_pct: float = 0.0,
+    ema_eligible_buffer_pct: float = 0.0,
     three_factor_require_ltp_below_vwap_for_eligible: bool = True,
 ) -> dict[str, Any]:
     """Same synthetic OHLC path as bullish fallback, but bearish pack (premium weakness on option LTP)."""
@@ -888,6 +1019,7 @@ def _indicator_pack_from_quote_fallback_bearish(
         rsi_reversal_from_rsi=rsi_reversal_from_rsi,
         rsi_reversal_falling_bars=rsi_reversal_falling_bars,
         vwap_eligible_buffer_pct=vwap_eligible_buffer_pct,
+        ema_eligible_buffer_pct=ema_eligible_buffer_pct,
         three_factor_require_ltp_below_vwap_for_eligible=three_factor_require_ltp_below_vwap_for_eligible,
     )
 
@@ -1130,6 +1262,75 @@ def pick_expiry_with_min_calendar_dte(
     return resolve_expiry_min_dte_weekday_with_fallback(
         expiries, today, min_dte_days=min_dte_days, weekday=weekday
     )
+
+
+def trading_sessions_from_tomorrow_through_expiry(
+    today: date,
+    expiry: date,
+    *,
+    holidays: set[date] | None = None,
+) -> int:
+    """
+    Count NSE trading sessions from **tomorrow** through ``expiry`` (inclusive of expiry),
+    skipping weekends and optional holiday set (``_estimated_nse_holidays``).
+    Used for StochasticBNF **2 trading-DTE** selection (Bank Nifty monthly Tuesday series).
+    """
+    if expiry <= today:
+        return 0
+    hol = holidays if holidays is not None else _estimated_nse_holidays()
+    n = 0
+    d = today + timedelta(days=1)
+    while d <= expiry:
+        if d.weekday() < 5 and d not in hol:
+            n += 1
+        d += timedelta(days=1)
+    return n
+
+
+def pick_expiry_two_trading_dte_tuesday_preferred(
+    expiries: list[str],
+    *,
+    today: date | None = None,
+) -> str | None:
+    """
+    Nearest listed expiry such that trading sessions (tomorrow → expiry) == 2; prefer **Tuesday**
+    (Bank Nifty monthly). Falls back to any weekday with exactly 2 sessions if Tuesday unavailable.
+    """
+    if not expiries:
+        return None
+    tday = today or _calendar_today_ist()
+    hol = _estimated_nse_holidays()
+    tue_matches: list[tuple[date, str]] = []
+    any_matches: list[tuple[date, str]] = []
+    for exp_str in expiries:
+        try:
+            d = datetime.strptime(exp_str.strip().upper(), "%d%b%Y").date()
+        except ValueError:
+            continue
+        if d <= tday:
+            continue
+        n_sess = trading_sessions_from_tomorrow_through_expiry(tday, d, holidays=hol)
+        if n_sess != 2:
+            continue
+        any_matches.append((d, exp_str))
+        if d.weekday() == 1:
+            tue_matches.append((d, exp_str))
+    pool = tue_matches if tue_matches else any_matches
+    if not pool:
+        return None
+    pool.sort(key=lambda x: x[0])
+    return pool[0][1]
+
+
+def pick_banknifty_tuesday_2_trading_dte_expiry(
+    kite: KiteConnect | None,
+    *,
+    instrument: str = "BANKNIFTY",
+) -> str | None:
+    """Broker-listed expiries → ``pick_expiry_two_trading_dte_tuesday_preferred``."""
+    inst = instrument.strip().upper()
+    expiries, _ = get_expiries_for_analytics(kite, inst)
+    return pick_expiry_two_trading_dte_tuesday_preferred(expiries, today=_calendar_today_ist())
 
 
 def _ltp_change_pct(last_price: float, prev_close: float) -> float:
@@ -1696,6 +1897,11 @@ def _build_live_chain(
     except (TypeError, ValueError):
         vwap_buf_short = 0.0
     vwap_buf_short = max(0.0, min(3.0, vwap_buf_short))
+    try:
+        ema_buf_short = float(ip_global.get("shortPremiumEmaEligibleBufferPct") or 0)
+    except (TypeError, ValueError):
+        ema_buf_short = 0.0
+    ema_buf_short = max(0.0, min(3.0, ema_buf_short))
     _tfvw = ip_global.get("shortPremiumThreeFactorRequireLtpBelowVwapForEligible")
     if _tfvw is None:
         tf_req_vwap_below = True
@@ -1785,6 +1991,8 @@ def _build_live_chain(
         vol_min = float(ip.get("volume_min_ratio", 1.5))
         inc_cross = bool(ip_global.get("include_ema_crossover_in_score", True))
         strict_bull = bool(ip_global.get("strict_bullish_comparisons", False))
+        long_vwap_margin = float(ip_global.get("longPremiumVwapMarginPct", 0.0) or 0.0)
+        long_ema_margin = float(ip_global.get("longPremiumEmaMarginPct", 0.0) or 0.0)
         inc_vol_score = bool(ip_global.get("include_volume_in_leg_score", True))
         inc_cross_bear = inc_cross
         inc_vol_bear = inc_vol_score
@@ -1812,6 +2020,7 @@ def _build_live_chain(
                 rsi_reversal_from_rsi=rsi_rev_from,
                 rsi_reversal_falling_bars=rsi_fall_n,
                 vwap_eligible_buffer_pct=vwap_buf_short,
+                ema_eligible_buffer_pct=ema_buf_short,
                 three_factor_require_ltp_below_vwap_for_eligible=tf_req_vwap_below,
             )
             put_ind = _indicator_pack_from_series_bearish(
@@ -1834,6 +2043,7 @@ def _build_live_chain(
                 rsi_reversal_from_rsi=rsi_rev_from,
                 rsi_reversal_falling_bars=rsi_fall_n,
                 vwap_eligible_buffer_pct=vwap_buf_short,
+                ema_eligible_buffer_pct=ema_buf_short,
                 three_factor_require_ltp_below_vwap_for_eligible=tf_req_vwap_below,
             )
         else:
@@ -1847,6 +2057,8 @@ def _build_live_chain(
                 vol_min,
                 include_ema_crossover_in_score=inc_cross,
                 strict_bullish_comparisons=strict_bull,
+                long_premium_vwap_margin_pct=long_vwap_margin,
+                long_premium_ema_margin_pct=long_ema_margin,
                 include_volume_in_score=inc_vol_score,
                 require_rsi_for_eligible=req_rsi_eligible,
             )
@@ -1860,6 +2072,8 @@ def _build_live_chain(
                 vol_min,
                 include_ema_crossover_in_score=inc_cross,
                 strict_bullish_comparisons=strict_bull,
+                long_premium_vwap_margin_pct=long_vwap_margin,
+                long_premium_ema_margin_pct=long_ema_margin,
                 include_volume_in_score=inc_vol_score,
                 require_rsi_for_eligible=req_rsi_eligible,
             )
@@ -1892,6 +2106,7 @@ def _build_live_chain(
                     rsi_reversal_from_rsi=rsi_rev_from,
                     rsi_reversal_falling_bars=rsi_fall_n,
                     vwap_eligible_buffer_pct=vwap_buf_short,
+                    ema_eligible_buffer_pct=ema_buf_short,
                     three_factor_require_ltp_below_vwap_for_eligible=tf_req_vwap_below,
                 )
             else:
@@ -1906,6 +2121,8 @@ def _build_live_chain(
                     vol_min,
                     include_ema_crossover_in_score=inc_cross,
                     strict_bullish_comparisons=strict_bull,
+                    long_premium_vwap_margin_pct=long_vwap_margin,
+                    long_premium_ema_margin_pct=long_ema_margin,
                     include_volume_in_score=inc_vol_score,
                     require_rsi_for_eligible=req_rsi_eligible,
                 )
@@ -1937,6 +2154,7 @@ def _build_live_chain(
                     rsi_reversal_from_rsi=rsi_rev_from,
                     rsi_reversal_falling_bars=rsi_fall_n,
                     vwap_eligible_buffer_pct=vwap_buf_short,
+                    ema_eligible_buffer_pct=ema_buf_short,
                     three_factor_require_ltp_below_vwap_for_eligible=tf_req_vwap_below,
                 )
             else:
@@ -1951,6 +2169,8 @@ def _build_live_chain(
                     vol_min,
                     include_ema_crossover_in_score=inc_cross,
                     strict_bullish_comparisons=strict_bull,
+                    long_premium_vwap_margin_pct=long_vwap_margin,
+                    long_premium_ema_margin_pct=long_ema_margin,
                     include_volume_in_score=inc_vol_score,
                     require_rsi_for_eligible=req_rsi_eligible,
                 )
@@ -1965,6 +2185,8 @@ def _build_live_chain(
                 call_ltp_series,
                 call_vol_series,
                 mxi,
+                vwap_eligible_buffer_pct=vwap_buf_short,
+                ema_eligible_buffer_pct=ema_buf_short,
             )
 
         call_oi_chg = round(((call_oi - prev_call_oi) / prev_call_oi) * 100, 2) if prev_call_oi else 0.0
@@ -2348,3 +2570,72 @@ def fetch_option_chain_sync(
         out["adx"] = adx_val
         out["adxOk"] = adx_val >= float(adx_min or 0)
     return out
+
+
+_NFO_TSYM_TO_TOKEN: dict[str, tuple[float, int]] = {}
+_NFO_TOK_TTL_SEC = 3600.0
+
+
+def get_nfo_instrument_token_for_tradingsymbol(kite: KiteConnect | None, tradingsymbol: str) -> int | None:
+    """Resolve NFO ``tradingsymbol`` → ``instrument_token`` with a short TTL cache."""
+    if kite is None:
+        return None
+    key = str(tradingsymbol or "").strip().upper()
+    if not key:
+        return None
+    now_ts = time.time()
+    cached = _NFO_TSYM_TO_TOKEN.get(key)
+    if cached and (now_ts - cached[0]) < _NFO_TOK_TTL_SEC:
+        return cached[1]
+    try:
+        for row in kite.instruments("NFO") or []:
+            if str(row.get("tradingsymbol", "")).strip().upper() == key:
+                tok = int(row.get("instrument_token", 0) or 0)
+                if tok:
+                    _NFO_TSYM_TO_TOKEN[key] = (now_ts, tok)
+                    return tok
+    except Exception:
+        pass
+    return None
+
+
+def fetch_option_minute_candles_today_ist_sync(
+    kite: KiteConnect | None, tradingsymbol: str
+) -> list[dict[str, Any]]:
+    """Today's IST session 1-minute OHLCV for an NFO option (for session VWAP)."""
+    if kite is None:
+        return []
+    tok = get_nfo_instrument_token_for_tradingsymbol(kite, tradingsymbol)
+    if not tok:
+        return []
+    now = datetime.now(_NSE_IST)
+    sess_start = now.replace(hour=9, minute=15, second=0, microsecond=0)
+    if now < sess_start:
+        sess_start = sess_start - timedelta(days=1)
+    try:
+        data = kite.historical_data(int(tok), sess_start, now, "minute")
+        if not isinstance(data, list):
+            return []
+        out: list[dict[str, Any]] = []
+        for d in data:
+            try:
+                dt = d.get("date")
+                if hasattr(dt, "isoformat"):
+                    t_iso = dt.isoformat()
+                else:
+                    t_iso = str(dt) if dt else ""
+                out.append(
+                    {
+                        "open": float(d["open"]),
+                        "high": float(d["high"]),
+                        "low": float(d["low"]),
+                        "close": float(d["close"]),
+                        "volume": float(d.get("volume") or 0),
+                        "time": t_iso,
+                    }
+                )
+            except (TypeError, ValueError, KeyError):
+                continue
+        return out
+    except Exception:
+        return []

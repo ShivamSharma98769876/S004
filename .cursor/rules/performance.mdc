@@ -1,0 +1,34 @@
+---
+description: Performance constraints for broker IO, DB, API, and frontend changes
+alwaysApply: true
+---
+
+# Performance (S004)
+
+Treat performance as a **default acceptance criterion** for any change—not an afterthought.
+
+## Broker and market data (backend)
+
+- **Reuse sessions**: Prefer existing `resolve_broker_context` / shared Kite paths over ad-hoc new connections per request.
+- **Rate limits**: Avoid extra parallel calls to Zerodha/Fyers (historical, option chain, quotes). Batch or share snapshots within a single refresh/tick when possible.
+- **No redundant IO**: Do not add per-strategy duplicate full chain or historical pulls without a shared cache or clear throttle; align with `ensure_recommendations` patterns.
+- **Async**: Keep broker calls off the event loop appropriately (`asyncio.to_thread` where the codebase already does for sync SDKs).
+
+## Database
+
+- Avoid **N+1** queries in new routes and services; prefer one query or a small fixed number with joins/`WHERE IN`.
+- Add indexes only when justified by real query patterns (migrations), not speculatively in unrelated PRs.
+
+## API and caching
+
+- Prefer **batched endpoints** and **short TTL in-process caches** for hot paths (see Observability snapshot pattern) over per-client hammering.
+- Keep response payloads **bounded**; paginate or summarize large lists.
+
+## Frontend (Next.js)
+
+- Avoid shipping heavy libraries to **every** page without code-splitting or route-level dynamic import when the dep is large.
+- Prefer **one fetch per screen refresh** where possible; avoid tight polling loops without interval/backoff.
+
+## When in doubt
+
+- Prefer **fewer, cheaper operations** over “more parallel” broker work unless quotas and impact are explicit.

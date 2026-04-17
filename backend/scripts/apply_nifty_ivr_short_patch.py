@@ -21,22 +21,21 @@ STRATEGY_ID = "strat-nifty-ivr-trend-short"
 SHORT_PREMIUM_DELTA_VIX_BANDS: dict[str, Any] = {
     "threshold": 17,
     "vixAbove": {
-        "deltaMinCE": 0.29,
-        "deltaMaxCE": 0.35,
-        "deltaMinPE": -0.35,
-        "deltaMaxPE": -0.29,
-    },
-    "vixAtOrBelow": {
-        "deltaMinCE": 0.33,
+        "deltaMinCE": 0.25,
         "deltaMaxCE": 0.40,
         "deltaMinPE": -0.40,
-        "deltaMaxPE": -0.33,
+        "deltaMaxPE": -0.25,
+    },
+    "vixAtOrBelow": {
+        "deltaMinCE": 0.25,
+        "deltaMaxCE": 0.40,
+        "deltaMinPE": -0.40,
+        "deltaMaxPE": -0.25,
     },
 }
 STRIKE_DESCRIPTION = (
-    "India VIX first; delta-only strike ladder. VIX>17 → CE +0.29..+0.35, PE -0.35..-0.29; "
-    "VIX≤17 → CE +0.33..+0.40, PE -0.40..-0.33. Regime: same for CE/PE — fresh EMA9<EMA21 cross + LTP<VWAP on leg. "
-    "shortPremiumRsiDecreasing: leg RSI < shortPremiumRsiBelow (80) and falling vs prior bar. IVR band on chain ivr. "
+    "India VIX first; delta-only strike ladder. VIX bands widened to CE +0.25..+0.40 / PE -0.40..-0.25. "
+    "Regime keeps EMA weakness with relaxed VWAP eligibility buffer and no mandatory RSI decreasing check. "
     "±strikes/side floor 12 (env S004_SHORT_PREMIUM_DELTA_ONLY_STRIKES_EACH_SIDE). DTE≥2; Tue weekly; min gamma; three_factor + skew/PCR."
 )
 IVR_BLOCK: dict[str, Any] = {
@@ -48,7 +47,7 @@ RSI_BLOCK: dict[str, Any] = {
     "period": 14,
     "min": 0,
     "max": 100,
-    "description": "Option-leg RSI on LTP series (period). With shortPremiumRsiDecreasing=true and three_factor, leg RSI must be < shortPremiumRsiBelow and falling vs the prior bar.",
+    "description": "Option-leg RSI on LTP series (period). Leg RSI must be below shortPremiumRsiBelow; falling-vs-prior bar is optional via shortPremiumRsiDecreasing.",
 }
 EMA_CROSS_BLOCK: dict[str, Any] = {
     "bonus": 0,
@@ -56,17 +55,15 @@ EMA_CROSS_BLOCK: dict[str, Any] = {
     "description": "Fresh cross within this many candles on the leg LTP series.",
 }
 TOP_DESCRIPTION = (
-    "NIFTY short premium. Per-leg regime on option LTP: fresh EMA9 cross below EMA21 within emaCrossover.maxCandlesSinceCross "
-    "and last close < leg VWAP for both sell-CE and sell-PE (symmetric). If both legs qualify at one strike, the more recent "
-    "cross wins. VIX→delta via shortPremiumDeltaVixBands; leg RSI when shortPremiumRsiDecreasing: RSI < shortPremiumRsiBelow "
-    "and RSI strictly below prior-bar leg RSI (same period as indicators.rsi). "
-    "Per-strike chain IVR in [ivr.minThreshold, maxLegThreshold]. No ADX; no min OI/volume when both are 0."
+    "NIFTY short premium. Per-leg regime on option LTP: fresh EMA9 cross below EMA21 and premium-weakness context with relaxed "
+    "VWAP eligibility buffer. VIX→delta via widened shortPremiumDeltaVixBands. Leg RSI uses shortPremiumRsiBelow without mandatory "
+    "falling-vs-prior bar. Per-strike chain IVR in [ivr.minThreshold, maxLegThreshold]."
 )
 SCORE_DESC = (
-    "Symmetric sell CE/PE: regimeSellPe/Ce = fresh EMA9 cross below EMA21 + LTP < leg VWAP (tie-break if both). "
-    "Leg RSI below shortPremiumRsiBelow and decreasing vs prior bar when shortPremiumRsiDecreasing. "
-    "Leg IVR in [ivr.minThreshold, maxLegThreshold]. "
-    "three_factor technical up to 3 points + skew/PCR bonuses. Auto-trade at autoTradeScoreThreshold."
+    "Symmetric sell CE/PE with widened VIX delta bands. Regime uses EMA weakness and relaxed VWAP eligibility buffer; "
+    "RSI must be below shortPremiumRsiBelow without mandatory decreasing filter. "
+    "Leg IVR in [ivr.minThreshold, maxLegThreshold]. three_factor technical up to 3 points + skew/PCR bonuses. "
+    "Auto-trade at autoTradeScoreThreshold."
 )
 
 
@@ -83,7 +80,9 @@ def merge(details: dict[str, Any]) -> dict[str, Any]:
     strike["shortPremiumDeltaVixBands"] = deepcopy(SHORT_PREMIUM_DELTA_VIX_BANDS)
     strike["shortPremiumDeltaOnlyStrikes"] = True
     strike["shortPremiumRsiDirectBand"] = False
-    strike["shortPremiumRsiDecreasing"] = True
+    strike["shortPremiumRsiDecreasing"] = False
+    strike["shortPremiumVwapEligibleBufferPct"] = 0.3
+    strike["shortPremiumThreeFactorRequireLtpBelowVwapForEligible"] = False
     strike["shortPremiumRsiBelow"] = 80
     strike["selectStrikeByMinGamma"] = True
     strike["maxStrikeRecommendations"] = 3

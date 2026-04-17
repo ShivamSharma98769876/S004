@@ -9,6 +9,7 @@ from pydantic import BaseModel
 from app.api.auth_context import get_user_id
 from app.db_client import ensure_user, execute, fetch, fetchrow
 from app.services.ist_time_sql import IST_TODAY, closed_at_ist_date_bare
+from app.services.lot_sizes import contract_multiplier_for_trade
 from app.services.platform_risk import (
     evaluate_trade_entry_allowed,
     get_platform_trading_paused,
@@ -157,7 +158,8 @@ async def get_engine_status(user_id: int = Depends(get_user_id)) -> dict:
         SELECT m.engine_running, m.mode, m.broker_connected, m.shared_api_connected,
                u.role, u.approved_live,
                COALESCE(m.platform_api_online, TRUE) AS platform_api_online,
-               COALESCE(m.max_trades_day, 4) AS max_trades_day
+               COALESCE(m.max_trades_day, 4) AS max_trades_day,
+               COALESCE(m.max_parallel_trades, 3) AS max_parallel_trades
         FROM s004_user_master_settings m
         LEFT JOIN s004_users u ON u.id = m.user_id
         WHERE m.user_id = $1
@@ -175,6 +177,7 @@ async def get_engine_status(user_id: int = Depends(get_user_id)) -> dict:
             "kiteStatus": "shared",
             "platformApiOnline": True,
             "maxTradesDay": 4,
+            "maxParallelTrades": 3,
         }
         if active_strategy:
             out["activeStrategy"] = active_strategy
@@ -210,6 +213,7 @@ async def get_engine_status(user_id: int = Depends(get_user_id)) -> dict:
         "kiteStatus": kite_status,
         "platformApiOnline": bool(row.get("platform_api_online", True)),
         "maxTradesDay": int(row.get("max_trades_day") or 4),
+        "maxParallelTrades": int(row.get("max_parallel_trades") or 3),
     }
     if active_strategy:
         out["activeStrategy"] = active_strategy
@@ -337,23 +341,33 @@ async def get_dashboard_summary(user_id: int = Depends(get_user_id)) -> dict:
         brokerage = trade_count * charges_per_trade
         gst_on_brokerage = round(brokerage * 0.18, 2)
         lot_size_row = await fetchrow(
-            "SELECT COALESCE(lot_size, 65) AS lot_size FROM s004_user_strategy_settings WHERE user_id = $1 ORDER BY updated_at DESC LIMIT 1",
+            """
+            SELECT COALESCE(lot_size, 65) AS lot_size, COALESCE(banknifty_lot_size, 30) AS banknifty_lot_size
+            FROM s004_user_strategy_settings WHERE user_id = $1 ORDER BY updated_at DESC LIMIT 1
+            """,
             user_id,
         )
         lot_size = int(lot_size_row["lot_size"] or 65) if lot_size_row else 65
+        bn_lot = int(lot_size_row["banknifty_lot_size"] or 30) if lot_size_row else 30
         stt_row = await fetchrow(
             f"""
             SELECT
-                COALESCE(SUM(entry_price * quantity * $2), 0) AS buy_value,
-                COALESCE(SUM(COALESCE(current_price, entry_price) * quantity * $2), 0) AS sell_value
-            FROM s004_live_trades
-            WHERE user_id = $1
-              AND current_state = 'EXIT'
-              AND closed_at IS NOT NULL
+                COALESCE(SUM(t.entry_price * t.quantity * (
+                    CASE WHEN COALESCE(r.instrument, '') = 'BANKNIFTY' THEN $3::numeric ELSE $2::numeric END
+                )), 0) AS buy_value,
+                COALESCE(SUM(COALESCE(t.current_price, t.entry_price) * t.quantity * (
+                    CASE WHEN COALESCE(r.instrument, '') = 'BANKNIFTY' THEN $3::numeric ELSE $2::numeric END
+                )), 0) AS sell_value
+            FROM s004_live_trades t
+            LEFT JOIN s004_trade_recommendations r ON r.recommendation_id = t.recommendation_id
+            WHERE t.user_id = $1
+              AND t.current_state = 'EXIT'
+              AND t.closed_at IS NOT NULL
               AND {closed_at_ist_date_bare()} = {IST_TODAY}
             """,
             user_id,
             lot_size,
+            bn_lot,
         )
         buy_value = float(stt_row["buy_value"] or 0.0) if stt_row else 0.0
         sell_value = float(stt_row["sell_value"] or 0.0) if stt_row else 0.0
@@ -408,10 +422,14 @@ async def get_dashboard_funds(user_id: int = Depends(get_user_id)) -> dict:
     bot_cap = float(master["max_investment_per_trade"])
 
     lot_row = await fetchrow(
-        "SELECT COALESCE(lot_size, 65) AS lot_size FROM s004_user_strategy_settings WHERE user_id = $1 ORDER BY updated_at DESC LIMIT 1",
+        """
+        SELECT COALESCE(lot_size, 65) AS lot_size, COALESCE(banknifty_lot_size, 30) AS banknifty_lot_size
+        FROM s004_user_strategy_settings WHERE user_id = $1 ORDER BY updated_at DESC LIMIT 1
+        """,
         user_id,
     )
     lot_size = int(lot_row["lot_size"] or 65) if lot_row else 65
+    bn_lot = int(lot_row["banknifty_lot_size"] or 30) if lot_row else 30
 
     chg_row = await fetchrow(
         "SELECT COALESCE(charges_per_trade, 20) AS charges_per_trade FROM s004_user_master_settings WHERE user_id = $1",
@@ -421,20 +439,26 @@ async def get_dashboard_funds(user_id: int = Depends(get_user_id)) -> dict:
 
     used = await fetchrow(
         """
-        SELECT COALESCE(SUM(entry_price * quantity * $2), 0) AS used_margin
-        FROM s004_live_trades
-        WHERE user_id = $1 AND current_state <> 'EXIT'
+        SELECT COALESCE(SUM(t.entry_price * t.quantity * (
+            CASE WHEN COALESCE(r.instrument, '') = 'BANKNIFTY' THEN $3::numeric ELSE $2::numeric END
+        )), 0) AS used_margin
+        FROM s004_live_trades t
+        LEFT JOIN s004_trade_recommendations r ON r.recommendation_id = t.recommendation_id
+        WHERE t.user_id = $1 AND t.current_state <> 'EXIT'
         """,
         user_id,
         lot_size,
+        bn_lot,
     )
     used_margin = float(used["used_margin"] or 0.0) if used else 0.0
 
     closed_rows = await fetch(
         """
-        SELECT entry_price, current_price, quantity, realized_pnl
-        FROM s004_live_trades
-        WHERE user_id = $1 AND current_state = 'EXIT' AND closed_at IS NOT NULL
+        SELECT t.entry_price, t.current_price, t.quantity, t.realized_pnl, t.strategy_id, t.symbol,
+               COALESCE(r.instrument, '') AS rec_instrument
+        FROM s004_live_trades t
+        LEFT JOIN s004_trade_recommendations r ON r.recommendation_id = t.recommendation_id
+        WHERE t.user_id = $1 AND t.current_state = 'EXIT' AND t.closed_at IS NOT NULL
         """,
         user_id,
     )
@@ -444,7 +468,14 @@ async def get_dashboard_funds(user_id: int = Depends(get_user_id)) -> dict:
         entry = float(r["entry_price"] or 0)
         exit_p = float(r["current_price"] or r["entry_price"] or 0)
         qty = int(r["quantity"] or 1)
-        contracts = qty * lot_size
+        mult = contract_multiplier_for_trade(
+            strategy_id=str(r.get("strategy_id") or ""),
+            symbol=str(r.get("symbol") or ""),
+            instrument=str(r.get("rec_instrument") or ""),
+            nifty_lot=lot_size,
+            banknifty_lot=bn_lot,
+        )
+        contracts = qty * mult
         est_ch = _est_charges_per_trade(entry, exit_p, contracts, charges_per_trade)
         net_realized += gross - est_ch
 

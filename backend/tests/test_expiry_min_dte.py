@@ -8,8 +8,10 @@ import app.services.option_chain_zerodha as ocz
 from app.services.option_chain_zerodha import (
     first_expiry_meeting_min_calendar_dte,
     get_expiries_for_instrument,
+    pick_expiry_two_trading_dte_tuesday_preferred,
     resolve_expiry_min_dte_weekday_with_fallback,
     select_expiry_min_dte_and_weekday,
+    trading_sessions_from_tomorrow_through_expiry,
 )
 from app.services.trades_service import _short_premium_datm_allows_leg
 
@@ -24,6 +26,32 @@ def test_min_dte_3_skips_short_dte():
 def test_min_dte_3_none_when_only_short_dte_listed():
     today = date(2026, 3, 24)
     assert first_expiry_meeting_min_calendar_dte(["26MAR2026"], today, min_dte_days=3) is None
+
+
+def test_trading_sessions_mon_to_wed_counts_two():
+    """Monday → Wednesday: Tue + Wed sessions = 2 (StochasticBNF 2-DTE)."""
+    today = date(2026, 4, 6)  # Mon
+    expiry = date(2026, 4, 8)  # Wed
+    assert trading_sessions_from_tomorrow_through_expiry(today, expiry, holidays=set()) == 2
+
+
+def test_trading_sessions_mon_to_tue_next_day_counts_one():
+    today = date(2026, 4, 6)
+    expiry = date(2026, 4, 7)  # Tue
+    assert trading_sessions_from_tomorrow_through_expiry(today, expiry, holidays=set()) == 1
+
+
+def test_pick_two_trading_dte_wednesday_when_only_match():
+    today = date(2026, 4, 6)  # Mon; Wed 08Apr has Tue+Wed = 2 sessions
+    exps = ["08APR2026"]
+    assert pick_expiry_two_trading_dte_tuesday_preferred(exps, today=today) == "08APR2026"
+
+
+def test_pick_two_trading_dte_prefers_earlier_tuesday_when_both_qualify():
+    """Fri 08 May 2026: Tue 12 May has 2 sessions (Mon+Tue); Wed 13 May has 3 — only 12MAY qualifies."""
+    today = date(2026, 5, 8)
+    exps = ["12MAY2026", "13MAY2026"]
+    assert pick_expiry_two_trading_dte_tuesday_preferred(exps, today=today) == "12MAY2026"
 
 
 def test_min_dte_0_accepts_earliest():

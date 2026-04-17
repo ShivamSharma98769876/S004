@@ -21,7 +21,9 @@ from app.services.ist_calendar import ist_today
 from app.services.ist_time_sql import IST_TODAY, closed_at_ist_date, closed_at_ist_date_bare
 from app.api.schemas import ExecuteRequest, ExecuteResponse, RecommendationOut, TradeOut
 from app.services.trade_chain_snapshot_service import fire_and_forget_exit_snapshot
+from app.services.lot_sizes import contract_multiplier_for_trade
 from app.services.trades_service import (
+    augment_admin_signal_strip,
     ensure_recommendations,
     execute_recommendation,
     filter_recommendations_short_delta_band_only,
@@ -30,6 +32,7 @@ from app.services.trades_service import (
     get_score_params_for_active_subscription,
     get_strategy_score_params,
     list_recommendations_for_user,
+    _get_user_strategy_params,
 )
 
 router = APIRouter(prefix="/trades", tags=["trades"])
@@ -171,6 +174,14 @@ def _coerce_recommendation_row(item: dict[str, Any]) -> dict[str, Any]:
             out["atm_distance"] = int(atm)
         except (TypeError, ValueError):
             out["atm_distance"] = None
+    for _k in (
+        "threshold_rsi_min",
+        "threshold_rsi_max",
+        "threshold_volume_min_ratio",
+        "include_volume_in_leg_score",
+        "threshold_failed_style",
+    ):
+        out.pop(_k, None)
     ris = out.get("refresh_interval_sec")
     if ris is not None:
         try:
@@ -252,6 +263,13 @@ async def get_strategy_params_debug(
                 "rsi_min": params.get("rsi_min"),
                 "rsi_max": params.get("rsi_max"),
                 "volume_min_ratio": params.get("volume_min_ratio"),
+                "include_volume_in_leg_score": params.get("include_volume_in_leg_score"),
+                "include_ema_crossover_in_score": params.get("include_ema_crossover_in_score"),
+                "strict_bullish_comparisons": params.get("strict_bullish_comparisons"),
+                "long_premium_vwap_margin_pct": params.get("long_premium_vwap_margin_pct"),
+                "long_premium_ema_margin_pct": params.get("long_premium_ema_margin_pct"),
+                "short_premium_vwap_eligible_buffer_pct": params.get("short_premium_vwap_eligible_buffer_pct"),
+                "short_premium_ema_eligible_buffer_pct": params.get("short_premium_ema_eligible_buffer_pct"),
                 "ema_crossover_max_candles": params.get("ema_crossover_max_candles"),
                 "adx_period": params.get("adx_period"),
                 "adx_min_threshold": params.get("adx_min_threshold"),
@@ -266,6 +284,14 @@ def _symbol_to_kite_nfo(symbol: str) -> str:
     """Convert stored symbol to Zerodha NFO quote format. Ours (NIFTY2631723250CE) matches Zerodha weekly YYMDD."""
     s = str(symbol or "").replace(" ", "").upper()
     return f"NFO:{s}" if s else "NFO:"
+
+
+def _symbol_to_fyers_symbol(symbol: str) -> str:
+    """Convert stored symbol to FYERS quote format (NSE:<symbol>)."""
+    s = str(symbol or "").replace(" ", "").upper()
+    if not s:
+        return "NSE:"
+    return s if ":" in s else f"NSE:{s}"
 
 
 async def _get_kite_client_or_none(user_id: int) -> KiteConnect | None:
@@ -433,7 +459,7 @@ async def get_recommendations(
         # Cap rows read from DB: auto-bar drops many rows; 150-row pulls were heavy for little benefit.
         # Admins (all_strategies): need a larger cap so eligible rows from every strategy are not cut off by LIMIT.
         if use_all_strategies:
-            fetch_cap = min(max(limit * 6, 48), 96)
+            fetch_cap = min(max(limit * 10, 96), 220)
         else:
             fetch_cap = min(max(limit * 3, limit), 48)
         if not use_all_strategies:
@@ -441,7 +467,7 @@ async def get_recommendations(
                 score_params_prefetch = await get_score_params_for_active_subscription(user_id)
             except Exception:
                 logger.exception("get_score_params_for_active_subscription failed user_id=%s", user_id)
-        rows = await list_recommendations_for_user(
+        raw_eligible_pool = await list_recommendations_for_user(
             user_id=user_id,
             status=status.upper(),
             min_confidence=min_confidence,
@@ -452,16 +478,24 @@ async def get_recommendations(
             all_strategies=use_all_strategies,
         )
         eligible_t0 = time.perf_counter()
-        rows = await filter_rows_auto_execute_aligned(
+        filtered = await filter_rows_auto_execute_aligned(
             # recommendation score-bar alignment for dashboard eligible strip
             user_id,
-            rows,
+            raw_eligible_pool,
             all_strategies=use_all_strategies,
             min_confidence=80.0,
             strategy_score_params=score_params_prefetch if not use_all_strategies else None,
         )
+        if use_all_strategies:
+            rows = await augment_admin_signal_strip(
+                user_id,
+                raw_eligible_pool,
+                filtered,
+                limit=limit,
+            )
+        else:
+            rows = filtered[:limit]
         phase_ms["eligible_filter"] = int((time.perf_counter() - eligible_t0) * 1000)
-        rows = rows[:limit]
     else:
         rows = await list_recommendations_for_user(
             user_id=user_id,
@@ -475,7 +509,9 @@ async def get_recommendations(
         )
     phase_ms["fetch"] = int((time.perf_counter() - fetch_t0) * 1000)
     delta_t0 = time.perf_counter()
-    if short_delta_band_only:
+    # Admin SIGNALS strip mixes strict-eligible rows with softer per-strategy watch fills; delta band would drop many short_premium previews.
+    apply_short_delta = short_delta_band_only and not (use_all_strategies and eligible_only)
+    if apply_short_delta:
         rows = await filter_recommendations_short_delta_band_only(user_id, kite, rows)
     phase_ms["delta_filter"] = int((time.perf_counter() - delta_t0) * 1000)
     scoremax_t0 = time.perf_counter()
@@ -561,30 +597,6 @@ async def execute_trade(
         raise HTTPException(status_code=500, detail=err_msg or "Order execution failed.")
 
 
-async def _get_user_strategy_params(user_id: int) -> dict:
-    row = await fetchrow(
-        """
-        SELECT lot_size, sl_points, target_points FROM s004_user_strategy_settings
-        WHERE user_id = $1
-        ORDER BY updated_at DESC
-        LIMIT 1
-        """,
-        user_id,
-    )
-    if not row:
-        return {"lot_size": 65, "sl_points": 15.0, "target_points": 10.0}
-    return {
-        "lot_size": max(1, int(row.get("lot_size") or 65)),
-        "sl_points": float(row.get("sl_points") or 15),
-        "target_points": float(row.get("target_points") or 10),
-    }
-
-
-async def _get_user_lot_size(user_id: int) -> int:
-    p = await _get_user_strategy_params(user_id)
-    return p["lot_size"]
-
-
 async def _get_lot_size_by_user_ids(user_ids: list[int]) -> dict[int, int]:
     """Return {user_id: lot_size} for given users. Defaults to 65 if not found."""
     if not user_ids:
@@ -606,9 +618,9 @@ async def _get_lot_size_by_user_ids(user_ids: list[int]) -> dict[int, int]:
 async def get_open_trades(user_id: int = Depends(get_user_id)) -> list[TradeOut]:
     rows = await fetch(
         """
-        SELECT t.trade_ref, t.symbol, t.mode, t.side, t.quantity, t.entry_price, t.current_price,
+        SELECT t.trade_ref, t.symbol, t.strategy_id, t.mode, t.side, t.quantity, t.entry_price, t.current_price,
                t.target_price, t.stop_loss_price, t.unrealized_pnl, t.opened_at, t.updated_at,
-               o.manual_execute, r.score, r.confidence_score,
+               o.manual_execute, r.score, r.confidence_score, r.instrument AS rec_instrument,
                COALESCE(c.display_name, t.strategy_id || ' ' || t.strategy_version) AS strategy_name
         FROM s004_live_trades t
         LEFT JOIN s004_execution_orders o ON o.order_ref = t.order_ref
@@ -620,24 +632,76 @@ async def get_open_trades(user_id: int = Depends(get_user_id)) -> list[TradeOut]
         user_id,
     )
     params = await _get_user_strategy_params(user_id)
-    lot_size = params["lot_size"]
+    nifty_lot = int(params["lot_size"])
+    bn_lot = int(params.get("banknifty_lot_size") or 30)
     sl_pts = params["sl_points"]
     tgt_pts = params["target_points"]
     out: list[TradeOut] = []
-    kite = await get_kite_for_quotes(user_id)
-    if kite and rows:
-        symbols = list(dict.fromkeys(_symbol_to_kite_nfo(r["symbol"]) for r in rows))
+    if rows:
+        from app.services.broker_runtime import FyersProvider, ZerodhaProvider, resolve_broker_context
+
+        quotes: dict[str, Any] = {}
+        fyers_quotes: dict[str, float] = {}
         try:
-            q = await asyncio.to_thread(kite.quote, symbols)
-            data = q.get("data", q) if isinstance(q, dict) else {}
-            quotes = data if isinstance(data, dict) else {}
+            broker_ctx = await resolve_broker_context(user_id, mode="PAPER")
+            provider = broker_ctx.market_data
         except Exception:
-            quotes = {}
+            provider = None
+
+        if isinstance(provider, ZerodhaProvider):
+            symbols = list(dict.fromkeys(_symbol_to_kite_nfo(r["symbol"]) for r in rows))
+            try:
+                q = await asyncio.to_thread(provider.kite.quote, symbols)
+                data = q.get("data", q) if isinstance(q, dict) else {}
+                quotes = data if isinstance(data, dict) else {}
+            except Exception:
+                quotes = {}
+        elif isinstance(provider, FyersProvider):
+            fy_symbols = list(dict.fromkeys(_symbol_to_fyers_symbol(r["symbol"]) for r in rows))
+            try:
+                q = await asyncio.to_thread(provider.fy.quotes, {"symbols": ",".join(fy_symbols)})
+                data_rows = (q or {}).get("d") or (q or {}).get("data") or []
+                for row in data_rows if isinstance(data_rows, list) else []:
+                    if not isinstance(row, dict):
+                        continue
+                    n = str(row.get("n") or row.get("symbol") or "").strip().upper()
+                    v = row.get("v") if isinstance(row.get("v"), dict) else {}
+                    lp_raw = v.get("lp")
+                    if lp_raw is None:
+                        lp_raw = v.get("ltp")
+                    if lp_raw is None:
+                        lp_raw = row.get("lp")
+                    try:
+                        lp = float(lp_raw or 0.0)
+                    except (TypeError, ValueError):
+                        lp = 0.0
+                    if n and lp > 0:
+                        fyers_quotes[n] = lp
+            except Exception:
+                fyers_quotes = {}
+        else:
+            # Fallback path: if market-data provider could not be resolved, try direct Zerodha quote client.
+            kite = await get_kite_for_quotes(user_id)
+            if kite:
+                symbols = list(dict.fromkeys(_symbol_to_kite_nfo(r["symbol"]) for r in rows))
+                try:
+                    q = await asyncio.to_thread(kite.quote, symbols)
+                    data = q.get("data", q) if isinstance(q, dict) else {}
+                    quotes = data if isinstance(data, dict) else {}
+                except Exception:
+                    quotes = {}
+
         for r in rows:
             d = dict(r)
-            nfo = _symbol_to_kite_nfo(r["symbol"])
             entry = float(r.get("entry_price") or 0.0)
             lots = int(r.get("quantity") or 1)
+            lot_size = contract_multiplier_for_trade(
+                strategy_id=str(r.get("strategy_id") or ""),
+                symbol=str(r.get("symbol") or ""),
+                instrument=str(r.get("rec_instrument") or ""),
+                nifty_lot=nifty_lot,
+                banknifty_lot=bn_lot,
+            )
             side = str(r.get("side") or "BUY").upper()
             if r.get("target_price") is not None:
                 target_price = float(r["target_price"])
@@ -647,11 +711,18 @@ async def get_open_trades(user_id: int = Depends(get_user_id)) -> list[TradeOut]
                 stop_loss_price = float(r["stop_loss_price"])
             else:
                 stop_loss_price = round(entry - sl_pts, 2) if side == "BUY" else round(entry + sl_pts, 2)
-            raw = quotes.get(nfo) if isinstance(quotes.get(nfo), dict) else {}
-            ltp = float(raw.get("last_price") or 0.0)
+            ltp = 0.0
+            if fyers_quotes:
+                fkey = _symbol_to_fyers_symbol(r["symbol"])
+                ltp = float(fyers_quotes.get(fkey) or 0.0)
+            else:
+                nfo = _symbol_to_kite_nfo(r["symbol"])
+                raw = quotes.get(nfo) if isinstance(quotes.get(nfo), dict) else {}
+                ltp = float(raw.get("last_price") or 0.0)
             contracts = lots * lot_size
             if ltp > 0:
                 d["current_price"] = round(ltp, 2)
+                d["quote_source"] = "live"
                 if side == "BUY":
                     d["unrealized_pnl"] = round((ltp - entry) * contracts, 2)
                     hit_target = ltp >= target_price
@@ -690,33 +761,14 @@ async def get_open_trades(user_id: int = Depends(get_user_id)) -> list[TradeOut]
                         continue
                     # LIVE: position monitor handles exit orders; fall through to display current state
             else:
-                d["current_price"] = round(entry, 2)
-                d["unrealized_pnl"] = 0.0
-            if d.get("target_price") is None:
-                d["target_price"] = round(entry + tgt_pts, 2) if side == "BUY" else round(entry - tgt_pts, 2)
-            if d.get("stop_loss_price") is None:
-                d["stop_loss_price"] = round(entry - sl_pts, 2) if side == "BUY" else round(entry + sl_pts, 2)
-            d["qty"] = contracts  # LotSize × quantity
-            try:
-                out.append(TradeOut.model_validate(_coerce_trade_row(d)))
-            except ValidationError:
-                logger.warning(
-                    "Skipping open trade row (validation) trade_ref=%s",
-                    d.get("trade_ref"),
-                    exc_info=True,
-                )
-    else:
-        for r in rows:
-            lots = int(r.get("quantity") or 1)
-            contracts = lots * lot_size
-            entry = float(r.get("entry_price") or 0.0)
-            curr = float(r.get("current_price") or entry)
-            side = str(r.get("side") or "BUY").upper()
-            d = dict(r)
-            if side == "BUY":
-                d["unrealized_pnl"] = round((curr - entry) * contracts, 2)
-            else:
-                d["unrealized_pnl"] = round((entry - curr) * contracts, 2)
+                # Quote can be missing transiently; keep last known trade price instead of snapping to entry.
+                curr = float(r.get("current_price") or entry)
+                d["current_price"] = round(curr, 2)
+                d["quote_source"] = "fallback"
+                if side == "BUY":
+                    d["unrealized_pnl"] = round((curr - entry) * contracts, 2)
+                else:
+                    d["unrealized_pnl"] = round((entry - curr) * contracts, 2)
             if d.get("target_price") is None:
                 d["target_price"] = round(entry + tgt_pts, 2) if side == "BUY" else round(entry - tgt_pts, 2)
             if d.get("stop_loss_price") is None:
@@ -739,9 +791,9 @@ async def get_closed_trades(user_id: int = Depends(get_user_id)) -> list[TradeOu
 
     rows = await fetch(
         """
-        SELECT t.trade_ref, t.symbol, t.mode, t.side, t.quantity, t.entry_price, t.current_price,
+        SELECT t.trade_ref, t.symbol, t.strategy_id, t.mode, t.side, t.quantity, t.entry_price, t.current_price,
                t.target_price, t.stop_loss_price, t.realized_pnl, t.opened_at, t.closed_at, t.updated_at,
-               t.current_state, o.manual_execute, r.score, r.confidence_score,
+               t.current_state, o.manual_execute, r.score, r.confidence_score, r.instrument AS rec_instrument,
                COALESCE(c.display_name, t.strategy_id || ' ' || t.strategy_version) AS strategy_name,
                (SELECT e.reason_code FROM s004_trade_events e
                 WHERE e.trade_ref = t.trade_ref AND e.next_state = 'EXIT'
@@ -756,13 +808,21 @@ async def get_closed_trades(user_id: int = Depends(get_user_id)) -> list[TradeOu
         user_id,
     )
     params = await _get_user_strategy_params(user_id)
-    lot_size = params["lot_size"]
+    nifty_l = int(params["lot_size"])
+    bn_l = int(params.get("banknifty_lot_size") or 30)
     out = []
     for r in rows:
         d = dict(r)
         d["reason"] = _format_exit_reason(d.pop("exit_reason_code", None))
         lots = int(d.get("quantity") or 1)
-        d["qty"] = lots * lot_size
+        mult = contract_multiplier_for_trade(
+            strategy_id=str(d.get("strategy_id") or ""),
+            symbol=str(d.get("symbol") or ""),
+            instrument=str(d.get("rec_instrument") or ""),
+            nifty_lot=nifty_l,
+            banknifty_lot=bn_l,
+        )
+        d["qty"] = lots * mult
         try:
             out.append(TradeOut.model_validate(_coerce_trade_row(d)))
         except ValidationError:
@@ -784,9 +844,10 @@ async def get_trade_history(
     if today_only:
         rows = await fetch(
             f"""
-            SELECT t.trade_ref, t.symbol, t.mode, t.side, t.quantity, t.entry_price, t.current_price,
+            SELECT t.trade_ref, t.symbol, t.strategy_id, t.mode, t.side, t.quantity, t.entry_price, t.current_price,
                    t.target_price, t.stop_loss_price, t.current_state, t.realized_pnl, t.unrealized_pnl,
                    t.opened_at, t.closed_at, t.updated_at, o.manual_execute, r.score, r.confidence_score,
+                   r.instrument AS rec_instrument,
                    COALESCE(c.display_name, t.strategy_id || ' ' || t.strategy_version) AS strategy_name,
                    (SELECT e.reason_code FROM s004_trade_events e
                     WHERE e.trade_ref = t.trade_ref AND e.next_state = 'EXIT'
@@ -807,9 +868,10 @@ async def get_trade_history(
     else:
         rows = await fetch(
             """
-            SELECT t.trade_ref, t.symbol, t.mode, t.side, t.quantity, t.entry_price, t.current_price,
+            SELECT t.trade_ref, t.symbol, t.strategy_id, t.mode, t.side, t.quantity, t.entry_price, t.current_price,
                    t.target_price, t.stop_loss_price, t.current_state, t.realized_pnl, t.unrealized_pnl,
                    t.opened_at, t.closed_at, t.updated_at, o.manual_execute, r.score, r.confidence_score,
+                   r.instrument AS rec_instrument,
                    COALESCE(c.display_name, t.strategy_id || ' ' || t.strategy_version) AS strategy_name,
                    (SELECT e.reason_code FROM s004_trade_events e
                     WHERE e.trade_ref = t.trade_ref AND e.next_state = 'EXIT'
@@ -825,14 +887,22 @@ async def get_trade_history(
             user_id,
         )
     params = await _get_user_strategy_params(user_id)
-    lot_size = params["lot_size"]
+    nifty_l = int(params["lot_size"])
+    bn_l = int(params.get("banknifty_lot_size") or 30)
     out = []
     for r in rows:
         d = dict(r)
         exit_code = d.pop("exit_reason_code", None)
         d["reason"] = _format_exit_reason(exit_code) if d.get("current_state") == "EXIT" else None
         lots = int(d.get("quantity") or 1)
-        d["qty"] = lots * lot_size
+        mult = contract_multiplier_for_trade(
+            strategy_id=str(d.get("strategy_id") or ""),
+            symbol=str(d.get("symbol") or ""),
+            instrument=str(d.get("rec_instrument") or ""),
+            nifty_lot=nifty_l,
+            banknifty_lot=bn_l,
+        )
+        d["qty"] = lots * mult
         try:
             out.append(TradeOut.model_validate(_coerce_trade_row(d)))
         except ValidationError:
@@ -1810,9 +1880,11 @@ async def get_daily_pnl(user_id: int = Depends(get_user_id)) -> list[dict]:
 async def simulate_close_trade(trade_ref: str, user_id: int = Depends(get_user_id)) -> dict:
     row = await fetchrow(
         """
-        SELECT entry_price, current_price, quantity, current_state, side, mode, symbol
-        FROM s004_live_trades
-        WHERE trade_ref = $1 AND user_id = $2
+        SELECT t.entry_price, t.current_price, t.quantity, t.current_state, t.side, t.mode, t.symbol,
+               t.strategy_id, r.instrument AS rec_instrument
+        FROM s004_live_trades t
+        LEFT JOIN s004_trade_recommendations r ON r.recommendation_id = t.recommendation_id
+        WHERE t.trade_ref = $1 AND t.user_id = $2
         """,
         trade_ref,
         user_id,
@@ -1829,8 +1901,15 @@ async def simulate_close_trade(trade_ref: str, user_id: int = Depends(get_user_i
     mode = str(row.get("mode") or "PAPER").upper()
     if entry <= 0:
         raise HTTPException(status_code=400, detail="Trade has invalid entry/current price.")
-    lot_size = await _get_user_lot_size(user_id)
-    contracts = lots * lot_size
+    sp = await _get_user_strategy_params(user_id)
+    mult = contract_multiplier_for_trade(
+        strategy_id=str(row.get("strategy_id") or ""),
+        symbol=str(row.get("symbol") or ""),
+        instrument=str(row.get("rec_instrument") or ""),
+        nifty_lot=int(sp["lot_size"]),
+        banknifty_lot=int(sp.get("banknifty_lot_size") or 30),
+    )
+    contracts = lots * mult
 
     exit_price: float
     if mode == "LIVE":

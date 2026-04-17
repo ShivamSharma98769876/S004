@@ -7,7 +7,22 @@ from pathlib import Path
 import pytest
 
 from app.services import trades_service as ts
-from app.services.evaluation_log import format_evaluation_event_text
+from app.services.evaluation_log import execution_intent_side_note, format_evaluation_event_text
+
+
+def test_execution_intent_side_note_only_when_intents_diverge() -> None:
+    assert execution_intent_side_note({"position_intent": "long_premium"}) is None
+    assert execution_intent_side_note({"position_intent": "long_premium", "execution_action_intent": "long_premium"}) is None
+    n = execution_intent_side_note(
+        {"position_intent": "long_premium", "execution_action_intent": "short_premium"}
+    )
+    assert n is not None
+    assert "short_premium" in n and "long_premium" in n
+    assert "SELL" in n and "long-premium" in n
+    n2 = execution_intent_side_note(
+        {"position_intent": "short_premium", "execution_action_intent": "long_premium"}
+    )
+    assert n2 is not None and "BUY" in n2 and "short-premium" in n2
 
 
 def test_emit_evaluation_snapshot_writes_readable_log(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -102,6 +117,89 @@ def test_emit_evaluation_snapshot_writes_readable_log(tmp_path: Path, monkeypatc
     assert "NIFTY07APR22000PE" in text
     assert "failed: regimeSellPe=false" in text
     assert "side=SELL" in text
+
+
+def test_emit_evaluation_snapshot_includes_execution_side_note_when_intents_diverge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("S004_EVALUATION_LOG_DIR", str(tmp_path))
+    row = {
+        "symbol": "NIFTY26MAR22000CE",
+        "instrument": "NIFTY",
+        "expiry": "26MAR2026",
+        "side": "SELL",
+        "option_type": "CE",
+        "distance_to_atm": 0,
+        "signal_eligible": False,
+        "score": 0,
+        "confidence_score": 0.0,
+        "failed_conditions": "PASS",
+        "delta": 0.32,
+        "gamma": 0.0,
+        "ivr": 40.0,
+        "oi": 10000,
+        "volume_spike_ratio": 1.0,
+        "entry_price": 100.0,
+        "ema9": 101.0,
+        "ema21": 99.0,
+        "vwap": 100.5,
+        "rsi": 55.0,
+    }
+    ts._emit_evaluation_snapshot(
+        trigger_user_id=1,
+        strategy_id="strat-test",
+        strategy_version="1.0.0",
+        strategy_type="rule-based",
+        subscribed_user_ids=[1],
+        score_params={
+            "score_threshold": 3,
+            "score_max": 4,
+            "position_intent": "long_premium",
+            "execution_action_intent": "short_premium",
+            "include_ema_crossover_in_score": False,
+        },
+        fetch_failed=False,
+        error=None,
+        generated_rows=[row],
+        scanned_candidates=[row],
+        chain_snapshot={"option_expiry": "07APR2026", "chain_rows": 11, "calendar_dte_ist": 11},
+    )
+    text = next(tmp_path.iterdir()).glob("*.log").__next__().read_text(encoding="utf-8")
+    assert "Note: execution intent (short_premium) differs from position intent (long_premium)" in text
+    assert "recommendation side=SELL" in text
+
+
+def test_short_premium_compact_log_includes_execution_side_note_when_present() -> None:
+    event: dict = {
+        "ts_ist": "2026-03-25T10:00:00+05:30",
+        "strategy_id": "strat-nifty-ivr-trend-short",
+        "strategy_version": "1.1.0",
+        "strategy_type": "rule-based",
+        "position_intent": "short_premium",
+        "execution_side_note": (
+            "Note: execution intent (long_premium) differs from position intent (short_premium): "
+            "recommendation side=BUY; chain/scoring uses short-premium rules."
+        ),
+        "fetch_failed": False,
+        "error": None,
+        "candidate_count": 0,
+        "scanned_candidate_count": 0,
+        "eligible_count": 0,
+        "chain_snapshot": {
+            "option_expiry": "07APR2026",
+            "chain_rows": 40,
+            "calendar_dte_ist": 11,
+            "short_premium_delta_abs": "VIX=20 → CE [0.29,0.35] PE [-0.35,-0.29]",
+            "short_delta_ce_lo": 0.29,
+            "short_delta_ce_hi": 0.35,
+            "short_delta_pe_lo": -0.35,
+            "short_delta_pe_hi": -0.29,
+        },
+        "candidates": [],
+    }
+    text = format_evaluation_event_text(event)
+    assert "Note: execution intent (long_premium)" in text
+    assert "recommendation side=BUY" in text
 
 
 def test_short_premium_compact_log_shows_gate_and_in_band_strikes_only() -> None:
@@ -217,6 +315,42 @@ def test_long_premium_log_includes_candidate_detail_when_env_set(monkeypatch: py
     assert "strike=22000" in text
     assert "E9=22010.00" in text
     assert "failed: score 2 < 3" in text
+
+
+def test_stochastic_bnf_empty_candidates_uses_short_title_and_spot_led_hint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("S004_EVALUATION_LOG_LONG_CANDIDATES", "1")
+    event: dict = {
+        "ts_ist": "2026-04-13T10:27:58+05:30",
+        "strategy_id": "strat-stochastic-bnf",
+        "strategy_version": "1.0.0",
+        "strategy_type": "stochastic-bnf",
+        "position_intent": "short_premium",
+        "fetch_failed": False,
+        "error": None,
+        "candidate_count": 0,
+        "scanned_candidate_count": 0,
+        "eligible_count": 0,
+        "score_threshold": 3,
+        "score_max": 5,
+        "auto_trade_score_threshold": 3.5,
+        "include_ema_crossover_in_score": False,
+        "strict_bullish_comparisons": True,
+        "rsi_min": 50,
+        "rsi_max": 75,
+        "volume_min_ratio": 1.02,
+        "adx_min_threshold": None,
+        "failed_conditions_sample": [],
+        "candidates": [],
+        "candidates_truncated": False,
+        "chain_snapshot": {},
+    }
+    text = format_evaluation_event_text(event)
+    assert "Scanned candidates (detail, short premium):" in text
+    assert "spot-led path" in text
+    assert "Chain snapshot:     — (not attached for this strategy type" in text
+    assert "chain fetch failed" not in text.lower()
 
 
 def test_short_premium_verbose_log_when_env_full(monkeypatch: pytest.MonkeyPatch) -> None:

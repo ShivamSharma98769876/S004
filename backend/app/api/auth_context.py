@@ -18,7 +18,10 @@ async def get_user_id(
             pass
     if uid is not None:
         return uid
-    return 2
+    raise HTTPException(
+        status_code=401,
+        detail="Missing or invalid X-User-Id. Sign in again from the app login page.",
+    )
 
 
 async def require_admin(user_id: int = Depends(get_user_id)) -> int:

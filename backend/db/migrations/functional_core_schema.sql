@@ -97,6 +97,7 @@ CREATE TABLE IF NOT EXISTS s004_user_strategy_settings (
     strategy_version VARCHAR(32) NOT NULL,
     lots INTEGER NOT NULL DEFAULT 1,
     lot_size INTEGER NOT NULL DEFAULT 65,
+    banknifty_lot_size INTEGER NOT NULL DEFAULT 30,
     max_strike_distance_atm INTEGER NOT NULL DEFAULT 5,
     max_premium NUMERIC(14,2) NOT NULL DEFAULT 200,
     min_premium NUMERIC(14,2) NOT NULL DEFAULT 30,

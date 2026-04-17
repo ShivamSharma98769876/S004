@@ -37,7 +37,10 @@ export type CapitalRiskSetup = {
 
 export type TradingParametersSetup = {
   lots: number;
+  /** NIFTY (and similar) index options — contract multiplier per lot */
   lotSize: number;
+  /** Bank Nifty index options — NSE contract size (verify on nseindia.com) */
+  bankniftyLotSize: number;
   maxStrikeDistanceFromAtm: number;
   maxPremium: number;
   minPremium: number;
@@ -124,6 +127,7 @@ export const DEFAULT_TRADING_SETUP: TradingSetup = {
   tradingParameters: {
     lots: 1,
     lotSize: 65,
+    bankniftyLotSize: 30,
     maxStrikeDistanceFromAtm: 5,
     maxPremium: 200,
     minPremium: 30,

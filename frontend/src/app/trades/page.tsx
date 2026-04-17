@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import AppFrame from "@/components/AppFrame";
-import { apiJson, isAdmin, postTradesRefreshCycle } from "@/lib/api_client";
+import { API_TIMEOUT_EXECUTE_MS, apiJson, isAdmin, postTradesRefreshCycle } from "@/lib/api_client";
 
 type Recommendation = {
   recommendation_id: string;
@@ -99,27 +99,19 @@ export default function TradesPage() {
   const [openSortCol, setOpenSortCol] = useState<string>("");
   const [openSortDir, setOpenSortDir] = useState<"asc" | "desc">("asc");
   const inFlightRef = useRef(false);
+  const listsInFlightRef = useRef(false);
 
-  /** Aligned with dashboard sync tick (refresh-cycle + lists). */
-  const TRADES_POLL_MS = 30_000;
+  /** Fast list read (~10s): recommendations + open positions only (no refresh-cycle, no funds/summary). */
+  const TRADES_LIST_POLL_MS = 10_000;
+  /** Engine refresh (~20s): POST refresh-cycle + lists, aligned with recommendation engine + auto-execute loop. */
+  const TRADES_ENGINE_POLL_MS = 20_000;
 
-  const loadAll = useCallback(
+  const loadLists = useCallback(
     async (opts?: { silent?: boolean }) => {
-      if (inFlightRef.current) return;
-      inFlightRef.current = true;
+      if (listsInFlightRef.current) return;
+      listsInFlightRef.current = true;
       const silent = opts?.silent ?? false;
-      if (!silent) {
-        setLoading(true);
-        setError(null);
-      }
       try {
-        // Keep page snappy: trigger refresh-cycle, but don't block list rendering on a slow broker call.
-        const refreshCycle = postTradesRefreshCycle().catch(() => null);
-        try {
-          await Promise.race([refreshCycle, new Promise((resolve) => window.setTimeout(resolve, 1200))]);
-        } catch {
-          /* still load table from stored rows */
-        }
         const [recs, open] = await Promise.all([
           apiJson<Recommendation[]>("/api/trades/recommendations", "GET", undefined, {
             status: "GENERATED",
@@ -140,32 +132,75 @@ export default function TradesPage() {
           setError(e instanceof Error ? e.message : "Failed to load trades");
         }
       } finally {
+        listsInFlightRef.current = false;
+      }
+    },
+    [limit, minConfidence, offset, sortBy, sortDir],
+  );
+
+  const loadAll = useCallback(
+    async (opts?: { silent?: boolean }) => {
+      if (inFlightRef.current) return;
+      inFlightRef.current = true;
+      const silent = opts?.silent ?? false;
+      if (!silent) {
+        setLoading(true);
+        setError(null);
+      }
+      try {
+        // Keep page snappy: trigger refresh-cycle, but don't block list rendering on a slow broker call.
+        const refreshCycle = postTradesRefreshCycle().catch(() => null);
+        try {
+          await Promise.race([refreshCycle, new Promise((resolve) => window.setTimeout(resolve, 1200))]);
+        } catch {
+          /* still load table from stored rows */
+        }
+        await loadLists({ silent: true });
+      } catch (e) {
+        if (!silent) {
+          setError(e instanceof Error ? e.message : "Failed to load trades");
+        }
+      } finally {
         inFlightRef.current = false;
         if (!silent) {
           setLoading(false);
         }
       }
     },
-    [limit, minConfidence, offset, sortBy, sortDir],
+    [loadLists],
   );
+
+  useEffect(() => {
+    if (isAdmin()) setLimit((n) => (n <= 10 ? 24 : n));
+  }, []);
 
   useEffect(() => {
     void loadAll();
   }, [loadAll]);
 
   useEffect(() => {
-    const id = window.setInterval(() => void loadAll({ silent: true }), TRADES_POLL_MS);
-    return () => window.clearInterval(id);
-  }, [loadAll]);
+    const fast = window.setInterval(() => void loadLists({ silent: true }), TRADES_LIST_POLL_MS);
+    const engine = window.setInterval(() => void loadAll({ silent: true }), TRADES_ENGINE_POLL_MS);
+    return () => {
+      window.clearInterval(fast);
+      window.clearInterval(engine);
+    };
+  }, [loadAll, loadLists]);
 
   const execute = async (recommendationId: string, mode: "PAPER" | "LIVE") => {
     setError(null);
     try {
-      await apiJson("/api/trades/execute", "POST", {
-        recommendation_id: recommendationId,
-        mode,
-        quantity: 1,
-      });
+      await apiJson(
+        "/api/trades/execute",
+        "POST",
+        {
+          recommendation_id: recommendationId,
+          mode,
+          quantity: 1,
+        },
+        undefined,
+        { timeoutMs: API_TIMEOUT_EXECUTE_MS },
+      );
       await loadAll();
     } catch (e) {
       const raw = e instanceof Error ? e.message : "Unable to execute selected recommendation.";

@@ -18,6 +18,11 @@ Long premium (e.g. TrendSnap Momentum): by default the log does **not** list eac
 counts, score thresholds, and a few ``failed_conditions`` samples. Set ``S004_EVALUATION_LOG_LONG_CANDIDATES=1`` to append a
 full per-candidate block (symbol, strike, Greeks, indicators, eligibility, failed reasons) for analysis. Keep
 ``S004_EVALUATION_LOG_MAX_CANDIDATES=0`` (default) so the list is not truncated.
+
+Spot-led strategies (e.g. ``stochastic-bnf``, ``supertrend-trail``): ``chain_snapshot`` is often empty in the event; ``Chain fetch: OK``
+means the refresh did not raise. **SuperTrendTrail** attaches ``scanned_candidates`` (every chain strike on the active CE/PE side) so
+the snapshot shows **Scanned strikes (spot-led, …)** when ``S004_EVALUATION_LOG_LONG_CANDIDATES`` is off, and full per-leg blocks when it is on.
+Other spot-led types may still show only counts until they pass a similar scan list.
 """
 
 from __future__ import annotations
@@ -34,6 +39,70 @@ _logger = logging.getLogger(__name__)
 _IST = ZoneInfo("Asia/Kolkata")
 _SAFE = re.compile(r"[^a-zA-Z0-9._-]+")
 _SEP = "=" * 80
+
+# Strategy types that build recommendations from spot/index logic first; evaluation log often has no chain_snapshot.
+_SPOT_LED_STRATEGY_TYPES: frozenset[str] = frozenset(
+    {"stochastic-bnf", "supertrend-trail", "trendpulse-z", "ps-vs-mtf"}
+)
+_CANDIDATES_DETAIL_SUPPRESS: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("strat-nifty-ivr-trend-short", "1.1.0"),
+        ("strat-nifty-ivr-trend-short", "1.2.0"),
+    }
+)
+
+
+def _candidates_detail_title(event: dict[str, Any]) -> str:
+    pi = str(event.get("position_intent") or "").strip().lower()
+    if pi == "short_premium":
+        return "Scanned candidates (detail, short premium):"
+    return "Scanned candidates (detail, long premium):"
+
+
+def _suppress_candidates_detail(event: dict[str, Any]) -> bool:
+    sid = str(event.get("strategy_id") or "").strip().lower()
+    ver = str(event.get("strategy_version") or "").strip().lower()
+    return (sid, ver) in _CANDIDATES_DETAIL_SUPPRESS
+
+
+def _empty_candidates_detail_line(event: dict[str, Any]) -> str:
+    if event.get("fetch_failed"):
+        return "  (none — refresh failed; see Error message above.)"
+    st = str(event.get("strategy_type") or "").strip().lower()
+    if st in _SPOT_LED_STRATEGY_TYPES:
+        return (
+            "  (none — no recommendation row this refresh (spot-led path: signal, time/VWAP filters, "
+            "expiry/ATM leg, OI/volume/IVR, or LTP). Chain summary is often omitted here; check server logs / Observability.)"
+        )
+    cs = event.get("chain_snapshot")
+    if not isinstance(cs, dict) or not cs:
+        return "  (none — no candidates; chain summary was not attached to this snapshot.)"
+    return "  (none — no candidates this refresh (scan empty or no legs passed gates).)"
+
+
+def execution_intent_side_note(score_params: dict[str, Any]) -> str | None:
+    """One line when effective execution intent implies BUY/SELL differently from the position-intent chain path.
+
+    Mirrors ``trades_service`` logic: chain uses ``position_intent`` (long vs short premium scan); row ``side`` uses
+    ``execution_action_intent`` defaulting to position intent.
+    """
+    pi = str(score_params.get("position_intent") or "long_premium").strip().lower()
+    if pi not in ("long_premium", "short_premium"):
+        pi = "long_premium"
+    raw = score_params.get("execution_action_intent")
+    ex_eff = str(raw if raw not in (None, "") else pi).strip().lower()
+    if ex_eff not in ("long_premium", "short_premium"):
+        ex_eff = pi
+    chain_short = pi == "short_premium"
+    action_short = ex_eff == "short_premium"
+    if action_short == chain_short:
+        return None
+    side_word = "SELL" if action_short else "BUY"
+    chain_word = "short" if chain_short else "long"
+    return (
+        f"Note: execution intent ({ex_eff}) differs from position intent ({pi}): "
+        f"recommendation side={side_word}; chain/scoring uses {chain_word}-premium rules."
+    )
 
 
 def _log_dir() -> Path | None:
@@ -164,6 +233,12 @@ def _fmt_leg_evaluation_block(i: int, c: dict[str, Any], *, diagnostic: bool) ->
         if part:
             ind_parts.append(f"{label}={part}")
     line2 = f"       {'  '.join(ind_parts)}" if ind_parts else "       E9=—  E21=—  VWAP=—  RSI=—"
+    if " | " in fail:
+        parts = [p.strip() for p in fail.split("|") if str(p).strip()]
+        line3 = f"       failed: {parts[0] if parts else fail}"
+        if len(parts) > 1:
+            line4 = f"       detail: {' | '.join(parts[1:])}"
+            return "\n".join((line1, line2, line3, line4))
     line3 = f"       failed: {fail}"
     return "\n".join((line1, line2, line3))
 
@@ -200,6 +275,78 @@ def _row_in_short_delta_band(row: dict[str, Any], cs: dict[str, Any]) -> bool:
     if ot == "CE":
         return ce_lo - 1e-9 <= df <= ce_hi + 1e-9
     return pe_lo - 1e-9 <= df <= pe_hi + 1e-9
+
+
+def _fmt_spot_led_scan_compact_line(i: int, c: dict[str, Any]) -> str:
+    """One-line strike row for spot-led strategies when long candidate logging is off."""
+    sym = _dash(c.get("symbol"))
+    ot = _dash(c.get("option_type"))
+    stk_v = c.get("strike")
+    strike_s = str(int(stk_v)) if isinstance(stk_v, (int, float)) else "—"
+    dist = c.get("distance_to_atm")
+    if dist is None:
+        dist_s = "—"
+    else:
+        try:
+            dist_s = str(int(dist))
+        except (TypeError, ValueError):
+            dist_s = _dash(dist)
+    ep = c.get("entry_price")
+    ltp_s = f"{float(ep):.2f}" if isinstance(ep, (int, float)) else "—"
+    el = c.get("signal_eligible")
+    el_s = "YES" if el is True else "NO" if el is False else "—"
+    fc = str(c.get("failed_conditions") or "—").replace("\n", " ").strip()
+    if len(fc) > 120:
+        fc = fc[:117] + "..."
+    line = (
+        f"   {i}. {sym} | {ot} | strike={strike_s} | dATM={dist_s} | OI={_dash(c.get('oi'))} | "
+        f"vol={_dash(c.get('volume'))} | LTP={ltp_s} | elig={el_s} | {fc}"
+    )
+    e5_s = _fmt_optf(c.get("ema5"), 2)
+    e15_s = _fmt_optf(c.get("ema15"), 2)
+    e50_s = _fmt_optf(c.get("ema50"), 2)
+    adx_s = _fmt_optf(c.get("adx"), 2)
+    k_s = _fmt_optf(c.get("stoch_k"), 2)
+    d_s = _fmt_optf(c.get("stoch_d"), 2)
+    vw_s = _fmt_optf(c.get("spot_vwap"), 2) or _fmt_optf(c.get("vwap"), 2)
+    if any(v is not None for v in (e5_s, e15_s, e50_s, adx_s, k_s, d_s, vw_s)):
+        return (
+            line
+            + f"\n       indicators: EMA5={e5_s or '—'} EMA15={e15_s or '—'} EMA50={e50_s or '—'} "
+            f"VWAP={vw_s or '—'} ADX={adx_s or '—'} K={k_s or '—'} D={d_s or '—'}"
+        )
+    ps3_s = _fmt_optf(c.get("ps3"), 3)
+    vs3_s = _fmt_optf(c.get("vs3"), 3)
+    rsi3_ps = _fmt_optf(c.get("rsi3"), 2)
+    ps15_s = _fmt_optf(c.get("ps15"), 3)
+    vs15_s = _fmt_optf(c.get("vs15"), 3)
+    rsi15_ps = _fmt_optf(c.get("rsi15"), 2)
+    adx15_ps = _fmt_optf(c.get("adx15"), 2)
+    ratr_s = _fmt_optf(c.get("r_atr"), 3)
+    if any(
+        v is not None
+        for v in (ps3_s, vs3_s, rsi3_ps, ps15_s, vs15_s, rsi15_ps, adx15_ps, ratr_s)
+    ):
+        return (
+            line
+            + f"\n       indicators: 3m PS={ps3_s or '—'} VS={vs3_s or '—'} RSI={rsi3_ps or '—'} | "
+            f"15m PS={ps15_s or '—'} VS={vs15_s or '—'} RSI={rsi15_ps or '—'} | "
+            f"ADX15={adx15_ps or '—'} rATR={ratr_s or '—'}"
+        )
+    return line
+
+
+def _fmt_spot_led_scan_row(i: int, c: dict[str, Any], *, strategy_type: str) -> str:
+    """
+    Spot-led scan rows.
+
+    SuperTrendTrail frequently uses "signal:... | close=... | ema10=... | st=..." style failed_conditions.
+    For readability, render the same multi-line failed/detail shape as normal candidate blocks.
+    """
+    st = str(strategy_type or "").strip().lower()
+    if st == "supertrend-trail":
+        return _fmt_leg_evaluation_block(i, c, diagnostic=False)
+    return _fmt_spot_led_scan_compact_line(i, c)
 
 
 def _fmt_short_strike_one_line(i: int, row: dict[str, Any], *, slim_candidate: bool) -> str:
@@ -246,6 +393,9 @@ def _format_evaluation_event_short_compact(event: dict[str, Any]) -> str:
         f"Time (IST):         {_format_ts_ist_display(event.get('ts_ist'))}",
         f"Strategy:           {_dash(event.get('strategy_id'))}  @  {_dash(event.get('strategy_version'))}",
     ]
+    _esn = event.get("execution_side_note")
+    if isinstance(_esn, str) and _esn.strip():
+        lines.append(_esn.strip())
     if event.get("fetch_failed"):
         lines.append("Chain fetch:        FAILED")
         if event.get("error"):
@@ -320,8 +470,11 @@ def format_evaluation_event_text(event: dict[str, Any]) -> str:
         f"Strategy:           {_dash(event.get('strategy_id'))}  @  {_dash(event.get('strategy_version'))}",
         f"Strategy type:      {_dash(event.get('strategy_type'))}",
         f"Position intent:    {_dash(event.get('position_intent'))}",
-        f"Trigger user:       {_dash(event.get('trigger_user_id'))}",
     ]
+    _esn = event.get("execution_side_note")
+    if isinstance(_esn, str) and _esn.strip():
+        lines.append(_esn.strip())
+    lines.append(f"Trigger user:       {_dash(event.get('trigger_user_id'))}")
     su = event.get("subscribed_user_ids")
     if isinstance(su, list) and su:
         lines.append(f"Subscribed users:   {', '.join(str(x) for x in su)}")
@@ -329,6 +482,87 @@ def format_evaluation_event_text(event: dict[str, Any]) -> str:
         lines.append("Subscribed users:   —")
 
     lines.append(f"Chain fetch:        {'FAILED' if event.get('fetch_failed') else 'OK'}")
+    spot_state = event.get("spot_state")
+    if isinstance(spot_state, dict) and spot_state:
+        kind = str(spot_state.get("kind") or event.get("strategy_type") or "").strip().lower()
+        if kind == "stochastic-bnf":
+            trend_s = _dash(spot_state.get("trend"))
+            reason_s = _dash(spot_state.get("reason"))
+            close_s = _fmt_optf(spot_state.get("close"), 2) or "—"
+            vwap_s = _fmt_optf(spot_state.get("vwap"), 2) or "—"
+            e5_s = _fmt_optf(spot_state.get("ema5"), 2) or "—"
+            e15_s = _fmt_optf(spot_state.get("ema15"), 2) or "—"
+            e50_s = _fmt_optf(spot_state.get("ema50"), 2) or "—"
+            adx_s = _fmt_optf(spot_state.get("adx"), 2) or "—"
+            adx_thr_s = _fmt_optf(spot_state.get("adx_threshold"), 2) or "—"
+            k_s = _fmt_optf(spot_state.get("stoch_k"), 2) or "—"
+            d_s = _fmt_optf(spot_state.get("stoch_d"), 2) or "—"
+            ob_s = _fmt_optf(spot_state.get("overbought"), 2) or "—"
+            os_s = _fmt_optf(spot_state.get("oversold"), 2) or "—"
+            lines.append(
+                f"Spot StochasticBNF: trend={trend_s} | reason={reason_s} | close={close_s} | VWAP={vwap_s}"
+            )
+            lines.append(
+                f"Indicators:         EMA5={e5_s} | EMA15={e15_s} | EMA50={e50_s} | ADX={adx_s}>{adx_thr_s} | "
+                f"StochK={k_s} | StochD={d_s} | OB/OS={ob_s}/{os_s}"
+            )
+            lines.append(
+                "Filters:            "
+                f"stochConfirmation={_dash(spot_state.get('stoch_confirmation'))} | "
+                f"vwapFilter={_dash(spot_state.get('vwap_filter'))} | "
+                f"timeFilter={_dash(spot_state.get('time_filter'))} "
+                f"({_dash(spot_state.get('time_filter_start'))}-{_dash(spot_state.get('time_filter_end'))}) | "
+                f"usePullbackEntry={_dash(spot_state.get('use_pullback_entry'))}"
+            )
+        elif kind == "ps-vs-mtf":
+            trend_s = _dash(spot_state.get("trend"))
+            reason_s = _dash(spot_state.get("reason"))
+            dir_s = _dash(spot_state.get("direction"))
+            conv_s = _fmt_confidence_slim(spot_state.get("conviction"))
+            ok_s = "YES" if spot_state.get("signal_ok") is True else "NO" if spot_state.get("signal_ok") is False else "—"
+            m = spot_state.get("metrics") if isinstance(spot_state.get("metrics"), dict) else {}
+            ps3_s = _fmt_optf(m.get("ps3"), 3) or "—"
+            vs3_s = _fmt_optf(m.get("vs3"), 3) or "—"
+            r3_s = _fmt_optf(m.get("rsi3"), 2) or "—"
+            ps15_s = _fmt_optf(m.get("ps15"), 3) or "—"
+            vs15_s = _fmt_optf(m.get("vs15"), 3) or "—"
+            r15_s = _fmt_optf(m.get("rsi15"), 2) or "—"
+            adx_s = _fmt_optf(m.get("adx15"), 2) or "—"
+            ratr_s = _fmt_optf(m.get("r_atr"), 3) or "—"
+            lines.append(
+                f"Spot PS/VS MTF:     trend={trend_s} | direction={dir_s} | reason={reason_s} | "
+                f"signal_ok={ok_s} | conviction={conv_s}%"
+            )
+            lines.append(
+                f"Indicators (3m/15m): PS3={ps3_s} VS3={vs3_s} RSI3={r3_s} | "
+                f"PS15={ps15_s} VS15={vs15_s} RSI15={r15_s} | ADX15={adx_s} | rATR={ratr_s}"
+            )
+            lines.append(
+                "Config gates:       "
+                f"minConviction≥{_fmt_optf(spot_state.get('minConvictionPct'), 1) or '—'}% | "
+                f"RSI15∈[{_fmt_optf(spot_state.get('rsiBandLow'), 0) or '—'}-{_fmt_optf(spot_state.get('rsiBandHigh'), 0) or '—'}] | "
+                f"ADX≥{_fmt_optf(spot_state.get('adxMin'), 1) or '—'} | "
+                f"rATR∈[{_fmt_optf(spot_state.get('atrRangeMin'), 2) or '—'}-{_fmt_optf(spot_state.get('atrRangeMax'), 2) or '—'}] | "
+                f"strict15m={_dash(spot_state.get('strict15m'))} | "
+                f"chart={_dash(spot_state.get('chart_interval_kite'))}"
+            )
+        else:
+            sd = spot_state.get("st_direction")
+            try:
+                sd_i = int(sd) if isinstance(sd, (int, float, str)) and str(sd).strip() != "" else None
+            except ValueError:
+                sd_i = None
+            if sd_i in (1, -1):
+                regime = "BULLISH" if sd_i == 1 else "BEARISH"
+                close_s = _fmt_optf(spot_state.get("close"), 2) or "—"
+                e10_s = _fmt_optf(spot_state.get("ema10"), 2) or "—"
+                e20_s = _fmt_optf(spot_state.get("ema20"), 2) or "—"
+                stu_s = _fmt_optf(spot_state.get("supertrend_upper"), 2) or "—"
+                stl_s = _fmt_optf(spot_state.get("supertrend_lower"), 2) or "—"
+                lines.append(
+                    f"Spot SuperTrend:    {regime} (dir={sd_i:+d}) | close={close_s} | ema10={e10_s} | ema20={e20_s} | "
+                    f"STu={stu_s} | STl={stl_s}"
+                )
     cs = event.get("chain_snapshot")
     if isinstance(cs, dict) and cs:
         lines.append(f"Option expiry:      {_dash(cs.get('option_expiry'))}")
@@ -359,6 +593,12 @@ def format_evaluation_event_text(event: dict[str, Any]) -> str:
                     lines.append(_fmt_short_diagnostic_line(j, row))
                 else:
                     lines.append(f"  {j:3}. {row!r}")
+    elif not event.get("fetch_failed"):
+        stt = str(event.get("strategy_type") or "").strip().lower()
+        if stt in _SPOT_LED_STRATEGY_TYPES:
+            lines.append(
+                "Chain snapshot:     — (not attached for this strategy type; OK means no Python exception on refresh.)"
+            )
     err = event.get("error")
     if err:
         lines.append(f"Error message:      {err}")
@@ -390,21 +630,49 @@ def format_evaluation_event_text(event: dict[str, Any]) -> str:
     else:
         lines.append("  (none)")
 
+    stt_spot = str(event.get("strategy_type") or "").strip().lower()
+    cands_spot = event.get("candidates") or []
+    if (
+        stt_spot in _SPOT_LED_STRATEGY_TYPES
+        and isinstance(cands_spot, list)
+        and len(cands_spot) > 0
+        and not event.get("fetch_failed")
+        and not _long_eval_log_candidates()
+    ):
+        max_sl = int(os.getenv("S004_EVALUATION_LOG_SPOT_LED_MAX_STRIKES", "60") or "60")
+        lines.append("")
+        lines.append("Scanned strikes (spot-led, one line per chain leg on the active side):")
+        show = cands_spot[:max_sl] if max_sl > 0 else cands_spot
+        for j, c in enumerate(show, start=1):
+            if isinstance(c, dict):
+                lines.append(_fmt_spot_led_scan_row(j, c, strategy_type=stt_spot))
+            else:
+                lines.append(f"   {j}. {c!r}")
+        if max_sl > 0 and len(cands_spot) > max_sl:
+            lines.append(
+                f"   … ({len(cands_spot) - max_sl} more rows; set S004_EVALUATION_LOG_SPOT_LED_MAX_STRIKES "
+                "or S004_EVALUATION_LOG_LONG_CANDIDATES=1 for full detail)"
+            )
+
     if not _long_eval_log_candidates():
         cands_hint = event.get("candidates") or []
-        if isinstance(cands_hint, list) and len(cands_hint) > 0:
+        if (
+            isinstance(cands_hint, list)
+            and len(cands_hint) > 0
+            and stt_spot not in _SPOT_LED_STRATEGY_TYPES
+        ):
             lines.append("")
             lines.append(
-                "Per-strike detail is omitted for long premium (log size). "
-                "Set S004_EVALUATION_LOG_LONG_CANDIDATES=1 to list all scanned candidates; "
+                "Per-strike candidate list is omitted (log size; S004_EVALUATION_LOG_LONG_CANDIDATES≠1). "
+                "Set S004_EVALUATION_LOG_LONG_CANDIDATES=1 to list scanned candidates; "
                 "keep S004_EVALUATION_LOG_MAX_CANDIDATES=0 so the list is not capped."
             )
 
-    if _long_eval_log_candidates():
+    if _long_eval_log_candidates() and not _suppress_candidates_detail(event):
         cands = event.get("candidates") or []
         trunc = event.get("candidates_truncated")
         lines.append("")
-        lines.append("Scanned candidates (detail, long premium):")
+        lines.append(_candidates_detail_title(event))
         if trunc:
             lines.append("  (list truncated — set S004_EVALUATION_LOG_MAX_CANDIDATES=0 for full scan in log)")
         if isinstance(cands, list) and cands:
@@ -414,7 +682,7 @@ def format_evaluation_event_text(event: dict[str, Any]) -> str:
                 else:
                     lines.append(f"   {j}. {c!r}")
         else:
-            lines.append("  (none — chain fetch failed or zero candidates this refresh)")
+            lines.append(_empty_candidates_detail_line(event))
 
     lines.extend(["", _SEP, ""])
     return "\n".join(lines) + "\n"

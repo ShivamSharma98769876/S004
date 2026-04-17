@@ -192,9 +192,11 @@ async def save_user_vault(
     )
 
 
-async def user_zerodha_kite(user_id: int, *, env_fallback: bool = True) -> KiteConnect | None:
+async def user_zerodha_kite(
+    user_id: int, *, env_fallback: bool = True, respect_active: bool = True
+) -> KiteConnect | None:
     active = await get_active_broker_code(user_id)
-    if active == BROKER_FYERS:
+    if respect_active and active == BROKER_FYERS:
         return None
     vault = await load_merged_vault(user_id)
     z = vault.get(BROKER_ZERODHA) if isinstance(vault.get(BROKER_ZERODHA), dict) else {}
@@ -210,9 +212,9 @@ async def user_zerodha_kite(user_id: int, *, env_fallback: bool = True) -> KiteC
     return kite
 
 
-async def user_fyers_client(user_id: int) -> Any | None:
+async def user_fyers_client(user_id: int, *, respect_active: bool = True) -> Any | None:
     active = await get_active_broker_code(user_id)
-    if active == BROKER_ZERODHA:
+    if respect_active and active == BROKER_ZERODHA:
         return None
     vault = await load_merged_vault(user_id)
     f = vault.get(BROKER_FYERS) if isinstance(vault.get(BROKER_FYERS), dict) else {}

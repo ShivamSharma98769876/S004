@@ -46,18 +46,6 @@ export type StrategyDayFitPayload = {
   };
 };
 
-function fmtPnl(n: number | null | undefined): string {
-  if (n == null || Number.isNaN(n)) return "—";
-  const sign = n >= 0 ? "+" : "";
-  return `${sign}₹${n.toLocaleString("en-IN", { maximumFractionDigits: 0 })}`;
-}
-
-function HitDot({ hit }: { hit: boolean | null | undefined }) {
-  if (hit === true) return <span className="landing-fit-hit landing-fit-hit--yes" title="Beat bucket median" />;
-  if (hit === false) return <span className="landing-fit-hit landing-fit-hit--no" title="Below bucket median" />;
-  return <span className="landing-fit-hit landing-fit-hit--na" title="Insufficient closed trades" />;
-}
-
 export default function StrategyDayFitWidget({
   data,
   loading,
@@ -86,9 +74,6 @@ export default function StrategyDayFitWidget({
       </section>
     );
   }
-
-  const acc = data.accuracySummary;
-  const recent = data.accuracyRecent ?? [];
 
   return (
     <section className="landing-strategy-fit panel-accent-signals" aria-label="Market-strategy fit suggestions">
@@ -178,59 +163,6 @@ export default function StrategyDayFitWidget({
             </div>
           )}
         </article>
-      </div>
-
-      <div className="landing-strategy-fit-accuracy">
-        <div className="landing-strategy-fit-accuracy-head">
-          <span className="landing-strategy-fit-accuracy-title">Prediction check</span>
-          <span className="landing-strategy-fit-accuracy-hint">
-            Prior UTC days: pick&apos;s realized PnL vs median of same bucket (all users, EXIT trades)
-          </span>
-        </div>
-        {acc && (acc.buyerScoredDays > 0 || acc.sellerScoredDays > 0) ? (
-          <p className="landing-strategy-fit-accuracy-summary">
-            Buyers beat median on{" "}
-            <strong>
-              {acc.buyerBeatMedianDays}/{acc.buyerScoredDays}
-            </strong>{" "}
-            scored days · Sellers{" "}
-            <strong>
-              {acc.sellerBeatMedianDays}/{acc.sellerScoredDays}
-            </strong>
-          </p>
-        ) : (
-          <p className="muted landing-strategy-fit-accuracy-summary">Building history — need completed trade days after first picks.</p>
-        )}
-        {recent.length > 0 ? (
-          <div className="landing-strategy-fit-accuracy-table-wrap">
-            <table className="landing-strategy-fit-accuracy-table">
-              <thead>
-                <tr>
-                  <th>Day (UTC)</th>
-                  <th>Buyer PnL</th>
-                  <th title="vs median of long-premium bucket">Δ</th>
-                  <th>Seller PnL</th>
-                  <th title="vs median of short-premium bucket">Δ</th>
-                </tr>
-              </thead>
-              <tbody>
-                {recent.map((row) => (
-                  <tr key={row.fitDate}>
-                    <td>{row.fitDate}</td>
-                    <td>{fmtPnl(row.buyerAggPnl)}</td>
-                    <td>
-                      <HitDot hit={row.buyerBeatMedian} />
-                    </td>
-                    <td>{fmtPnl(row.sellerAggPnl)}</td>
-                    <td>
-                      <HitDot hit={row.sellerBeatMedian} />
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        ) : null}
       </div>
 
       <p className="landing-strategy-fit-disclaimer">{data.disclaimer}</p>

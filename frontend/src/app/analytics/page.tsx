@@ -103,6 +103,7 @@ export default function AnalyticsPage() {
   const [expirySource, setExpirySource] = useState<string | null>(null);
   const [sessionHint, setSessionHint] = useState<string | null>(null);
   const [marketDataQuoteSource, setMarketDataQuoteSource] = useState<string | null>(null);
+  const [platformSharedBrokerCode, setPlatformSharedBrokerCode] = useState<string | null>(null);
   const [lastRefreshAt, setLastRefreshAt] = useState<string | null>(null);
   const chainInFlightRef = useRef(false);
 
@@ -162,6 +163,9 @@ export default function AnalyticsPage() {
         if (typeof json.credentials_present === "boolean") setCredentialsPresent(json.credentials_present);
         if (typeof json.session_hint === "string") setSessionHint(json.session_hint);
         if (typeof json.market_data_quote_source === "string") setMarketDataQuoteSource(json.market_data_quote_source);
+        if (typeof json.platform_shared_broker_code === "string") {
+          setPlatformSharedBrokerCode(json.platform_shared_broker_code);
+        }
       } catch (e) {
         setError(e instanceof Error ? e.message : "Network error");
       } finally {
@@ -204,6 +208,7 @@ export default function AnalyticsPage() {
             expiry_source?: string;
             session_hint?: string;
             market_data_quote_source?: string;
+            platform_shared_broker_code?: string;
           } | null
         ) => {
         if (cancelled) return;
@@ -225,6 +230,9 @@ export default function AnalyticsPage() {
         setExpirySource(json.expiry_source ?? null);
         setSessionHint(typeof json.session_hint === "string" ? json.session_hint : null);
         setMarketDataQuoteSource(typeof json.market_data_quote_source === "string" ? json.market_data_quote_source : null);
+        setPlatformSharedBrokerCode(
+          typeof json.platform_shared_broker_code === "string" ? json.platform_shared_broker_code : null
+        );
       }
       )
       .catch(() => {
@@ -321,13 +329,14 @@ export default function AnalyticsPage() {
       {requireLiveBroker && brokerSessionOk === false && !sessionHint && (
         <div className="notice error" role="alert">
           {credentialsPresent === false
-            ? "No market-data credentials resolved for option chain (Zerodha). Connect under Settings → Brokers or use admin shared Zerodha for paper."
-            : "Market data session is not valid. Reconnect Zerodha under Settings → Brokers, then refresh."}
+            ? "No market-data credentials resolved for option chain. Connect under Settings -> Brokers or use admin shared broker for paper."
+            : "Market data session is not valid. Reconnect your broker under Settings -> Brokers, then refresh."}
         </div>
       )}
       {requireLiveBroker && brokerSessionOk && expirySource === "estimated_weeklies" && (
         <div className="notice warning">
-          Using estimated weekly dates for expiry — real NFO dates could not be loaded. If this persists, fix the Zerodha market-data session under Settings → Brokers.
+          Using estimated weekly dates for expiry — broker expiries could not be loaded. If this persists, reconnect
+          market-data broker under Settings → Brokers.
         </div>
       )}
       {requireLiveBroker && brokerSessionOk && expirySource === "zerodha_nfo" && (
@@ -388,7 +397,7 @@ export default function AnalyticsPage() {
         {brokerSessionOk !== null && (
           <span
             className={`chip ${brokerSessionOk ? "chip-status-active" : "chip-status-paused"}`}
-            title={sessionHint || "Zerodha Kite used for indices and option chain market data"}
+            title={sessionHint || "Resolved broker market-data session"}
           >
             Market data
             {marketDataQuoteSource === "user_zerodha"
@@ -396,7 +405,7 @@ export default function AnalyticsPage() {
               : marketDataQuoteSource === "user_fyers"
                 ? " (your FYERS)"
               : marketDataQuoteSource === "platform_shared"
-                ? " (shared Zerodha)"
+                ? ` (shared ${String(platformSharedBrokerCode || "broker").toUpperCase()})`
               : marketDataQuoteSource === "platform_only_unavailable"
                 ? " (admin shared — unavailable)"
                 : marketDataQuoteSource === "pool_or_env"

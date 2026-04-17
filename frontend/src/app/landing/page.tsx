@@ -3,11 +3,6 @@
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import AppFrame from "@/components/AppFrame";
-import TrendPulseChart, {
-  type TrendPulseEntryEvent,
-  type TrendPulseTradeEvent,
-  type TrendPulseTradeSignal,
-} from "@/components/TrendPulseChart";
 import {
   CePeFlowArena,
   ConfidenceGauge,
@@ -18,14 +13,10 @@ import {
 } from "@/components/landing/LandingDashWidgets";
 import StrategyDayFitWidget, { type StrategyDayFitPayload } from "@/components/landing/StrategyDayFitWidget";
 import { type NewsSentimentPayload } from "@/components/landing/NewsSentimentWidget";
-import MarketVerdictWidget, {
-  formatTpInterval,
-  htfTrendBias,
-  sessionTrendBias,
-} from "@/components/landing/MarketVerdictWidget";
+import MarketVerdictWidget, { sessionTrendBias } from "@/components/landing/MarketVerdictWidget";
 import OiSellerPinboardWidget, { type OiWallsPayload } from "@/components/landing/OiSellerPinboardWidget";
 import SidewaysRegimePanel, { type SidewaysRegimePayload } from "@/components/landing/SidewaysRegimePanel";
-import { apiJson, getAuth, postTradesRefreshCycle } from "@/lib/api_client";
+import { apiJson, getAuth } from "@/lib/api_client";
 import { formatTimeIST } from "@/lib/datetime_ist";
 
 type MarketSnapshot = {
@@ -35,31 +26,6 @@ type MarketSnapshot = {
   sentimentLabel: string;
   intradayTrendLabel: string;
   vix?: number | null;
-};
-
-type TrendPulsePayload = {
-  strategyId: string | null;
-  strategyVersion: string | null;
-  strategyType: string;
-  trendpulseEnabled: boolean;
-  stInterval?: string;
-  htfInterval?: string;
-  htfBias?: string | null;
-  series: {
-    times: string[];
-    ps_z: number[];
-    vs_z: number[];
-    adx_last: number | null;
-    displayDate?: string | null;
-    displayTimezone?: string;
-    displayDateFallback?: boolean;
-    noBarsForDisplayDate?: boolean;
-    chartHint?: string | null;
-  } | null;
-  entryEvents?: TrendPulseEntryEvent[];
-  tradeEvents?: TrendPulseTradeEvent[];
-  tradeSignal?: TrendPulseTradeSignal | null;
-  message: string | null;
 };
 
 type OptionsIntelPayload = {
@@ -112,7 +78,8 @@ type SentimentPayload = {
 type DecisionSnapshotPayload = {
   marketSnapshot: MarketSnapshot;
   sentiment: SentimentPayload;
-  trendpulse: TrendPulsePayload;
+  /** Present from API; landing page does not render TrendPulse. */
+  trendpulse?: unknown;
   strategyDayFit?: StrategyDayFitPayload;
   newsSentiment?: NewsSentimentPayload;
   oiWalls?: OiWallsPayload | null;
@@ -148,7 +115,6 @@ export default function LandingPage() {
   const router = useRouter();
   const [snap, setSnap] = useState<MarketSnapshot | null>(null);
   const [sentiment, setSentiment] = useState<SentimentPayload | null>(null);
-  const [tp, setTp] = useState<TrendPulsePayload | null>(null);
   const [history, setHistory] = useState<SentimentHistoryPayload | null>(null);
   const [strategyFit, setStrategyFit] = useState<StrategyDayFitPayload | null>(null);
   const [newsSentiment, setNewsSentiment] = useState<NewsSentimentPayload | null>(null);
@@ -164,21 +130,13 @@ export default function LandingPage() {
     inFlightRef.current = true;
     setErr(null);
     try {
-      try {
-        await Promise.race([
-          postTradesRefreshCycle(),
-          new Promise((resolve) => window.setTimeout(resolve, 700)),
-        ]);
-      } catch {
-        /* still load landing */
-      }
       const [snapshotRes, histRes] = await Promise.allSettled([
         apiJson<DecisionSnapshotPayload>(
           "/api/landing/decision-snapshot",
           "GET",
           undefined,
           undefined,
-          { timeoutMs: 20_000 },
+          { timeoutMs: 35_000 },
         ),
         apiJson<SentimentHistoryPayload>("/api/landing/sentiment-history", "GET", undefined, { limit: 90 }),
       ]);
@@ -189,7 +147,6 @@ export default function LandingPage() {
         hadAnySuccess = true;
         setSnap(snapshot.marketSnapshot);
         setSentiment(snapshot.sentiment);
-        setTp(snapshot.trendpulse);
         setStrategyFit(snapshot.strategyDayFit ?? null);
         setNewsSentiment(snapshot.newsSentiment ?? null);
         setOiWalls(snapshot.oiWalls ?? null);
@@ -231,7 +188,8 @@ export default function LandingPage() {
   const dirClass = dir === "BULLISH" ? "pos" : dir === "BEARISH" ? "neg" : "";
   const trendPoints = history?.points ?? [];
   const latestReplay = history?.replay?.[history.replay.length - 1];
-  const waterfallDrivers = (latestReplay?.sentiment?.drivers ?? sentiment?.drivers ?? []).slice(0, 6);
+  // Keep Drivers in lockstep with Conviction/market widgets (current snapshot first).
+  const waterfallDrivers = (sentiment?.drivers ?? latestReplay?.sentiment?.drivers ?? []).slice(0, 6);
   const trendChart = useMemo(() => {
     const raw = trendPoints.map((p) => Number(p.directionScore) || 0);
     if (raw.length === 0) {
@@ -295,12 +253,7 @@ export default function LandingPage() {
       : m15Label != null && m15Label !== "—"
         ? sessionTrendBias(m15Label)
         : null;
-  const heroHtfBias = tp?.trendpulseEnabled ? htfTrendBias(tp.htfBias) : null;
   const trendGradId = `landingTrendFill-${useId().replace(/:/g, "")}`;
-  const tpSessionNote =
-    tp?.series?.displayDate != null && tp?.series?.displayDate !== ""
-      ? `Session ${tp.series.displayDate}${tp.series.displayTimezone === "Asia/Kolkata" || !tp.series.displayTimezone ? " (IST)" : ` (${tp.series.displayTimezone})`}${tp.series.noBarsForDisplayDate ? " · no bars in feed yet" : ""}`
-      : null;
 
   return (
     <AppFrame>
@@ -374,8 +327,8 @@ export default function LandingPage() {
 
           <div className="landing-hero-cell landing-hero-trend landing-widget-help-host">
             <LandingWidgetHelp
-              meaning="Session = full-day NIFTY % change. 15m = last 15-minute bar vs the prior bar (same index). HTF = TrendPulse higher-timeframe bias when subscribed. Signal = TrendPulse chart timeframe (see Market pulse)."
-              usage="Use 15m for very recent swing vs session for day bias; align with HTF when TrendPulse is on."
+              meaning="Session = full-day NIFTY % change. 15m = last 15-minute bar vs the prior bar (same index)."
+              usage="Use 15m for very recent swing vs session for day bias."
             />
             <span className="landing-hero-eyebrow">Trend</span>
             <div className="landing-hero-trend-stack">
@@ -426,22 +379,6 @@ export default function LandingPage() {
                   {loading && !snap ? "…" : hero15mBias ?? "—"}
                 </span>
               </div>
-              {tp?.trendpulseEnabled && heroHtfBias ? (
-                <div className="landing-hero-tf-row">
-                  <div className="landing-hero-tf-meta">
-                    <span className="landing-hero-tf-name">HTF {formatTpInterval(tp.htfInterval)}</span>
-                    <span className="landing-hero-tf-sub muted">TrendPulse</span>
-                  </div>
-                  <span className={`landing-hero-tf-bias landing-hero-tf-bias--${heroHtfBias.toLowerCase()}`}>
-                    {heroHtfBias}
-                  </span>
-                </div>
-              ) : null}
-              {tp?.trendpulseEnabled ? (
-                <p className="landing-hero-tf-signal muted">
-                  Signal <strong>{formatTpInterval(tp.stInterval)}</strong>
-                </p>
-              ) : null}
             </div>
           </div>
         </section>
@@ -450,7 +387,7 @@ export default function LandingPage() {
           loading={loading}
           sentiment={sentiment}
           snap={snap}
-          tp={tp}
+          tp={null}
           news={newsSentiment}
         />
 
@@ -686,9 +623,9 @@ export default function LandingPage() {
                   ) : null}
                 </p>
               </div>
-              {latestReplay?.timestamp && (
-                <time className="landing-waterfall-time" dateTime={latestReplay.timestamp}>
-                  {formatTimeIST(latestReplay.timestamp, { seconds: true })}
+              {lastRefreshAt && (
+                <time className="landing-waterfall-time" dateTime={lastRefreshAt}>
+                  {formatTimeIST(lastRefreshAt, { seconds: true })}
                 </time>
               )}
             </header>
@@ -722,83 +659,6 @@ export default function LandingPage() {
         />
         <StrategyDayFitWidget data={strategyFit} loading={loading} />
       </div>
-
-      <section className="landing-tp-panel panel-accent-chain landing-widget-help-host">
-        <LandingWidgetHelp
-          meaning="TrendPulse Z: PS_z vs VS_z on your signal timeframe. Rupee icons mark bars where this strategy actually opened a trade."
-          usage="Read the banner for live eligibility. Hover a rupee for IST time, strike, and symbol. Scroll the chart to see earlier session bars."
-        />
-        <header className="landing-tp-head">
-          <div>
-            <h2 className="landing-tp-title">TrendPulse Z</h2>
-            <p className="landing-tp-sub">Strategy signal on your subscribed / active plan</p>
-          </div>
-        </header>
-        <div className="landing-tp-body">
-        {loading && !tp ? (
-          <p className="muted">Loading…</p>
-        ) : tp && !tp.trendpulseEnabled ? (
-          <p className="muted">{tp.message}</p>
-        ) : !tp?.series?.times?.length ? (
-          <p className="muted">{tp?.series?.chartHint ?? tp?.message ?? "No chart data for this session."}</p>
-        ) : (
-          <>
-            <p className="landing-tp-meta muted">
-              {(tp?.stInterval ?? "5minute").replace("minute", "m")} bars · ADX (ST) last: {tp?.series?.adx_last ?? "—"}
-              {tp?.tradeSignal?.adxMin != null && tp?.tradeSignal?.adxSt != null && (
-                <> · min ADX {tp.tradeSignal.adxMin}</>
-              )}
-              {tpSessionNote ? <> · {tpSessionNote}</> : null}
-            </p>
-            {tp?.tradeSignal && (
-              <div
-                className={`trendpulse-signal-banner${tp.tradeSignal.entryEligible ? " trendpulse-signal-banner--ok" : " trendpulse-signal-banner--hold"}`}
-                role="status"
-              >
-                <div className="trendpulse-signal-banner-title">
-                  {tp.tradeSignal.entryEligible ? "Entry conditions satisfied (latest bar)" : "Wait — entry not confirmed"}
-                </div>
-                <p className="trendpulse-signal-banner-text">{tp.tradeSignal.summary}</p>
-                {tp.tradeSignal.recommendation && (
-                  <div className="trendpulse-rec-box" role="region" aria-label="Plan recommendation">
-                    <div className="trendpulse-rec-title">Plan recommendation (₹ at risk)</div>
-                    <p className="trendpulse-rec-body">
-                      {tp.tradeSignal.recommendation.strike != null && Number.isFinite(tp.tradeSignal.recommendation.strike) ? (
-                        <>
-                          <strong>
-                            {Number(tp.tradeSignal.recommendation.strike).toLocaleString("en-IN")}{" "}
-                            {tp.tradeSignal.recommendation.optionType ?? ""}
-                          </strong>
-                          {" · "}
-                        </>
-                      ) : null}
-                      <span className="trendpulse-rec-symbol">{tp.tradeSignal.recommendation.symbol || "—"}</span>
-                      {" · "}
-                      Entry {tp.tradeSignal.recommendation.entryPrice?.toFixed?.(2) ?? "—"} · T{" "}
-                      {tp.tradeSignal.recommendation.targetPrice?.toFixed?.(2) ?? "—"} · SL{" "}
-                      {tp.tradeSignal.recommendation.stopLossPrice?.toFixed?.(2) ?? "—"}
-                      {tp.tradeSignal.recommendation.confidenceScore != null ? (
-                        <> · conf. {Math.round(tp.tradeSignal.recommendation.confidenceScore)}%</>
-                      ) : null}
-                    </p>
-                  </div>
-                )}
-              </div>
-            )}
-            <TrendPulseChart
-              times={tp?.series?.times ?? []}
-              psZ={tp?.series?.ps_z ?? []}
-              vsZ={tp?.series?.vs_z ?? []}
-              stIntervalLabel={(tp?.stInterval ?? "5minute").replace("minute", "m")}
-              sessionDayNote={tpSessionNote}
-              tradeSignal={tp?.tradeSignal ?? null}
-              entryEvents={tp?.entryEvents ?? []}
-              tradeEvents={tp?.tradeEvents ?? []}
-            />
-          </>
-        )}
-        </div>
-      </section>
     </AppFrame>
   );
 }

@@ -1,5 +1,7 @@
 """Short premium: option legs use bearish (premium weakness) indicator pack on LTP series."""
 
+import pytest
+
 from app.services import option_chain_zerodha as ocz
 from app.services.option_chain_zerodha import (
     _add_ivr_to_chain,
@@ -10,7 +12,9 @@ from app.services.option_chain_zerodha import (
     _indicator_pack_from_quote_fallback_bearish,
     _indicator_pack_from_series,
     _indicator_pack_from_series_bearish,
+    _resolve_regime_sell_pe_ce_at_strike,
     _rsi_strictly_falling_last_n_bars,
+    _strike_leg_regime_sell_pe,
 )
 
 
@@ -45,6 +49,32 @@ def test_augment_option_leg_series_skips_when_poll_long_enough():
     assert a is long_poll
     assert b is long_vols
     assert bud[0] == 5
+
+
+def test_regime_pe_sustained_bearish_when_cross_is_stale():
+    """After max_candles_since_cross, regime still passes if LTP<VWAP and rounded EMA9<EMA21."""
+    n = 40
+    ltps = [100.0 - i * 0.22 for i in range(n)]
+    vols = [400.0 + (i % 4) * 25.0 for i in range(n)]
+    ok, _bb = _strike_leg_regime_sell_pe(ltps, vols, max_cross_i=2)
+    assert ok is True
+
+
+def test_resolve_regime_sell_pe_ce_tie_bars_keeps_both_legs(monkeypatch: pytest.MonkeyPatch):
+    """Same bars-since on PE and CE must not force regimeSellPe=regimeSellCe=false."""
+
+    def _pe(*a: object, **k: object) -> tuple[bool, int]:
+        return True, 3
+
+    def _ce(*a: object, **k: object) -> tuple[bool, int]:
+        return True, 3
+
+    monkeypatch.setattr(ocz, "_strike_leg_regime_sell_pe", _pe)
+    monkeypatch.setattr(ocz, "_strike_leg_regime_sell_ce", _ce)
+    pe_ok, ce_ok = _resolve_regime_sell_pe_ce_at_strike(
+        [1.0] * 25, [1.0] * 25, [1.0] * 25, [1.0] * 25, 8
+    )
+    assert pe_ok is True and ce_ok is True
 
 
 def test_series_bearish_downtrend_primary_and_ema_weakness():

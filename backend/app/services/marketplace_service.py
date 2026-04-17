@@ -26,6 +26,12 @@ def _strategy_explainer(strategy_id: str, display_name: str, description: str) -
             "VWAP Pullback waits for price to retrace near VWAP and rejoin trend direction. "
             "It aims to avoid chasing spikes and focuses on structured intraday continuation."
         )
+    if "ai-gift" in sid or "ai gift" in name:
+        return (
+            "AI Gift combines live option-chain micro-structure (OI, OI change, IVR, VWAP, RSI, delta, volume) "
+            "with directional context to rank high-quality long/short strike candidates. "
+            "When eligible, signals appear in Dashboard and can auto-execute per your Paper/Live settings."
+        )
     if "momentum" in sid or "oi" in sid or "momentum" in name:
         return (
             "Momentum + OI Spike ranks strikes where momentum aligns with open-interest behavior, "
@@ -55,12 +61,15 @@ async def list_strategies_for_user(
     limit: int,
     offset: int,
 ) -> list[dict]:
+    """Marketplace rows: 30d PnL and win rate use this user's closed trades in the last 30 days when at
+    least one EXIT exists for that strategy; otherwise catalog ``performance_snapshot`` (seed/demo).
+    """
     sort_map = {
-        "updated_at": "c.updated_at",
-        "pnl_30d": "pnl_30d",
-        "win_rate": "win_rate",
+        "updated_at": "sub.catalog_updated_at",
+        "pnl_30d": "sub.pnl_30d",
+        "win_rate": "sub.win_rate",
     }
-    order_col = sort_map.get(sort_by, "c.updated_at")
+    order_col = sort_map.get(sort_by, "sub.catalog_updated_at")
     order_dir = "ASC" if sort_dir.upper() == "ASC" else "DESC"
 
     where_parts = ["c.publish_status = 'PUBLISHED'"]
@@ -74,25 +83,49 @@ async def list_strategies_for_user(
     where_sql = " AND ".join(where_parts)
     rows = await fetch(
         f"""
-        SELECT
-            c.strategy_id,
-            c.version,
-            c.display_name,
-            COALESCE(c.description, '') AS description,
-            c.strategy_details_json,
-            us.strategy_details_json AS user_strategy_details_json,
-            c.risk_profile,
-            c.publish_status,
-            COALESCE((c.performance_snapshot->>'pnl_30d')::numeric, 0) AS pnl_30d,
-            COALESCE((c.performance_snapshot->>'win_rate_30d')::numeric, 0) AS win_rate,
-            COALESCE(s.status, 'NOT_SUBSCRIBED') AS subscription_status
-        FROM s004_strategy_catalog c
-        LEFT JOIN s004_strategy_subscriptions s
-            ON s.user_id = $1 AND s.strategy_id = c.strategy_id AND s.strategy_version = c.version
-        LEFT JOIN s004_user_strategy_settings us
-            ON us.user_id = $1 AND us.strategy_id = c.strategy_id AND us.strategy_version = c.version
-        WHERE {where_sql}
-        ORDER BY {order_col} {order_dir}, c.updated_at DESC
+        SELECT * FROM (
+            SELECT
+                c.strategy_id,
+                c.version,
+                c.display_name,
+                COALESCE(c.description, '') AS description,
+                c.strategy_details_json,
+                us.strategy_details_json AS user_strategy_details_json,
+                c.risk_profile,
+                c.publish_status,
+                CASE
+                    WHEN COALESCE(u30.n_exit, 0) > 0 THEN u30.sum_pnl
+                    ELSE COALESCE((c.performance_snapshot->>'pnl_30d')::numeric, 0)
+                END AS pnl_30d,
+                CASE
+                    WHEN COALESCE(u30.n_exit, 0) > 0 THEN
+                        ROUND((100.0 * u30.n_win::numeric / NULLIF(u30.n_exit, 0)), 2)
+                    ELSE COALESCE((c.performance_snapshot->>'win_rate_30d')::numeric, 0)
+                END AS win_rate,
+                COALESCE(s.status, 'NOT_SUBSCRIBED') AS subscription_status,
+                c.updated_at AS catalog_updated_at
+            FROM s004_strategy_catalog c
+            LEFT JOIN s004_strategy_subscriptions s
+                ON s.user_id = $1 AND s.strategy_id = c.strategy_id AND s.strategy_version = c.version
+            LEFT JOIN s004_user_strategy_settings us
+                ON us.user_id = $1 AND us.strategy_id = c.strategy_id AND us.strategy_version = c.version
+            LEFT JOIN (
+                SELECT
+                    strategy_id,
+                    strategy_version,
+                    SUM(realized_pnl)::numeric AS sum_pnl,
+                    COUNT(*)::bigint AS n_exit,
+                    COUNT(*) FILTER (WHERE realized_pnl > 0)::bigint AS n_win
+                FROM s004_live_trades
+                WHERE user_id = $1
+                  AND current_state = 'EXIT'
+                  AND closed_at IS NOT NULL
+                  AND closed_at >= (NOW() - INTERVAL '30 days')
+                GROUP BY strategy_id, strategy_version
+            ) u30 ON u30.strategy_id = c.strategy_id AND u30.strategy_version = c.version
+            WHERE {where_sql}
+        ) sub
+        ORDER BY {order_col} {order_dir}, sub.catalog_updated_at DESC
         LIMIT ${argn} OFFSET ${argn + 1}
         """,
         *args,
@@ -108,6 +141,14 @@ async def list_strategies_for_user(
         user_details = _parse_details(r.get("user_strategy_details_json"))
         pi_raw = str(user_details.get("tradeActionIntent") or user_details.get("positionIntent") or "").strip().lower()
         position_intent = pi_raw if pi_raw in {"long_premium", "short_premium"} else "long_premium"
+        try:
+            pnl_30 = float(r["pnl_30d"] or 0)
+        except (TypeError, ValueError):
+            pnl_30 = 0.0
+        try:
+            win_r = float(r["win_rate"] or 0)
+        except (TypeError, ValueError):
+            win_r = 0.0
         out.append(
             {
                 "strategy_id": r["strategy_id"],
@@ -120,9 +161,8 @@ async def list_strategies_for_user(
                 "status": row_status,
                 "publish_status": r["publish_status"],
                 "position_intent": position_intent,
-                # Reset marketplace performance counters for fresh runtime.
-                "pnl_30d": 0.0,
-                "win_rate": 0.0,
+                "pnl_30d": pnl_30,
+                "win_rate": win_r,
             }
         )
     return out
@@ -161,12 +201,12 @@ async def ensure_user_strategy_settings(user_id: int, strategy_id: str, strategy
     await execute(
         """
         INSERT INTO s004_user_strategy_settings (
-            user_id, strategy_id, strategy_version, lots, lot_size, max_strike_distance_atm,
+            user_id, strategy_id, strategy_version, lots, lot_size, banknifty_lot_size, max_strike_distance_atm,
             max_premium, min_premium, min_entry_strength_pct, sl_type, sl_points,
             breakeven_trigger_pct, target_points, trailing_sl_points, timeframe,
             trade_start, trade_end, enabled_indices, auto_pause_after_losses, updated_at
         )
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16::time,$17::time,$18,$19,NOW())
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17::time,$18::time,$19,$20,NOW())
         ON CONFLICT (user_id, strategy_id, strategy_version) DO NOTHING
         """,
         user_id,
@@ -174,6 +214,7 @@ async def ensure_user_strategy_settings(user_id: int, strategy_id: str, strategy
         strategy_version,
         int(def_val("lots", 1)),
         int(def_val("lot_size", 65)),
+        int(def_val("banknifty_lot_size", 30)),
         int(def_val("max_strike_distance_atm", 5)),
         float(def_val("max_premium", 200)),
         float(def_val("min_premium", 30)),

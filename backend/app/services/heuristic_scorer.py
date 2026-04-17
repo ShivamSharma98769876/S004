@@ -66,10 +66,16 @@ def _score_volume_spike(vol_ratio: float) -> tuple[float, str | None]:
 
 
 def _score_rsi(rsi: float | None, rsi_min: float = 45, rsi_max: float = 75) -> tuple[float, str | None]:
-    """RSI in zone = higher. 45-75 ideal for momentum."""
+    """RSI in zone = higher. When rsi_max is relaxed (≥99.5), treat as floor-only: RSI ≥ rsi_min scores best."""
     if rsi is None:
         return (3.0, None)
     v = float(rsi)
+    if rsi_max >= 99.5:
+        if v >= rsi_min:
+            return (5.0, f"RSI {v:.0f}")
+        if v >= rsi_min - 10:
+            return (3.0, None)
+        return (1.5, None)
     if rsi_min <= v <= rsi_max:
         return (5.0, f"RSI {v:.0f}")
     if 40 <= v < rsi_min or rsi_max < v <= 80:

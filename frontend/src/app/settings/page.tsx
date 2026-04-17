@@ -40,6 +40,25 @@ export default function SettingsPage() {
     capitalRisk: CapitalRiskSetup;
     tradingParameters: TradingParametersSetup;
     strategy: StrategySetup;
+    updatedAt?: string;
+  };
+
+  const applyRemoteSettings = (remote: RemoteSettings) => {
+    setMaster(remote.master);
+    setCredentials(remote.credentials);
+    setCapitalRisk(remote.capitalRisk);
+    setTradingParams(remote.tradingParameters);
+    setStrategy(remote.strategy);
+    const at = remote.updatedAt ?? new Date().toISOString();
+    setSavedAt(at);
+    saveTradingSetup({
+      master: remote.master,
+      credentials: remote.credentials,
+      capitalRisk: remote.capitalRisk,
+      tradingParameters: remote.tradingParameters,
+      strategy: remote.strategy,
+      updatedAt: at,
+    });
   };
 
   const loadSettingsForStrategy = (sid: string | null, ver: string | null) => {
@@ -47,33 +66,50 @@ export default function SettingsPage() {
     return apiJson<RemoteSettings>(`/api/settings${params}`)
       .then((remote) => {
         if (!remote) return;
-        setMaster(remote.master);
-        setCredentials(remote.credentials);
-        setCapitalRisk(remote.capitalRisk);
-        setTradingParams(remote.tradingParameters);
-        setStrategy(remote.strategy);
+        applyRemoteSettings(remote);
       })
       .catch(() => undefined);
   };
 
   useEffect(() => {
-    const localSetup = loadTradingSetup();
-    setMaster(localSetup.master);
-    setCredentials(localSetup.credentials);
-    setCapitalRisk(localSetup.capitalRisk);
-    setTradingParams(localSetup.tradingParameters);
-    setStrategy(localSetup.strategy);
-    setSavedAt(localSetup.updatedAt);
+    let cancelled = false;
 
     apiJson<{ strategy_id: string; version: string; display_name: string }[]>("/api/settings/strategy-options")
-      .then((opts) => setStrategyOptions(opts ?? []))
-      .catch(() => setStrategyOptions([]));
+      .then((opts) => {
+        if (!cancelled) setStrategyOptions(opts ?? []);
+      })
+      .catch(() => {
+        if (!cancelled) setStrategyOptions([]);
+      });
 
     apiJson<{ approved_paper: boolean; approved_live: boolean }>("/api/auth/me")
-      .then((me) => setApproval({ approved_paper: me.approved_paper, approved_live: me.approved_live }))
-      .catch(() => setApproval(null));
+      .then((me) => {
+        if (!cancelled) setApproval({ approved_paper: me.approved_paper, approved_live: me.approved_live });
+      })
+      .catch(() => {
+        if (!cancelled) setApproval(null);
+      });
 
-    loadSettingsForStrategy(null, null);
+    (async () => {
+      try {
+        const remote = await apiJson<RemoteSettings>("/api/settings");
+        if (cancelled || !remote) return;
+        applyRemoteSettings(remote);
+      } catch {
+        if (cancelled) return;
+        const localSetup = loadTradingSetup();
+        setMaster(localSetup.master);
+        setCredentials(localSetup.credentials);
+        setCapitalRisk(localSetup.capitalRisk);
+        setTradingParams(localSetup.tradingParameters);
+        setStrategy(localSetup.strategy);
+        setSavedAt(localSetup.updatedAt);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   /** Shown in UI; can differ briefly from master.mode while LIVE is being coerced to PAPER. */
@@ -328,12 +364,23 @@ export default function SettingsPage() {
               />
             </label>
             <label className="field">
-              <span>Lot Size</span>
+              <span>Lot Size (NIFTY)</span>
               <input
                 className="control-input"
                 type="number"
                 value={tradingParams.lotSize}
                 onChange={(e) => setTradingParams((p) => ({ ...p, lotSize: Number(e.target.value) }))}
+              />
+            </label>
+            <label className="field">
+              <span>Bank Nifty lot size</span>
+              <input
+                className="control-input"
+                type="number"
+                value={tradingParams.bankniftyLotSize ?? 30}
+                onChange={(e) =>
+                  setTradingParams((p) => ({ ...p, bankniftyLotSize: Number(e.target.value) }))
+                }
               />
             </label>
             <label className="field">

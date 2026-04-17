@@ -99,6 +99,11 @@ class HeuristicEnhancementConfig:
     ce_requires_spot_not_down: bool = False
     pe_requires_spot_not_up: bool = False
     directional_gate_flat_band_pct: float = 0.05
+    # Dynamic action intent (BUY vs SELL) per recommendation row.
+    dynamic_action_intent_enabled: bool = False
+    dynamic_long_trend_min_spot_chg_pct: float = 0.35
+    dynamic_long_ivr_max: float = 55.0
+    dynamic_short_ivr_min: float = 65.0
     # Custom matrix entries override DEFAULT_MONEYNESS_DTE_RULES key "atm_core|ultra" -> [eligible, cap]
     matrix_overrides: dict[str, list[bool | float | None]] = field(default_factory=dict)
 
@@ -139,6 +144,10 @@ class HeuristicEnhancementConfig:
             ce_requires_spot_not_down=bool(d.get("ceRequiresSpotNotDown", False)),
             pe_requires_spot_not_up=bool(d.get("peRequiresSpotNotUp", False)),
             directional_gate_flat_band_pct=float(d.get("directionalGateFlatBandPct", 0.05)),
+            dynamic_action_intent_enabled=bool(d.get("dynamicActionIntentEnabled", False)),
+            dynamic_long_trend_min_spot_chg_pct=float(d.get("dynamicLongTrendMinSpotChgPct", 0.35)),
+            dynamic_long_ivr_max=float(d.get("dynamicLongIvrMax", 55.0)),
+            dynamic_short_ivr_min=float(d.get("dynamicShortIvrMin", 65.0)),
             matrix_overrides=overrides,
         )
 

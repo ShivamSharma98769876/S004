@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 DEFAULT_DETAILS = {
     "displayName": "TrendSnap Momentum",
-    "description": "Simple four-factor option read: close above VWAP (gate), EMA9 above EMA21, RSI 50-75, volume above 1.02x average. Signal when at least three of four pass.",
+    "description": "Simple four-factor option read: close above VWAP (gate), EMA9 above EMA21, RSI 50-75, volume above 1.0x average. Signal when at least three of four pass.",
     "includeEmaCrossoverInScore": False,
     "strictBullishComparisons": True,
     "indicators": {
@@ -25,7 +25,7 @@ DEFAULT_DETAILS = {
         },
         "rsi": {"period": 14, "min": 50, "max": 75, "description": "RSI between 50 and 75 adds one point."},
         "vwap": {"description": "Latest candle close strictly above VWAP is the primary gate and first point."},
-        "volumeSpike": {"minRatio": 1.02, "description": "Volume strictly above 1.02x recent average adds one point."},
+        "volumeSpike": {"minRatio": 1.0, "description": "Volume strictly above 1.0x recent average adds one point."},
         "ivr": {"maxThreshold": 20, "bonus": 0, "description": "IVR for reference; no score bonus."},
     },
     "strikeSelection": {
@@ -39,7 +39,7 @@ DEFAULT_DETAILS = {
     "scoreThreshold": 3,
     "scoreMax": 4,
     "autoTradeScoreThreshold": 4,
-    "scoreDescription": "Primary: close must be above VWAP. Score 0-4: VWAP, EMA9>EMA21, RSI 50-75, volume>1.02x avg. No crossover or IVR points. BUY CE/PE when score >= 3.",
+    "scoreDescription": "Primary: close must be above VWAP. Score 0-4: VWAP, EMA9>EMA21, RSI 50-75, volume>1.0x avg. No crossover or IVR points. BUY CE/PE when score >= 3.",
 }
 
 

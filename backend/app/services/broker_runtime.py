@@ -103,7 +103,7 @@ class ZerodhaProvider(MarketDataProvider, ExecutionProvider):
         require_live: bool,
     ) -> dict[str, Any]:
         if require_live and not await self.session_ok():
-            raise RuntimeError("Live Zerodha session required for option chain.")
+            raise RuntimeError("Live broker session required for option chain.")
         kite = self.kite if await self.session_ok() else None
         return await asyncio.to_thread(
             fetch_option_chain_sync,
@@ -533,7 +533,7 @@ class FyersProvider(MarketDataProvider, ExecutionProvider):
     ) -> dict[str, Any]:
         _ = (strikes_up, strikes_down)
         if require_live and not await self.session_ok():
-            raise RuntimeError("Live FYERS session required for option chain.")
+            raise RuntimeError("Live broker session required for option chain.")
         under = _fyers_underlying(instrument)
         expiry_date = ""
         try:
@@ -763,21 +763,37 @@ class FyersProvider(MarketDataProvider, ExecutionProvider):
 
 async def _resolve_user_provider(user_id: int) -> tuple[MarketDataProvider | None, str | None]:
     active = await ba.get_active_broker_code(user_id)
-    if active == ba.BROKER_FYERS:
-        fy = await ba.user_fyers_client(user_id)
-        if fy:
-            return FyersProvider(fy), ba.BROKER_FYERS
-    if active == ba.BROKER_ZERODHA:
-        kite = await ba.user_zerodha_kite(user_id, env_fallback=False)
-        if kite:
-            return ZerodhaProvider(kite), ba.BROKER_ZERODHA
-    # Fallback within user's own vault only (when active code missing/incomplete).
-    kite = await ba.user_zerodha_kite(user_id, env_fallback=False)
+    # Probe both user brokers regardless of active code so we can fall back when
+    # the active broker token is stale but another connected broker is live.
+    kite = await ba.user_zerodha_kite(user_id, env_fallback=False, respect_active=False)
+    fy = await ba.user_fyers_client(user_id, respect_active=False)
+    providers: dict[str, MarketDataProvider] = {}
     if kite:
-        return ZerodhaProvider(kite), ba.BROKER_ZERODHA
-    fy = await ba.user_fyers_client(user_id)
+        providers[ba.BROKER_ZERODHA] = ZerodhaProvider(kite)
     if fy:
-        return FyersProvider(fy), ba.BROKER_FYERS
+        providers[ba.BROKER_FYERS] = FyersProvider(fy)
+    if not providers:
+        return None, active
+
+    order: list[str] = []
+    if active in (ba.BROKER_ZERODHA, ba.BROKER_FYERS):
+        order.append(str(active))
+    for code in (ba.BROKER_FYERS, ba.BROKER_ZERODHA):
+        if code not in order:
+            order.append(code)
+
+    for code in order:
+        p = providers.get(code)
+        if p is None:
+            continue
+        try:
+            if await p.session_ok():
+                return p, code
+        except Exception:
+            continue
+
+    # Nothing is currently live; report "no user provider" and let caller choose
+    # shared/non-live fallbacks without broker-specific noise.
     return None, active
 
 

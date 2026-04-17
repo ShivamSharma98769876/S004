@@ -45,6 +45,12 @@ def strategy_kind(details: dict[str, Any]) -> str:
         return "trendpulse_z"
     if st == "heuristic-voting":
         return "heuristic_voting"
+    if st == "supertrend-trail":
+        return "supertrend_trail"
+    if st == "stochastic-bnf":
+        return "stochastic_bnf"
+    if st == "ps-vs-mtf":
+        return "ps_vs_mtf"
     return "rule_based"
 
 

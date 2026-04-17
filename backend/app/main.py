@@ -66,6 +66,7 @@ from app.api import (
     routes_landing,
     routes_marketplace,
     routes_metrics,
+    routes_observability,
     routes_settings,
     routes_trades,
 )
@@ -141,6 +142,7 @@ def create_app() -> FastAPI:
     app.include_router(routes_trades.router, prefix="/api")
     app.include_router(routes_dashboard.router, prefix="/api")
     app.include_router(routes_landing.router, prefix="/api")
+    app.include_router(routes_observability.router, prefix="/api")
     return app
 
 

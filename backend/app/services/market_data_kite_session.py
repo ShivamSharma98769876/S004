@@ -1,4 +1,4 @@
-"""Zerodha Kite session diagnostics for features that use shared quote resolution (user → platform)."""
+"""Broker session diagnostics for features that use shared quote resolution (user -> platform)."""
 
 from __future__ import annotations
 
@@ -14,22 +14,22 @@ def market_data_session_hint(
     kite_present: bool,
     platform_shared_broker_code: str | None = None,
 ) -> str:
-    """User-facing copy: option chain / indices use Zerodha Kite market data, not FYERS yet."""
+    """User-facing market-data session hints, broker-agnostic."""
     if quote_source == "platform_only_unavailable":
         pbc = (platform_shared_broker_code or "").lower()
         if pbc and pbc != BROKER_ZERODHA:
             if pbc == BROKER_FYERS:
                 return (
-                    "Admin platform shared connection is FYERS; option analytics still need Zerodha market data. "
-                    "Set Zerodha on the shared slot under Admin → Platform broker, or connect your own Zerodha under Settings → Brokers."
+                    "Admin platform shared connection is FYERS, but its market-data session is currently unavailable. "
+                    "Ask admin to reconnect the shared broker under Admin -> Platform broker."
                 )
             return (
-                "Admin platform shared broker is configured, but Zerodha market data cannot be loaded from it. "
-                "Use Zerodha on Admin → Platform broker or connect Zerodha under Settings → Brokers."
+                "Admin platform shared broker is configured, but market data cannot be loaded from it. "
+                "Ask admin to reconnect under Admin -> Platform broker."
             )
         return (
-            "Admin shared broker (paper pool) is configured but Zerodha tokens there are missing or unusable. "
-            "Ask an admin to reconnect under Admin → Platform broker."
+            "Admin shared broker (paper pool) is configured but tokens there are missing or unusable. "
+            "Ask an admin to reconnect under Admin -> Platform broker."
         )
     if session_ok:
         if quote_source == "platform_shared":
@@ -41,19 +41,13 @@ def market_data_session_hint(
         if quote_source == "user_fyers":
             return "Market data session OK (your FYERS connection under Settings → Brokers)."
         return "Market data session OK (resolved broker market-data session)."
-    if (active_broker or "").lower() == BROKER_FYERS:
-        return (
-            "FYERS is your active broker, but option analytics still use Zerodha market data. "
-            "Connect Zerodha under Settings → Brokers, or ask an admin to set the shared Zerodha connection for paper quotes."
-        )
     if not kite_present:
         return (
-            "No Zerodha market-data session. Connect Zerodha under Settings → Brokers, "
-            "or ask an admin to configure the shared Zerodha connection for paper (Admin → Platform broker)."
+            "No broker market-data session is available. Connect a broker under Settings -> Brokers, "
+            "or ask an admin to configure/reconnect the shared broker for paper quotes (Admin -> Platform broker)."
         )
     return (
-        "Zerodha market-data token is missing or expired (Kite tokens expire daily). "
-        "Reconnect under Settings → Brokers, then refresh this page."
+        "Broker market-data token is missing or expired. Reconnect under Settings -> Brokers, then refresh this page."
     )
 
 

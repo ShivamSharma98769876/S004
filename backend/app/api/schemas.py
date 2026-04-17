@@ -147,6 +147,7 @@ class TradeOut(BaseModel):
     score: float | int | None = None
     confidence_score: float | None = None
     strategy_name: str | None = None
+    quote_source: Literal["live", "fallback"] | None = None
 
     @field_serializer("opened_at", "closed_at", "updated_at", when_used="json")
     def _serialize_trade_timestamps(self, v: datetime | None) -> str | None:

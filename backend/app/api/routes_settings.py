@@ -30,30 +30,32 @@ def _parse_time(val: str | None) -> time:
 # Fallback only when strategy_details not in catalog; preferred path is strategy JSON from s004_strategy_catalog.
 DEFAULT_STRATEGY_DETAILS = {
     "displayName": "TrendSnap Momentum",
-    "description": "Simple four-factor option read: close above VWAP (gate), EMA9 above EMA21, RSI 50-75, volume above 1.02x average. Signal when at least three of four pass. Exits use SL, target, and breakeven from Settings.",
+    "description": "Four-factor option read on the latest candle: close above VWAP (required gate), EMA9 above EMA21, RSI >= 50 (no upper cap), volume above 1.0x average. Signal when at least three of four pass. Exits use SL, target, and breakeven from Settings.",
     "includeEmaCrossoverInScore": False,
     "strictBullishComparisons": True,
+    "longPremiumVwapMarginPct": 2.0,
+    "longPremiumEmaMarginPct": 1.0,
     "indicators": {
         "ema": {"fast": 9, "slow": 21, "description": "EMA9 strictly above EMA21 adds one point."},
-        "emaCrossover": {"bonus": 0, "maxCandlesSinceCross": 3, "description": "Not counted in score; metadata only."},
-        "rsi": {"period": 14, "min": 50, "max": 75, "description": "RSI between 50 and 75 adds one point."},
+        "emaCrossover": {"bonus": 0, "maxCandlesSinceCross": 10, "description": "Not counted in score; metadata only."},
+        "rsi": {"period": 14, "min": 50, "max": 100, "description": "RSI at or above 50 adds one point (upper band relaxed)."},
         "vwap": {"description": "Latest candle close strictly above VWAP is the primary gate and first point."},
-        "volumeSpike": {"minRatio": 1.02, "description": "Volume strictly above 1.02x recent average adds one point."},
+        "volumeSpike": {"minRatio": 1.0, "description": "Volume strictly above 1.0x recent average adds one point."},
         "ivr": {"maxThreshold": 20, "bonus": 0, "description": "IVR for reference; no score bonus."},
     },
     "strikeSelection": {
         "minOi": 5000,
         "minVolume": 300,
         "maxOtmSteps": 3,
-        "deltaPreferredCE": 0.35,
-        "deltaPreferredPE": -0.35,
+        "deltaPreferredCE": 0.45,
+        "deltaPreferredPE": -0.45,
         "description": "Liquidity: min OI 5k, min volume 300. Max 3 steps OTM. Prefer delta near 0.35 CE / -0.35 PE.",
     },
     "scoreThreshold": 3,
     "scoreMax": 4,
     "autoTradeScoreThreshold": 4,
     "positionIntent": "long_premium",
-    "scoreDescription": "Primary: close must be above VWAP. Score 0-4: VWAP, EMA9>EMA21, RSI 50-75, volume>1.02x avg. No crossover or IVR points. BUY CE/PE when score >= 3.",
+    "scoreDescription": "Primary: close must be above VWAP. Score 0-4: VWAP, EMA9>EMA21, RSI >= 50, volume>1.0x avg. No crossover or IVR points. BUY CE/PE when score >= 3.",
 }
 
 
@@ -166,12 +168,12 @@ async def get_settings(
             await execute(
                 """
                 INSERT INTO s004_user_strategy_settings (
-                    user_id, strategy_id, strategy_version, lots, lot_size, max_strike_distance_atm,
+                    user_id, strategy_id, strategy_version, lots, lot_size, banknifty_lot_size, max_strike_distance_atm,
                     max_premium, min_premium, min_entry_strength_pct, sl_type, sl_points,
                     breakeven_trigger_pct, target_points, trailing_sl_points, timeframe,
                     trade_start, trade_end, enabled_indices, auto_pause_after_losses, updated_at
                 )
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16::time,$17::time,$18,$19,NOW())
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17::time,$18::time,$19,$20,NOW())
                 ON CONFLICT (user_id, strategy_id, strategy_version) DO NOTHING
                 """,
                 user_id,
@@ -179,6 +181,7 @@ async def get_settings(
                 ver,
                 int(def_val("lots", 1)),
                 int(def_val("lot_size", 65)),
+                int(def_val("banknifty_lot_size", 30)),
                 int(def_val("max_strike_distance_atm", 5)),
                 float(def_val("max_premium", 200)),
                 float(def_val("min_premium", 30)),
@@ -307,6 +310,7 @@ async def get_settings(
         tradingParameters={
             "lots": int(strategy["lots"]),
             "lotSize": int(strategy["lot_size"]),
+            "bankniftyLotSize": int(strategy.get("banknifty_lot_size") or 30),
             "maxStrikeDistanceFromAtm": int(strategy["max_strike_distance_atm"]),
             "maxPremium": float(strategy["max_premium"]),
             "minPremium": float(strategy["min_premium"]),
@@ -539,7 +543,59 @@ async def upsert_settings(payload: SettingsPayload, user_id: int = Depends(get_u
     if not indices:
         indices = ["NIFTY"]
 
-    charges_per_trade = float(payload.capitalRisk.get("chargesPerTrade", 20))
+    cr = payload.capitalRisk if isinstance(payload.capitalRisk, dict) else {}
+    try:
+        row_master = await fetchrow(
+            """
+            SELECT max_parallel_trades, max_trades_day, max_profit_day, max_loss_day,
+                   initial_capital, max_investment_per_trade,
+                   COALESCE(charges_per_trade, 20) AS charges_per_trade
+            FROM s004_user_master_settings
+            WHERE user_id = $1
+            """,
+            user_id,
+        )
+    except asyncpg.UndefinedColumnError:
+        row_master = await fetchrow(
+            """
+            SELECT max_parallel_trades, max_trades_day, max_profit_day, max_loss_day,
+                   initial_capital, max_investment_per_trade
+            FROM s004_user_master_settings
+            WHERE user_id = $1
+            """,
+            user_id,
+        )
+
+    def _cap_int(key: str, col: str, default: int) -> int:
+        if key in cr and cr[key] is not None:
+            return int(cr[key])
+        if row_master and row_master.get(col) is not None:
+            return int(row_master[col])
+        return default
+
+    def _cap_float(key: str, col: str, default: float) -> float:
+        if key in cr and cr[key] is not None:
+            return float(cr[key])
+        if row_master and row_master.get(col) is not None:
+            return float(row_master[col])
+        return default
+
+    max_parallel_trades = _cap_int(
+        "maxParallelTrades",
+        "max_parallel_trades",
+        int(payload.master.get("maxTrades", 3)),
+    )
+    max_trades_day = _cap_int("maxTradesDay", "max_trades_day", 4)
+    max_profit_day = _cap_float("maxProfitDay", "max_profit_day", 5000.0)
+    max_loss_day = _cap_float(
+        "maxLossDay",
+        "max_loss_day",
+        float(payload.master.get("dailyLossLimit", 2000)),
+    )
+    initial_capital = _cap_float("initialCapital", "initial_capital", 100000.0)
+    max_investment_per_trade = _cap_float("maxInvestmentPerTrade", "max_investment_per_trade", 50000.0)
+    charges_per_trade = _cap_float("chargesPerTrade", "charges_per_trade", 20.0)
+
     try:
         await execute(
             """
@@ -573,12 +629,12 @@ async def upsert_settings(payload: SettingsPayload, user_id: int = Depends(get_u
             bool(payload.master.get("sharedApiConnected", True)),
             bool(payload.master.get("platformApiOnline", True)),
             str(payload.master.get("mode", "PAPER")),
-            int(payload.capitalRisk.get("maxParallelTrades", payload.master.get("maxTrades", 3))),
-            int(payload.capitalRisk.get("maxTradesDay", 4)),
-            float(payload.capitalRisk.get("maxProfitDay", 5000)),
-            float(payload.capitalRisk.get("maxLossDay", payload.master.get("dailyLossLimit", 2000))),
-            float(payload.capitalRisk.get("initialCapital", 100000)),
-            float(payload.capitalRisk.get("maxInvestmentPerTrade", 50000)),
+            max_parallel_trades,
+            max_trades_day,
+            max_profit_day,
+            max_loss_day,
+            initial_capital,
+            max_investment_per_trade,
             charges_per_trade,
             json.dumps(payload.credentials),
         )
@@ -614,27 +670,28 @@ async def upsert_settings(payload: SettingsPayload, user_id: int = Depends(get_u
             bool(payload.master.get("sharedApiConnected", True)),
             bool(payload.master.get("platformApiOnline", True)),
             str(payload.master.get("mode", "PAPER")),
-            int(payload.capitalRisk.get("maxParallelTrades", payload.master.get("maxTrades", 3))),
-            int(payload.capitalRisk.get("maxTradesDay", 4)),
-            float(payload.capitalRisk.get("maxProfitDay", 5000)),
-            float(payload.capitalRisk.get("maxLossDay", payload.master.get("dailyLossLimit", 2000))),
-            float(payload.capitalRisk.get("initialCapital", 100000)),
-            float(payload.capitalRisk.get("maxInvestmentPerTrade", 50000)),
+            max_parallel_trades,
+            max_trades_day,
+            max_profit_day,
+            max_loss_day,
+            initial_capital,
+            max_investment_per_trade,
             json.dumps(payload.credentials),
         )
 
     await execute(
         """
         INSERT INTO s004_user_strategy_settings (
-            user_id, strategy_id, strategy_version, lots, lot_size, max_strike_distance_atm,
+            user_id, strategy_id, strategy_version, lots, lot_size, banknifty_lot_size, max_strike_distance_atm,
             max_premium, min_premium, min_entry_strength_pct, sl_type, sl_points,
             breakeven_trigger_pct, target_points, trailing_sl_points, timeframe,
             trade_start, trade_end, enabled_indices, auto_pause_after_losses, updated_at
         )
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16::time,$17::time,$18,$19,NOW())
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17::time,$18::time,$19,$20,NOW())
         ON CONFLICT (user_id, strategy_id, strategy_version) DO UPDATE SET
             lots = EXCLUDED.lots,
             lot_size = EXCLUDED.lot_size,
+            banknifty_lot_size = EXCLUDED.banknifty_lot_size,
             max_strike_distance_atm = EXCLUDED.max_strike_distance_atm,
             max_premium = EXCLUDED.max_premium,
             min_premium = EXCLUDED.min_premium,
@@ -656,6 +713,7 @@ async def upsert_settings(payload: SettingsPayload, user_id: int = Depends(get_u
         str(payload.strategy.get("strategyVersion", "1.0.0")),
         int(payload.tradingParameters.get("lots", 1)),
         int(payload.tradingParameters.get("lotSize", 65)),
+        int(payload.tradingParameters.get("bankniftyLotSize", 30)),
         int(payload.tradingParameters.get("maxStrikeDistanceFromAtm", 5)),
         float(payload.tradingParameters.get("maxPremium", 200)),
         float(payload.tradingParameters.get("minPremium", 30)),

@@ -87,6 +87,88 @@ def validate_strategy_details(details: dict) -> list[str]:
         if pi and pi != "long_premium":
             errors.append("TrendPulse Z requires positionIntent 'long_premium'.")
 
+    if strategy_type == "supertrend-trail":
+        stt = details.get("superTrendTrail")
+        if stt is not None and not isinstance(stt, dict):
+            errors.append("'superTrendTrail' must be an object.")
+        elif isinstance(stt, dict):
+            for key, label in [
+                ("emaFast", "superTrendTrail.emaFast"),
+                ("emaSlow", "superTrendTrail.emaSlow"),
+                ("atrPeriod", "superTrendTrail.atrPeriod"),
+                ("candleDaysBack", "superTrendTrail.candleDaysBack"),
+                ("minDteCalendarDays", "superTrendTrail.minDteCalendarDays"),
+            ]:
+                if key in stt and not isinstance(stt.get(key), (int, float)):
+                    errors.append(f"'{label}' must be a number.")
+            if "atrMultiplier" in stt and not isinstance(stt.get("atrMultiplier"), (int, float)):
+                errors.append("'superTrendTrail.atrMultiplier' must be a number.")
+            if "vwapStepThresholdPct" in stt and not isinstance(stt.get("vwapStepThresholdPct"), (int, float)):
+                errors.append("'superTrendTrail.vwapStepThresholdPct' must be a number.")
+            if "entryVsVwapEpsPct" in stt and not isinstance(stt.get("entryVsVwapEpsPct"), (int, float)):
+                errors.append("'superTrendTrail.entryVsVwapEpsPct' must be a number.")
+        pi = str(details.get("positionIntent", "short_premium")).strip().lower()
+        if pi != "short_premium":
+            errors.append("SuperTrendTrail requires positionIntent 'short_premium'.")
+
+    if strategy_type == "stochastic-bnf":
+        sb = details.get("stochasticBnf")
+        if sb is not None and not isinstance(sb, dict):
+            errors.append("'stochasticBnf' must be an object.")
+        elif isinstance(sb, dict):
+            for key, label in [
+                ("adxPeriod", "stochasticBnf.adxPeriod"),
+                ("candleDaysBack", "stochasticBnf.candleDaysBack"),
+                ("rsiLength", "stochasticBnf.rsiLength"),
+                ("stochLength", "stochasticBnf.stochLength"),
+                ("stochK", "stochasticBnf.stochK"),
+                ("stochD", "stochasticBnf.stochD"),
+            ]:
+                if key in sb and not isinstance(sb.get(key), (int, float)):
+                    errors.append(f"'{label}' must be a number.")
+            if "adxThreshold" in sb and not isinstance(sb.get("adxThreshold"), (int, float)):
+                errors.append("'stochasticBnf.adxThreshold' must be a number.")
+            if "overbought" in sb and not isinstance(sb.get("overbought"), (int, float)):
+                errors.append("'stochasticBnf.overbought' must be a number.")
+            if "oversold" in sb and not isinstance(sb.get("oversold"), (int, float)):
+                errors.append("'stochasticBnf.oversold' must be a number.")
+            for bkey in ("usePullbackEntry", "stochConfirmation", "vwapFilter", "timeFilter"):
+                if bkey in sb and not isinstance(sb.get(bkey), bool):
+                    errors.append(f"'stochasticBnf.{bkey}' must be a boolean.")
+        pi = str(details.get("positionIntent", "short_premium")).strip().lower()
+        if pi != "short_premium":
+            errors.append("StochasticBNF requires positionIntent 'short_premium'.")
+
+    if strategy_type == "ps-vs-mtf":
+        pv = details.get("psVsMtf")
+        if pv is not None and not isinstance(pv, dict):
+            errors.append("'psVsMtf' must be an object.")
+        elif isinstance(pv, dict):
+            for key, label in [
+                ("rsiPeriod", "psVsMtf.rsiPeriod"),
+                ("psEmaPeriod", "psVsMtf.psEmaPeriod"),
+                ("vsWmaPeriod", "psVsMtf.vsWmaPeriod"),
+                ("atrPeriod", "psVsMtf.atrPeriod"),
+                ("adxPeriod", "psVsMtf.adxPeriod"),
+                ("candleDaysBack", "psVsMtf.candleDaysBack"),
+            ]:
+                if key in pv and not isinstance(pv.get(key), (int, float)):
+                    errors.append(f"'{label}' must be a number.")
+            for key, label in [
+                ("adxMin", "psVsMtf.adxMin"),
+                ("adxRef", "psVsMtf.adxRef"),
+                ("atrRangeMin", "psVsMtf.atrRangeMin"),
+                ("atrRangeMax", "psVsMtf.atrRangeMax"),
+                ("rsiBandLow", "psVsMtf.rsiBandLow"),
+                ("rsiBandHigh", "psVsMtf.rsiBandHigh"),
+                ("minConvictionPct", "psVsMtf.minConvictionPct"),
+                ("volumeVsPriorMult", "psVsMtf.volumeVsPriorMult"),
+            ]:
+                if key in pv and not isinstance(pv.get(key), (int, float)):
+                    errors.append(f"'{label}' must be a number.")
+            if "strict15m" in pv and not isinstance(pv.get("strict15m"), bool):
+                errors.append("'psVsMtf.strict15m' must be a boolean.")
+
     # heuristics (for heuristic-voting strategy type)
     if strategy_type == "heuristic-voting":
         heuristics = details.get("heuristics")
@@ -201,6 +283,13 @@ def validate_strategy_details(details: dict) -> list[str]:
             type(esh) is bool or not isinstance(esh, int) or esh < 0 or esh > 23
         ):
             errors.append("'strikeSelection.earlySessionEndHourIST' must be an integer hour 0–23 (IST).")
+        esm = strike.get("earlySessionEndMinuteIST")
+        if esm is not None and (
+            type(esm) is bool or not isinstance(esm, int) or esm < 0 or esm > 59
+        ):
+            errors.append(
+                "'strikeSelection.earlySessionEndMinuteIST' must be an integer minute 0–59 (IST, optional)."
+            )
         if "shortPremiumAsymmetricDatm" in strike and strike.get("shortPremiumAsymmetricDatm") is not None:
             if not isinstance(strike.get("shortPremiumAsymmetricDatm"), bool):
                 errors.append("'strikeSelection.shortPremiumAsymmetricDatm' must be a boolean.")
